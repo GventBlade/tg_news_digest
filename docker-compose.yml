@@ -1,0 +1,11 @@
+services:
+  news-bot:
+    build: .
+    container_name: tg_news_digest
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - ./news_session.session:/app/news_session.session
+      - ./data:/app/data
+      - ./downloads:/app/downloads

@@ -1,0 +1,21 @@
+# Віртуальне оточення
+.venv/
+venv/
+ENV/
+
+# Секрети та конфігурації (КРИТИЧНО!)
+.env
+*.session
+*.session-journal
+
+# Локальні дані та медіа
+data/
+downloads/
+*.db
+*.sqlite3
+
+# Кеш Python та середовищ розробки
+__pycache__/
+*.py[cod]
+.idea/
+.vscode/

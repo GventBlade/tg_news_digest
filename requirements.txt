@@ -1,0 +1,7 @@
+telethon>=1.36.0
+aiogram>=3.7.0
+google-genai>=0.1.1
+apscheduler>=3.10.4
+pydantic-settings>=2.2.1
+python-dotenv>=1.0.1
+qrcode>=7.4.2
