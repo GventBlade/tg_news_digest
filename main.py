@@ -1,16 +1,16 @@
 import asyncio
+from datetime import datetime, timedelta
 import logging
 import os
 import shutil
-from datetime import datetime
 from zoneinfo import ZoneInfo
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from app.services.collector import NewsCollector
-from app.services.summarizer import NewsSummarizer
-from app.services.publisher import NewsPublisher
 from app.services.history import NewsHistory
+from app.services.publisher import NewsPublisher
+from app.services.summarizer import NewsSummarizer
 
 logging.basicConfig(
     level=logging.INFO,
@@ -20,29 +20,23 @@ logger = logging.getLogger(__name__)
 
 
 def get_slot_header_text() -> str:
-    """Формує заголовок випуску з прив'язкою до слоту та дати."""
+    """
+    Формує заголовок випуску з автоматичним округленням до найближчої цілої години.
+    (03:57 -> 04:00, 07:57 -> 08:00, 11:57 -> 12:00, 15:57 -> 16:00, 19:57 -> 20:00, 23:57 -> 00:00)
+    """
     kyiv_tz = ZoneInfo("Europe/Kyiv")
     now = datetime.now(kyiv_tz)
 
-    hour = now.hour
-    if hour in [23, 0]:
-        display_hour = "00:00"
-    elif 5 <= hour <= 6:
-        display_hour = "06:00"
-    elif 11 <= hour <= 12:
-        display_hour = "12:00"
-    elif 17 <= hour <= 18:
-        display_hour = "18:00"
-    else:
-        display_hour = now.strftime("%H:%M")
-
-    date_str = now.strftime("%d.%m.%Y")
+    # Округлюємо до найближчої повної години
+    rounded_time = (now + timedelta(minutes=30)).replace(minute=0, second=0, microsecond=0)
+    display_hour = rounded_time.strftime("%H:%M")
+    date_str = rounded_time.strftime("%d.%m.%Y")
 
     return (
         f"🔥 <b>10 НАЙСВІЖІШИХ НОВИН</b>\n"
         f"🕒 <i>Станом на {display_hour}, {date_str}</i>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"<i>Головні події за останні 6 годин:</i>"
+        f"<i>Головні події за останні 4 години:</i>"
     )
 
 
@@ -62,19 +56,19 @@ def cleanup_downloads_folder():
 
 
 async def process_and_publish_news_cycle():
-    logger.info("🚀 Початок новинного циклу (ТОП-10)...")
+    logger.info("🚀 Початок новинного циклу 4/24 (ТОП-10)...")
     collector = NewsCollector()
     summarizer = NewsSummarizer()
     publisher = NewsPublisher()
     history = NewsHistory()
 
     try:
-        # 1. Збір постів за останні 6 годин (вже відфільтровані від раніше опублікованих)
-        posts = await collector.fetch_recent_posts(hours=6, limit_per_channel=10)
+        # 1. Збір постів за останні 4 години (вже відфільтровані від раніше опублікованих)
+        posts = await collector.fetch_recent_posts(hours=4, limit_per_channel=10)
         logger.info(f"Зібрано {len(posts)} нових текстів для аналізу.")
 
         if not posts:
-            logger.info("Нових новин за останні 6 годин не виявлено.")
+            logger.info("Нових новин за останні 4 години не виявлено.")
             return
 
         # 2. Gemini відбирає ТОП-10 унікальних новин
@@ -84,7 +78,7 @@ async def process_and_publish_news_cycle():
         if not top_news:
             return
 
-        # 3. Публікуємо заголовок випуску
+        # 3. Публікуємо заголовок випуску з округленим часом
         header_text = get_slot_header_text()
         await publisher.publish_news(text=header_text)
         await asyncio.sleep(2)
@@ -134,14 +128,14 @@ async def process_and_publish_news_cycle():
 async def main():
     scheduler = AsyncIOScheduler(timezone="Europe/Kyiv")
 
-    # Розклад: за 5 хв до 00:00, 06:00, 12:00, 18:00
+    # Розклад 4/24: запуск о 03:57, 07:57, 11:57, 15:57, 19:57, 23:57
     scheduler.add_job(
         process_and_publish_news_cycle,
-        trigger=CronTrigger(hour="5,11,17,23", minute="55", timezone="Europe/Kyiv")
+        trigger=CronTrigger(hour="3,7,11,15,19,23", minute="57", timezone="Europe/Kyiv")
     )
 
     scheduler.start()
-    logger.info("⏳ Планувальник запущено. Очікування наступного слоту...")
+    logger.info("⏳ Планувальник 4/24 запущено. Очікування наступного слоту (57 хв)...")
 
     while True:
         await asyncio.sleep(3600)
