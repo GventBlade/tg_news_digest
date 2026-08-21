@@ -1,6 +1,7 @@
-import logging
 import json
-from typing import List, Dict, Any
+import logging
+import time
+from typing import Any, Dict, List
 from google import genai
 from google.genai import types
 from app.config import settings
@@ -12,10 +13,13 @@ class NewsSummarizer:
     def __init__(self):
         self.client = genai.Client(api_key=settings.GEMINI_API_KEY)
 
-    def select_top_distinct_news(self, posts: List[Dict[str, Any]], count: int = 10) -> List[Dict[str, Any]]:
+    def select_top_distinct_news(
+        self, posts: List[Dict[str, Any]], count: int = 10, max_retries: int = 3
+    ) -> List[Dict[str, Any]]:
         """
         Аналізує масив новин за 6 годин, прибирає дублікати
         і формує ТОП-10 унікальних тем без нав'язливих маркерів.
+        Включає автоматичний retry при тимчасових збоях 503 / 429 API.
         """
         if not posts:
             return []
@@ -29,7 +33,9 @@ class NewsSummarizer:
             else:
                 media_tag = "[ТЕКСТ]"
 
-            posts_context.append(f"ID {idx} {media_tag} [{p['channel_title']}]: {p['text']}")
+            posts_context.append(
+                f"ID {idx} {media_tag} [{p['channel_title']}]: {p['text']}"
+            )
 
         all_text = "\n---\n".join(posts_context)
 
@@ -65,17 +71,50 @@ class NewsSummarizer:
 {all_text[:40000]}
 """
 
-        try:
-            response = self.client.models.generate_content(
-                model="gemini-3.6-flash",
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0.2,
+        for attempt in range(1, max_retries + 1):
+            try:
+                response = self.client.models.generate_content(
+                    model="gemini-3.6-flash",
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        temperature=0.2,
+                    ),
                 )
-            )
-            data = json.loads(response.text)
-            return data.get("news", [])
-        except Exception as e:
-            logger.error(f"Помилка відбору топ-новин через Gemini: {e}")
-            return []
+
+                raw_text = response.text.strip()
+                # Захист від можливих markdown-тегів
+                if raw_text.startswith("```json"):
+                    raw_text = raw_text[7:]
+                if raw_text.startswith("```"):
+                    raw_text = raw_text[3:]
+                if raw_text.endswith("```"):
+                    raw_text = raw_text[:-3]
+
+                data = json.loads(raw_text.strip())
+                return data.get("news", [])
+
+            except Exception as e:
+                error_str = str(e)
+                if (
+                    "503" in error_str
+                    or "429" in error_str
+                    or "UNAVAILABLE" in error_str
+                    or "ResourceExhausted" in error_str
+                ):
+                    if attempt < max_retries:
+                        sleep_seconds = attempt * 5
+                        logger.warning(
+                            f"⚠️ Gemini API тимчасово перевантажено ({error_str[:60]}...). "
+                            f"Спроба {attempt}/{max_retries}. Очікування {sleep_seconds} сек..."
+                        )
+                        time.sleep(sleep_seconds)
+                        continue
+
+                logger.error(
+                    f"❌ Помилка відбору топ-новин через Gemini (спроба {attempt}/{max_retries}): {e}"
+                )
+                if attempt == max_retries:
+                    return []
+
+        return []
