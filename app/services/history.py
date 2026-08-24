@@ -1,6 +1,7 @@
 import sqlite3
 import os
 from datetime import datetime, timedelta, timezone
+from typing import List
 
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -19,10 +20,17 @@ class NewsHistory:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     channel_name TEXT,
                     message_id INTEGER,
+                    published_title TEXT DEFAULT '',
                     published_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(channel_name, message_id)
                 )
             """)
+            # Міграція на випадок, якщо колонка ще не існує
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA table_info(published_news)")
+            columns = [col[1] for col in cursor.fetchall()]
+            if "published_title" not in columns:
+                cursor.execute("ALTER TABLE published_news ADD COLUMN published_title TEXT DEFAULT ''")
             conn.commit()
 
     def is_published(self, channel_name: str, message_id: int) -> bool:
@@ -35,20 +43,32 @@ class NewsHistory:
             )
             return cursor.fetchone() is not None
 
-    def mark_as_published(self, channel_name: str, message_id: int):
-        """Зберігає факт публікації."""
+    def mark_as_published(self, channel_name: str, message_id: int, title: str = ""):
+        """Зберігає факт публікації та заголовок новини."""
         try:
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute(
-                    "INSERT OR IGNORE INTO published_news (channel_name, message_id) VALUES (?, ?)",
-                    (channel_name, message_id)
+                    "INSERT OR IGNORE INTO published_news (channel_name, message_id, published_title) VALUES (?, ?, ?)",
+                    (channel_name, message_id, title)
                 )
                 conn.commit()
         except Exception:
             pass
 
+    def get_recent_titles(self, hours: int = 24) -> List[str]:
+        """Отримує заголовки новин, опублікованих за останні години, для уникнення повторів."""
+        threshold = datetime.now(timezone.utc) - timedelta(hours=hours)
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT published_title FROM published_news WHERE published_at > ? AND published_title != ''",
+                (threshold,)
+            )
+            rows = cursor.fetchall()
+            return [r[0] for r in rows if r[0]]
+
     def cleanup_old_records(self, days: int = 2):
-        """Видаляє записи старші за 2 дні, щоб база завжди була крихітною."""
+        """Видаляє записи старші за 2 дні."""
         threshold = datetime.now(timezone.utc) - timedelta(days=days)
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("DELETE FROM published_news WHERE published_at < ?", (threshold,))
