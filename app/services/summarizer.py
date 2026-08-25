@@ -12,17 +12,26 @@ logger = logging.getLogger(__name__)
 class NewsSummarizer:
     def __init__(self):
         self.client = genai.Client(api_key=settings.GEMINI_API_KEY)
+        # Каскад моделей у порядку пріоритету:
+        self.models_priority = [
+            "gemini-3.7-flash",
+            "gemini-3.6-flash",
+            "gemini-3.5-flash",
+            "gemini-3.5-flash-lite",
+            "gemini-3.1-flash-lite",
+        ]
 
     def select_top_distinct_news(
         self,
         posts: List[Dict[str, Any]],
         past_titles: Optional[List[str]] = None,
         count: int = 10,
-        max_retries: int = 3
+        max_retries_per_model: int = 2
     ) -> List[Dict[str, Any]]:
         """
         Аналізує масив новин за 4 години, прибирає дублікати відносно поточної вибірки
         та відносно вже опублікованих тем за минулу добу.
+        Використовує каскадне перемикання на резервні моделі при 503 / 429 збоях.
         """
         if not posts:
             return []
@@ -85,49 +94,55 @@ class NewsSummarizer:
 {all_text[:40000]}
 """
 
-        for attempt in range(1, max_retries + 1):
-            try:
-                response = self.client.models.generate_content(
-                    model="gemini-3.7-flash",
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        temperature=0.2,
-                    ),
-                )
+        # Каскадний прохід по моделях
+        for model_name in self.models_priority:
+            for attempt in range(1, max_retries_per_model + 1):
+                try:
+                    logger.info(f"Спроба генерації через {model_name} (спроба {attempt}/{max_retries_per_model})...")
 
-                raw_text = response.text.strip()
-                if raw_text.startswith("```json"):
-                    raw_text = raw_text[7:]
-                if raw_text.startswith("```"):
-                    raw_text = raw_text[3:]
-                if raw_text.endswith("```"):
-                    raw_text = raw_text[:-3]
+                    response = self.client.models.generate_content(
+                        model=model_name,
+                        contents=prompt,
+                        config=types.GenerateContentConfig(
+                            response_mime_type="application/json",
+                            temperature=0.2,
+                        ),
+                    )
 
-                data = json.loads(raw_text.strip())
-                return data.get("news", [])
+                    raw_text = response.text.strip()
+                    if raw_text.startswith("```json"):
+                        raw_text = raw_text[7:]
+                    if raw_text.startswith("```"):
+                        raw_text = raw_text[3:]
+                    if raw_text.endswith("```"):
+                        raw_text = raw_text[:-3]
 
-            except Exception as e:
-                error_str = str(e)
-                if (
-                    "503" in error_str
-                    or "429" in error_str
-                    or "UNAVAILABLE" in error_str
-                    or "ResourceExhausted" in error_str
-                ):
-                    if attempt < max_retries:
-                        sleep_seconds = attempt * 5
+                    data = json.loads(raw_text.strip())
+                    selected_news = data.get("news", [])
+                    if selected_news:
+                        logger.info(f"✅ Успішно отримано {len(selected_news)} новин через модель {model_name}")
+                        return selected_news
+
+                except Exception as e:
+                    error_str = str(e)
+                    is_retryable = any(
+                        err_code in error_str
+                        for err_code in ["503", "429", "UNAVAILABLE", "ResourceExhausted", "high demand", "NOT_FOUND"]
+                    )
+
+                    if is_retryable:
                         logger.warning(
-                            f"⚠️ Gemini API тимчасово перевантажено ({error_str[:60]}...). "
-                            f"Спроба {attempt}/{max_retries}. Очікування {sleep_seconds} сек..."
+                            f"⚠️ Модель {model_name} повернула помилку або недоступна ({error_str[:70]}...)."
                         )
-                        time.sleep(sleep_seconds)
-                        continue
+                        if attempt < max_retries_per_model:
+                            time.sleep(3 * attempt)
+                            continue
+                        else:
+                            logger.info(f"🔄 Перемикаємося на наступну модель у ланцюжку...")
+                            break
+                    else:
+                        logger.error(f"❌ Помилка запиту до {model_name}: {e}")
+                        break
 
-                logger.error(
-                    f"❌ Помилка відбору топ-новин через Gemini (спроба {attempt}/{max_retries}): {e}"
-                )
-                if attempt == max_retries:
-                    return []
-
+        logger.error("❌ Усі доступні моделі Gemini вичерпали спроби або недоступні.")
         return []
