@@ -130,7 +130,7 @@ async def main():
     )
 
     scheduler.start()
-    logger.info("⏳ Планувальник 4/24 запущено. Очікування наступного слоту (57 хв)...")
+    logger.info("⏳ Планувальник 4/24 запущено. Очікування наступного слоту (58 хв)...")
 
     while True:
         await asyncio.sleep(3600)
