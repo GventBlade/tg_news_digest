@@ -1,6 +1,7 @@
 import json
 import logging
 import math
+import re
 import time
 from typing import Any, Dict, List, Optional
 from google import genai
@@ -17,7 +18,8 @@ class NewsSummarizer:
     MAX_INPUT_CHARS = 50000
     MAX_EVENT_SOURCE_CHARS = 2500
     MAX_NEWS_CHARS = 350
-    ALLOWED_CATEGORIES = {"war", "politics", "economy", "international", "society", "technology", "science", "culture", "other"}
+    ALLOWED_CATEGORIES = {"war", "politics", "economy", "international", "society", "technology", "science", "culture",
+                          "other"}
 
     def __init__(self):
         self.client = genai.Client(api_key=settings.GEMINI_API_KEY)
@@ -70,7 +72,8 @@ class NewsSummarizer:
             prepared.append({
                 "idx": idx, "text": text, "media_tag": media_tag,
                 "channel_title": channel_title, "channel_username": channel_username,
-                "views": views, "score": (20 if media_tag == "[ВІДЕО]" else (10 if media_tag == "[ФОТО]" else 0)) + min(math.log10(max(views, 1)) * 5, 35)
+                "views": views, "score": (20 if media_tag == "[ВІДЕО]" else (10 if media_tag == "[ФОТО]" else 0)) + min(
+                    math.log10(max(views, 1)) * 5, 35)
             })
 
         if not prepared:
@@ -88,7 +91,8 @@ class NewsSummarizer:
 
         return "\n\n---\n\n".join(result)
 
-    def _analyze_events(self, posts_context: str, past_titles: Optional[List[str]], max_retries: int) -> List[Dict[str, Any]]:
+    def _analyze_events(self, posts_context: str, past_titles: Optional[List[str]], max_retries: int) -> List[
+        Dict[str, Any]]:
         history_block = self._build_history_block(past_titles)
         prompt = f"""Ти — старший новинний аналітик редакції "Новини UA 6/24".
 ТВОЄ ЗАВДАННЯ: знайти реальні події, об'єднати всі повідомлення про одну подію в одну EVENT, відкинути інформаційний шум і оцінити показники (0-100).
@@ -151,10 +155,13 @@ TELEGRAM POSTS:
                 has_video = any(posts[s].get("has_video") for s in src_ids)
                 has_media = any(posts[s].get("has_media") for s in src_ids)
 
-                score = (imp * 0.35 + scale * 0.15 + rel * 0.20 + pub * 0.12 + nov * 0.08 + med * 0.05 + min(len(src_ids) * 2, 8))
+                score = (imp * 0.35 + scale * 0.15 + rel * 0.20 + pub * 0.12 + nov * 0.08 + med * 0.05 + min(
+                    len(src_ids) * 2, 8))
                 score += 3 if has_video else (1 if has_media else 0)
-                if rel < 45: score -= 15
-                elif rel < 60: score -= 7
+                if rel < 45:
+                    score -= 15
+                elif rel < 60:
+                    score -= 7
                 if len(src_ids) == 1: score -= 2
 
                 cat = ev.get("category", "other")
@@ -190,7 +197,8 @@ TELEGRAM POSTS:
             for s_id in ev.get("source_ids", []):
                 p = posts[s_id]
                 media = "[ВІДЕО]" if p.get("has_video") else ("[ФОТО]" if p.get("has_media") else "[ТЕКСТ]")
-                sources_txt.append(f"ID {s_id} {media} [{p.get('channel_title', 'Джерело')}]: {p.get('text', '')[:self.MAX_EVENT_SOURCE_CHARS]}")
+                sources_txt.append(
+                    f"ID {s_id} {media} [{p.get('channel_title', 'Джерело')}]: {p.get('text', '')[:self.MAX_EVENT_SOURCE_CHARS]}")
 
             ev_blocks.append(
                 f"EVENT ID: {ev.get('event_id')} | CAT: {ev.get('category')} | SCORE: {ev.get('balanced_score')}\n"
@@ -206,8 +214,12 @@ TELEGRAM POSTS:
 ВИМОГИ:
 1. 1 EVENT = 1 НОВИНА. Жодних повторів і поділу однієї події.
 2. МЕДІА: 7-8 новин повинні мати [ФОТО]/[ВІДЕО] (1-2 обов'язково [ВІДЕО]). Лише 1-2 можуть бути [ТЕКСТ].
-3. ФОРМАТ: До 350 символів. Перший рядок: ОДИН тематичний емодзі (🇺🇦, 🇺🇸, 💥, 🚀, ⚖️, 🏛, 🛢, 📹, 🌍, 💰, ⚡) + <b>Короткий жирний заголовок</b>. Далі 2-3 короткі речення з фактами й цифрами.
-4. ЗАБОРОНЕНО: маркери 📍, 📌, клікбейт та непідтверджені чутки.
+3. СТИЛЬ ТА ФОРМАТ ТЕКСТУ:
+   - До 350 символів на новину.
+   - Перший рядок: ОДИН тематичний емодзі (🇺🇦, 🇺🇸, 💥, 🚀, ⚖️, 🏛, 🛢, 📹, 🌍, 💰, ⚡) + <b>Короткий жирний заголовок</b>.
+   - СУВОРА ЗАБОРОНА: НЕ пиши в тексті та заголовку слова на кшталт "[ФОТО]", "[ВІДЕО]", "[ТЕКСТ]", "ФОТО:", "ВІДЕО:". Ці теги були лише для твоєї службової аналітики.
+   - ЗАБОРОНЕНО використовувати маркери 📍, 📌, клікбейт та непідтверджені чутки.
+   - Основний текст: 2-3 короткі речення з фактами й цифрами.
 
 Формат відповіді ТІЛЬКИ JSON:
 {{
@@ -225,7 +237,8 @@ TELEGRAM POSTS:
         data = self._call_json_with_cascade(prompt, max_retries, "EDITOR")
         return data.get("news", []) if data and isinstance(data.get("news"), list) else []
 
-    def _validate_final_news(self, news: List[Dict[str, Any]], posts: List[Dict[str, Any]], count: int) -> List[Dict[str, Any]]:
+    def _validate_final_news(self, news: List[Dict[str, Any]], posts: List[Dict[str, Any]], count: int) -> List[
+        Dict[str, Any]]:
         if not isinstance(news, list):
             return []
 
@@ -240,6 +253,12 @@ TELEGRAM POSTS:
                 continue
 
             text = text.strip()
+
+            # Примусово очищаємо залишки будь-яких службових тегів медіа з тексту
+            text = re.sub(r'\[(ФОТО\vert{}ВІДЕО\vert{}ТЕКСТ\vert{}PHOTO\vert{}VIDEO\vert{}TEXT)\]\s*', '', text,
+                          flags=re.IGNORECASE)
+            text = re.sub(r'(ФОТО|ВІДЕО|ТЕКСТ):\s*', '', text, flags=re.IGNORECASE)
+
             if "📍" in text or "📌" in text or "<b>" not in text or "</b>" not in text:
                 continue
 
@@ -248,7 +267,7 @@ TELEGRAM POSTS:
                 last_sp = text.rfind(" ")
                 text = (text[:last_sp].rstrip() if last_sp > 200 else text) + "…"
 
-            validated.append({"source_id": s_id, "text": text})
+            validated.append({"source_id": s_id, "text": text.strip()})
             used_ids.add(s_id)
             if len(validated) >= count:
                 break
@@ -283,8 +302,10 @@ TELEGRAM POSTS:
     @staticmethod
     def _clean_json_response(text: str) -> str:
         text = text.strip()
-        if text.startswith("```json"): text = text[7:]
-        elif text.startswith("```"): text = text[3:]
+        if text.startswith("```json"):
+            text = text[7:]
+        elif text.startswith("```"):
+            text = text[3:]
         if text.endswith("```"): text = text[:-3]
         return text.strip()
 
@@ -292,7 +313,8 @@ TELEGRAM POSTS:
         if not past_titles:
             return "Історія опублікованих тем відсутня."
         titles = [t.strip() for t in past_titles[-self.HISTORY_LIMIT:] if t and t.strip()]
-        return "ВЖЕ ОПУБЛІКОВАНІ ТЕМИ:\n" + "\n".join(f"- {t}" for t in titles) if titles else "Історія опублікованих тем відсутня."
+        return "ВЖЕ ОПУБЛІКОВАНІ ТЕМИ:\n" + "\n".join(
+            f"- {t}" for t in titles) if titles else "Історія опублікованих тем відсутня."
 
     @staticmethod
     def _safe_score(val: Any) -> float:
@@ -307,4 +329,5 @@ TELEGRAM POSTS:
             p = posts[s_id]
             bonus = 20 if p.get("has_video") else (10 if p.get("has_media") else 0)
             return bonus + min(math.log10(max(p.get("views", 0) or 0, 1)) * 2, 15)
+
         return max(source_ids, key=score)
