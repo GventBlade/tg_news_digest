@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import time
 from typing import Any, Dict, List, Optional
 from google import genai
@@ -10,137 +11,300 @@ logger = logging.getLogger(__name__)
 
 
 class NewsSummarizer:
+    DEFAULT_COUNT = 10
+    ANALYZER_CANDIDATES = 25
+    HISTORY_LIMIT = 30
+    MAX_INPUT_CHARS = 50000
+    MAX_EVENT_SOURCE_CHARS = 2500
+    MAX_NEWS_CHARS = 350
+    ALLOWED_CATEGORIES = {"war", "politics", "economy", "international", "society", "technology", "science", "culture", "other"}
+
     def __init__(self):
         self.client = genai.Client(api_key=settings.GEMINI_API_KEY)
-        # Каскад моделей у порядку пріоритету:
-        self.models_priority = [
-            "gemini-3.5-flash",
-            "gemini-3.5-flash-lite",
-            "gemini-3.1-flash-lite",
-        ]
+        self.models_priority = ["gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
 
     def select_top_distinct_news(
         self,
         posts: List[Dict[str, Any]],
         past_titles: Optional[List[str]] = None,
-        count: int = 10,
-        max_retries_per_model: int = 2
+        count: int = DEFAULT_COUNT,
+        max_retries_per_model: int = 2,
     ) -> List[Dict[str, Any]]:
-        """
-        Аналізує масив новин за 4 години, прибирає дублікати відносно поточної вибірки
-        та відносно вже опублікованих тем за минулу добу.
-        Використовує каскадне перемикання на резервні моделі при 503 / 429 збоях.
-        """
         if not posts:
             return []
 
-        posts_context = []
-        for idx, p in enumerate(posts):
-            if p.get("has_video"):
-                media_tag = "[ВІДЕО]"
-            elif p.get("has_media"):
-                media_tag = "[ФОТО]"
-            else:
-                media_tag = "[ТЕКСТ]"
+        logger.info(f"Формування дайджесту: {len(posts)} постів → TOP {count}")
+        posts_context = self._build_posts_context(posts)
+        if not posts_context:
+            return []
 
-            posts_context.append(
-                f"ID {idx} {media_tag} [{p['channel_title']}]: {p['text']}"
-            )
+        # Крок 1: Аналіз та дедуплікація подій
+        analyzed_events = self._analyze_events(posts_context, past_titles, max_retries_per_model)
+        if not analyzed_events:
+            return []
 
-        all_text = "\n---\n".join(posts_context)
+        # Крок 2: Python Scoring та балансування
+        ranked_events = self._rank_events(analyzed_events, posts)
+        ranked_events = ranked_events[:max(count * 2, self.ANALYZER_CANDIDATES)]
 
-        history_block = ""
-        if past_titles:
-            recent_list = "\n- ".join(past_titles[-30:])
-            history_block = f"""
-ВЖЕ ОПУБЛІКОВАНІ ТЕМИ ЗА ДОБУ (СУВОРО ЗАБОРОНЕНО ПОВТОРЮВАТИ АБО РОБИТИ СХОЖІ ПОСТИ НА ЦІ ТЕМИ):
-- {recent_list}
-"""
+        # Крок 3: Фінальна генерація текстів редактором
+        final_news = self._generate_final_digest(ranked_events, posts, past_titles, count, max_retries_per_model)
 
-        prompt = f"""
-Ти — головний редактор провідного новинного Telegram-каналу "Новини UA 4/24".
-Перед тобою всі повідомлення з українських медіа за останні години.
+        # Крок 4: Валідація результату
+        validated = self._validate_final_news(final_news, posts, count)
+        logger.info(f"Фінальний дайджест сформовано: {len(validated)}/{count} новин")
+        return validated
 
-ТВОЄ ЗАВДАННЯ:
-1. Відібрати РІВНО {count} НАЙВАЖЛИВІШИХ і принципово РІЗНИХ новинних тем.
-2. ВАЖЛИВА ВИМОГА ДО КОНТЕНТУ: серед обраних новин ОБОВ'ЯЗКОВО має бути щонайменше 1-2 важливі події з міткою [ВІДЕО] (робота ППО, фронт, наслідки атак, обміни полоненими тощо).
-3. БАЛАНС ТЕМ: фронт/ЗСУ, важливі рішення влади/закони/виплати (з цифрами), ключові міста, міжнародна політика.
-4. Для кожного пункту вкажи `source_id` поста з найкращим джерелом/медіа.
+    def _build_posts_context(self, posts: List[Dict[str, Any]]) -> str:
+        prepared = []
+        for idx, post in enumerate(posts):
+            text = (post.get("text") or "").strip()
+            if not text:
+                continue
 
-СУВОРІ ЗАБОРОНИ ТА ФІЛЬТРИ (ВІДКИДАТИ ОДРАЗУ):
-- СИТУАТИВНИЙ РАДАРНИЙ МОНІТОРИНГ ТА ТРИВОГИ: ЗАБОРОНЕНО публікувати рух БпЛА, "Шахеди курсують на Дніпро/Одесу", загрози балістики, пуски КАБів чи вибухи без підтверджених наслідків. Канал не є радаром тривог.
-- ПОВТОРИ: ЖОДНИХ дублів як всередині поточної вибірки, так і з темами, які вже публікувалися раніше (звіряйся зі списком нижче).
-- ДРІБНИЙ ПОБУТОВИЙ КРИМІНАЛ (якщо це не резонансна подія національного масштабу), чутки та рекламу.
+            media_tag = "[ВІДЕО]" if post.get("has_video") else ("[ФОТО]" if post.get("has_media") else "[ТЕКСТ]")
+            channel_title = post.get("channel_title") or post.get("channel_username") or "Джерело"
+            channel_username = str(post.get("channel_username") or "").replace("@", "").strip()
+            views = int(post.get("views") or 0)
+
+            prepared.append({
+                "idx": idx, "text": text, "media_tag": media_tag,
+                "channel_title": channel_title, "channel_username": channel_username,
+                "views": views, "score": (20 if media_tag == "[ВІДЕО]" else (10 if media_tag == "[ФОТО]" else 0)) + min(math.log10(max(views, 1)) * 5, 35)
+            })
+
+        if not prepared:
+            return ""
+
+        prepared.sort(key=lambda x: x["score"], reverse=True)
+        result, current_length = [], 0
+
+        for item in prepared:
+            block = f"ID {item['idx']} {item['media_tag']} [{item['channel_title']}] @{item['channel_username']}\nПерегляди: {item['views']}\n{item['text']}"
+            if current_length + len(block) > self.MAX_INPUT_CHARS:
+                continue
+            result.append(block)
+            current_length += len(block) + 10
+
+        return "\n\n---\n\n".join(result)
+
+    def _analyze_events(self, posts_context: str, past_titles: Optional[List[str]], max_retries: int) -> List[Dict[str, Any]]:
+        history_block = self._build_history_block(past_titles)
+        prompt = f"""Ти — старший новинний аналітик редакції "Новини UA 6/24".
+ТВОЄ ЗАВДАННЯ: знайти реальні події, об'єднати всі повідомлення про одну подію в одну EVENT, відкинути інформаційний шум і оцінити показники (0-100).
+
+ПРАВИЛО ДЕДУПЛІКАЦІЇ: Одна реальна подія (атака, робота ППО, наслідки, заяви влади, жертви) = ОДНА EVENT.
+
 {history_block}
-ВИМОГИ ДО ОФОРМЛЕННЯ ТА СТИЛЮ ТЕКСТУ:
-- Загальний розмір тексту — до 350 символів.
-- Перший рядок: один тематичний емодзі за змістом події (наприклад, 📹, 🚀, ⚖️, 🏛, 🛢, 🛡) + жирний чіткий заголовок.
-- Основний текст: 2-3 короткі змістовні речення/абзаци з фактами та цифрами.
-- СУВОРА ЗАБОРОНА: НЕ використовуй червоні маркери-булавки (📍, 📌) на початку кожного рядка. Текст має читатися чисто (використовуй звичайний відступ або тире "—").
 
-Формат відповіді ВИКЛЮЧНО JSON:
+ФІЛЬТРИ ВІДКИДАННЯ:
+- Щоденні рутинні обстріли прифронтових міст/сіл (Нікополь, прифронтовий Херсон, села Сумщини тощо) без масових жертв або стратегічних наслідків.
+- Радарний шум (рух дронів, пуски КАБ, загрози без влучань), комуналка, дрібні ДТП і локальний транспорт.
+
+ОЦІНКА: importance, scale, reliability, public_interest, novelty, media_value (всі від 0 до 100).
+
+Відповідь ТІЛЬКИ у форматі JSON:
 {{
-  "news": [
+  "events": [
     {{
-      "source_id": 0,
-      "text": "🛢 <b>У Росії через дефіцит бензину стрімко зріс попит на каністри</b>\\n\\nКількість пошукових запитів на маркетплейсах зросла в чотири рази.\\n\\nДефіцит загострюється через систематичні удари по російських НПЗ."
+      "event_id": "E1",
+      "source_ids": [0, 2],
+      "best_source_id": 0,
+      "category": "war",
+      "importance": 90,
+      "scale": 85,
+      "reliability": 90,
+      "public_interest": 90,
+      "novelty": 80,
+      "media_value": 85,
+      "headline_hint": "Масована атака на об'єкт",
+      "summary": "Короткий опис"
     }}
   ]
 }}
 
-Новини для обробки:
-{all_text[:40000]}
-"""
+TELEGRAM POSTS:
+{posts_context}"""
 
-        # Каскадний прохід по моделях
-        for model_name in self.models_priority:
-            for attempt in range(1, max_retries_per_model + 1):
+        data = self._call_json_with_cascade(prompt, max_retries, "ANALYZER")
+        return data.get("events", []) if data and isinstance(data.get("events"), list) else []
+
+    def _rank_events(self, events: List[Dict[str, Any]], posts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        ranked, cat_counts = [], {}
+
+        for ev in events:
+            try:
+                src_ids = [s for s in ev.get("source_ids", []) if isinstance(s, int) and 0 <= s < len(posts)]
+                best_id = ev.get("best_source_id")
+                if not src_ids and isinstance(best_id, int) and 0 <= best_id < len(posts):
+                    src_ids = [best_id]
+                if not src_ids:
+                    continue
+
+                imp = self._safe_score(ev.get("importance"))
+                scale = self._safe_score(ev.get("scale"))
+                rel = self._safe_score(ev.get("reliability"))
+                pub = self._safe_score(ev.get("public_interest"))
+                nov = self._safe_score(ev.get("novelty"))
+                med = self._safe_score(ev.get("media_value"))
+
+                has_video = any(posts[s].get("has_video") for s in src_ids)
+                has_media = any(posts[s].get("has_media") for s in src_ids)
+
+                score = (imp * 0.35 + scale * 0.15 + rel * 0.20 + pub * 0.12 + nov * 0.08 + med * 0.05 + min(len(src_ids) * 2, 8))
+                score += 3 if has_video else (1 if has_media else 0)
+                if rel < 45: score -= 15
+                elif rel < 60: score -= 7
+                if len(src_ids) == 1: score -= 2
+
+                cat = ev.get("category", "other")
+                if cat not in self.ALLOWED_CATEGORIES: cat = "other"
+
+                cur_c = cat_counts.get(cat, 0)
+                bal_score = score - (8 if cur_c >= 4 else (3 if cur_c >= 3 else 0))
+                cat_counts[cat] = cur_c + 1
+
+                ev_copy = dict(ev)
+                ev_copy.update({
+                    "source_ids": src_ids,
+                    "best_source_id": self._select_best_source(src_ids, posts),
+                    "has_video": has_video,
+                    "has_media": has_media,
+                    "category": cat,
+                    "balanced_score": round(bal_score, 2)
+                })
+                ranked.append(ev_copy)
+            except Exception as e:
+                logger.warning(f"Помилка ранжування події: {e}")
+
+        ranked.sort(key=lambda x: x.get("balanced_score", 0), reverse=True)
+        return ranked
+
+    def _generate_final_digest(
+        self, events: List[Dict[str, Any]], posts: List[Dict[str, Any]],
+        past_titles: Optional[List[str]], count: int, max_retries: int
+    ) -> List[Dict[str, Any]]:
+        ev_blocks = []
+        for ev in events:
+            sources_txt = []
+            for s_id in ev.get("source_ids", []):
+                p = posts[s_id]
+                media = "[ВІДЕО]" if p.get("has_video") else ("[ФОТО]" if p.get("has_media") else "[ТЕКСТ]")
+                sources_txt.append(f"ID {s_id} {media} [{p.get('channel_title', 'Джерело')}]: {p.get('text', '')[:self.MAX_EVENT_SOURCE_CHARS]}")
+
+            ev_blocks.append(
+                f"EVENT ID: {ev.get('event_id')} | CAT: {ev.get('category')} | SCORE: {ev.get('balanced_score')}\n"
+                f"SUMMARY: {ev.get('summary', '')}\nSOURCES:\n" + "\n".join(sources_txt)
+            )
+
+        history_block = self._build_history_block(past_titles)
+        prompt = f"""Ти — головний редактор Telegram-каналу "Новини UA 6/24".
+Створи фінальний дайджест із РІВНО {count} найкращих, найрезонансніших і принципово РІЗНИХ новин.
+
+{history_block}
+
+ВИМОГИ:
+1. 1 EVENT = 1 НОВИНА. Жодних повторів і поділу однієї події.
+2. МЕДІА: 7-8 новин повинні мати [ФОТО]/[ВІДЕО] (1-2 обов'язково [ВІДЕО]). Лише 1-2 можуть бути [ТЕКСТ].
+3. ФОРМАТ: До 350 символів. Перший рядок: ОДИН тематичний емодзі (🇺🇦, 🇺🇸, 💥, 🚀, ⚖️, 🏛, 🛢, 📹, 🌍, 💰, ⚡) + <b>Короткий жирний заголовок</b>. Далі 2-3 короткі речення з фактами й цифрами.
+4. ЗАБОРОНЕНО: маркери 📍, 📌, клікбейт та непідтверджені чутки.
+
+Формат відповіді ТІЛЬКИ JSON:
+{{
+  "news": [
+    {{
+      "source_id": 0,
+      "text": "🛢 <b>Заголовок новини</b>\\n\\nТекст події з фактами."
+    }}
+  ]
+}}
+
+ВІДІБРАНІ EVENT:
+{chr(10).join(ev_blocks)}"""
+
+        data = self._call_json_with_cascade(prompt, max_retries, "EDITOR")
+        return data.get("news", []) if data and isinstance(data.get("news"), list) else []
+
+    def _validate_final_news(self, news: List[Dict[str, Any]], posts: List[Dict[str, Any]], count: int) -> List[Dict[str, Any]]:
+        if not isinstance(news, list):
+            return []
+
+        validated, used_ids = [], set()
+        for item in news:
+            if not isinstance(item, dict):
+                continue
+            s_id, text = item.get("source_id"), item.get("text")
+            if not (isinstance(s_id, int) and 0 <= s_id < len(posts)) or s_id in used_ids:
+                continue
+            if not isinstance(text, str) or not text.strip():
+                continue
+
+            text = text.strip()
+            if "📍" in text or "📌" in text or "<b>" not in text or "</b>" not in text:
+                continue
+
+            if len(text) > self.MAX_NEWS_CHARS:
+                text = text[:self.MAX_NEWS_CHARS]
+                last_sp = text.rfind(" ")
+                text = (text[:last_sp].rstrip() if last_sp > 200 else text) + "…"
+
+            validated.append({"source_id": s_id, "text": text})
+            used_ids.add(s_id)
+            if len(validated) >= count:
+                break
+
+        return validated
+
+    def _call_json_with_cascade(self, prompt: str, max_retries: int, op_name: str) -> Optional[Dict[str, Any]]:
+        for model in self.models_priority:
+            for attempt in range(1, max_retries + 1):
                 try:
-                    logger.info(f"Спроба генерації через {model_name} (спроба {attempt}/{max_retries_per_model})...")
-
+                    logger.info(f"{op_name}: спроба {attempt}/{max_retries} через {model}...")
                     response = self.client.models.generate_content(
-                        model=model_name,
+                        model=model,
                         contents=prompt,
-                        config=types.GenerateContentConfig(
-                            response_mime_type="application/json",
-                            temperature=0.2,
-                        ),
+                        config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.2),
                     )
-
-                    raw_text = response.text.strip()
-                    if raw_text.startswith("```json"):
-                        raw_text = raw_text[7:]
-                    if raw_text.startswith("```"):
-                        raw_text = raw_text[3:]
-                    if raw_text.endswith("```"):
-                        raw_text = raw_text[:-3]
-
-                    data = json.loads(raw_text.strip())
-                    selected_news = data.get("news", [])
-                    if selected_news:
-                        logger.info(f"✅ Успішно отримано {len(selected_news)} новин через модель {model_name}")
-                        return selected_news
-
+                    raw_text = self._clean_json_response((response.text or "").strip())
+                    data = json.loads(raw_text)
+                    if isinstance(data, dict):
+                        return data
                 except Exception as e:
-                    error_str = str(e)
-                    is_retryable = any(
-                        err_code in error_str
-                        for err_code in ["503", "429", "UNAVAILABLE", "ResourceExhausted", "high demand", "NOT_FOUND"]
-                    )
-
-                    if is_retryable:
-                        logger.warning(
-                            f"⚠️ Модель {model_name} повернула помилку або недоступна ({error_str[:70]}...)."
-                        )
-                        if attempt < max_retries_per_model:
+                    err = str(e)
+                    if any(c in err for c in ["503", "429", "UNAVAILABLE", "ResourceExhausted", "NOT_FOUND"]):
+                        if attempt < max_retries:
                             time.sleep(3 * attempt)
                             continue
-                        else:
-                            logger.info(f"🔄 Перемикаємося на наступну модель у ланцюжку...")
-                            break
-                    else:
-                        logger.error(f"❌ Помилка запиту до {model_name}: {e}")
                         break
+                    logger.error(f"Помилка {op_name} ({model}): {e}")
+                    break
+        return None
 
-        logger.error("❌ Усі доступні моделі Gemini вичерпали спроби або недоступні.")
-        return []
+    @staticmethod
+    def _clean_json_response(text: str) -> str:
+        text = text.strip()
+        if text.startswith("```json"): text = text[7:]
+        elif text.startswith("```"): text = text[3:]
+        if text.endswith("```"): text = text[:-3]
+        return text.strip()
+
+    def _build_history_block(self, past_titles: Optional[List[str]]) -> str:
+        if not past_titles:
+            return "Історія опублікованих тем відсутня."
+        titles = [t.strip() for t in past_titles[-self.HISTORY_LIMIT:] if t and t.strip()]
+        return "ВЖЕ ОПУБЛІКОВАНІ ТЕМИ:\n" + "\n".join(f"- {t}" for t in titles) if titles else "Історія опублікованих тем відсутня."
+
+    @staticmethod
+    def _safe_score(val: Any) -> float:
+        try:
+            return max(0.0, min(100.0, float(val)))
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def _select_best_source(source_ids: List[int], posts: List[Dict[str, Any]]) -> int:
+        def score(s_id: int) -> float:
+            p = posts[s_id]
+            bonus = 20 if p.get("has_video") else (10 if p.get("has_media") else 0)
+            return bonus + min(math.log10(max(p.get("views", 0) or 0, 1)) * 2, 15)
+        return max(source_ids, key=score)
