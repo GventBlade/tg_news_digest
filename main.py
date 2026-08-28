@@ -2,6 +2,7 @@ import asyncio
 from datetime import datetime, timedelta
 import logging
 import os
+import re
 import shutil
 from zoneinfo import ZoneInfo
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -9,6 +10,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 from app.services.collector import NewsCollector
 from app.services.history import NewsHistory
+from app.services.image_generator import AIImageGenerator
 from app.services.publisher import NewsPublisher
 from app.services.summarizer import NewsSummarizer
 
@@ -55,6 +57,7 @@ async def process_and_publish_news_cycle():
     summarizer = NewsSummarizer()
     publisher = NewsPublisher()
     history = NewsHistory()
+    image_gen = AIImageGenerator()
 
     try:
         # 1. Збір новин за останні 4 години
@@ -65,10 +68,10 @@ async def process_and_publish_news_cycle():
             logger.info("Нових новин за останні 4 години не виявлено.")
             return
 
-        # 2. Отримуємо заголовки за останні 24 години, щоб Gemini не дублювала теми
-        past_titles = history.get_recent_titles(hours=24)
+        # 2. Отримуємо заголовки за останні 48 годин для суворого блокування дублів
+        past_titles = history.get_recent_titles(hours=48)
 
-        # 3. Gemini відбирає ТОП-10 без дублів та без радарних тривог
+        # 3. Gemini відбирає ТОП-10 без повторів, радарних тривог та дрібниць
         top_news = summarizer.select_top_distinct_news(posts, past_titles=past_titles, count=10)
         logger.info(f"AI відібрав {len(top_news)} унікальних тем.")
 
@@ -81,27 +84,44 @@ async def process_and_publish_news_cycle():
         await asyncio.sleep(2)
 
         # 5. Публікуємо відібрані новини
-        for item in top_news:
+        for idx, item in enumerate(top_news):
             source_idx = item.get("source_id", 0)
             target_post = posts[source_idx] if 0 <= source_idx < len(posts) else posts[0]
 
+            # Спроба завантажити оригінальне медіа з донора
             media_path, media_type = await collector.download_post_media(target_post["message_obj"])
 
+            # Якщо оригінального фото/відео немає — генеруємо тематичну ілюстрацію через Imagen
+            if not media_path:
+                first_line = item["text"].strip().split("\n")[0]
+                clean_title = re.sub(r"<[^>]+>", "", first_line).strip()
+                clean_summary = re.sub(r"<[^>]+>", "", item["text"]).strip()
+
+                ai_image_path = image_gen.generate_news_image(
+                    headline=clean_title,
+                    summary=clean_summary[:200],
+                    news_id=idx
+                )
+                if ai_image_path:
+                    media_path = ai_image_path
+                    media_type = "photo"
+
+            # Публікація в канал
             await publisher.publish_news(
                 text=item["text"],
                 media_path=media_path,
                 media_type=media_type
             )
 
-            # Витягуємо перший рядок (заголовок) для збереження в базу
+            # Фіксація заголовка в базу (для дедуплікації наступних випусків)
             first_line = item["text"].strip().split("\n")[0]
-
             history.mark_as_published(
                 channel_name=target_post["channel_name"],
                 message_id=target_post["message_id"],
                 title=first_line
             )
 
+            # Очищення тимчасового файлу медіа
             if media_path and os.path.exists(media_path):
                 try:
                     os.remove(media_path)
@@ -110,7 +130,7 @@ async def process_and_publish_news_cycle():
 
             await asyncio.sleep(3)
 
-        history.cleanup_old_records(days=2)
+        history.cleanup_old_records(days=5)
         cleanup_downloads_folder()
 
         logger.info("✅ Випуск ТОП-10 успішно опубліковано, дублікати відфільтровано!")
@@ -126,11 +146,11 @@ async def main():
 
     scheduler.add_job(
         process_and_publish_news_cycle,
-        trigger=CronTrigger(hour="3,7,11,15,19,23", minute="58", timezone="Europe/Kyiv")
+        trigger=CronTrigger(hour="3,7,11,15,19,23", minute="57", timezone="Europe/Kyiv")
     )
 
     scheduler.start()
-    logger.info("⏳ Планувальник 4/24 запущено. Очікування наступного слоту (58 хв)...")
+    logger.info("⏳ Планувальник 4/24 запущено. Очікування наступного слоту (57 хв)...")
 
     while True:
         await asyncio.sleep(3600)

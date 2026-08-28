@@ -14,12 +14,14 @@ logger = logging.getLogger(__name__)
 class NewsSummarizer:
     DEFAULT_COUNT = 10
     ANALYZER_CANDIDATES = 25
-    HISTORY_LIMIT = 30
-    MAX_INPUT_CHARS = 50000
+    HISTORY_LIMIT = 100
+    MAX_INPUT_CHARS = 55000
     MAX_EVENT_SOURCE_CHARS = 2500
     MAX_NEWS_CHARS = 350
-    ALLOWED_CATEGORIES = {"war", "politics", "economy", "international", "society", "technology", "science", "culture",
-                          "other"}
+    ALLOWED_CATEGORIES = {
+        "war", "politics", "economy", "international", "society",
+        "technology", "science", "culture", "other"
+    }
 
     def __init__(self):
         self.client = genai.Client(api_key=settings.GEMINI_API_KEY)
@@ -40,7 +42,7 @@ class NewsSummarizer:
         if not posts_context:
             return []
 
-        # Крок 1: Аналіз та дедуплікація подій
+        # Крок 1: Аналіз, дедуплікація та відсіювання вже опублікованого
         analyzed_events = self._analyze_events(posts_context, past_titles, max_retries_per_model)
         if not analyzed_events:
             return []
@@ -70,9 +72,13 @@ class NewsSummarizer:
             views = int(post.get("views") or 0)
 
             prepared.append({
-                "idx": idx, "text": text, "media_tag": media_tag,
-                "channel_title": channel_title, "channel_username": channel_username,
-                "views": views, "score": (20 if media_tag == "[ВІДЕО]" else (10 if media_tag == "[ФОТО]" else 0)) + min(
+                "idx": idx,
+                "text": text,
+                "media_tag": media_tag,
+                "channel_title": channel_title,
+                "channel_username": channel_username,
+                "views": views,
+                "score": (25 if media_tag == "[ВІДЕО]" else (15 if media_tag == "[ФОТО]" else 0)) + min(
                     math.log10(max(views, 1)) * 5, 35)
             })
 
@@ -95,17 +101,22 @@ class NewsSummarizer:
         Dict[str, Any]]:
         history_block = self._build_history_block(past_titles)
         prompt = f"""Ти — старший новинний аналітик редакції "Новини UA 6/24".
-ТВОЄ ЗАВДАННЯ: знайти реальні події, об'єднати всі повідомлення про одну подію в одну EVENT, відкинути інформаційний шум і оцінити показники (0-100).
+ТВОЄ ЗАВДАННЯ:
+1. Знайти нові унікальні новинні події.
+2. Об'єднати всі повідомлення різних каналів про одну й ту саму подію в одну EVENT.
+3. СУВОРО ВІДСІЯТИ теми, які вже публікувалися (дивись список АРХІВ нижче). Якщо подія про смерть монарха, зсуви в Непалі чи танкери/нафту вже була — ПОВТОРНО НЕ БРАТИ!
 
-ПРАВИЛО ДЕДУПЛІКАЦІЇ: Одна реальна подія (атака, робота ППО, наслідки, заяви влади, жертви) = ОДНА EVENT.
-
+━━━━━━━━━━━━━━━━━━━━
+АРХІВ ВЖЕ ОПУБЛІКОВАНИХ ТЕМ (СУВОРО ЗАБОРОНЕНО ВИБИРАТИ СХОЖІ ТЕМИ):
 {history_block}
+━━━━━━━━━━━━━━━━━━━━
 
-ФІЛЬТРИ ВІДКИДАННЯ:
-- Щоденні рутинні обстріли прифронтових міст/сіл (Нікополь, прифронтовий Херсон, села Сумщини тощо) без масових жертв або стратегічних наслідків.
-- Радарний шум (рух дронів, пуски КАБ, загрози без влучань), комуналка, дрібні ДТП і локальний транспорт.
+СУВОРІ ФІЛЬТРИ:
+- ЗАБОРОНЕНО брати теми з АРХІВУ (інше формулювання тієї самої новини НЕ робить її новою).
+- ЗАБОРОНЕНО рутинні обстріли прифронтових міст/сіл (Нікополь, прифронтовий Херсон, села Сумщини) без масових жертв (від 5 загиблих) чи руйнувань ТЕЦ/НПЗ.
+- ЗАБОРОНЕНО радарний шум (рух дронів, загрози балістики без влучань), комуналку, перекриття доріг, дрібні ДТП.
 
-ОЦІНКА: importance, scale, reliability, public_interest, novelty, media_value (всі від 0 до 100).
+ОЦІНКА ПОКАЗНИКІВ (0-100): importance, scale, reliability, public_interest, novelty, media_value.
 
 Відповідь ТІЛЬКИ у форматі JSON:
 {{
@@ -121,7 +132,7 @@ class NewsSummarizer:
       "public_interest": 90,
       "novelty": 80,
       "media_value": 85,
-      "headline_hint": "Масована атака на об'єкт",
+      "headline_hint": "Масована атака на Київ",
       "summary": "Короткий опис"
     }}
   ]
@@ -157,7 +168,7 @@ TELEGRAM POSTS:
 
                 score = (imp * 0.35 + scale * 0.15 + rel * 0.20 + pub * 0.12 + nov * 0.08 + med * 0.05 + min(
                     len(src_ids) * 2, 8))
-                score += 3 if has_video else (1 if has_media else 0)
+                score += 5 if has_video else (3 if has_media else -5)  # Штраф за відсутність медіа
                 if rel < 45:
                     score -= 15
                 elif rel < 60:
@@ -209,17 +220,19 @@ TELEGRAM POSTS:
         prompt = f"""Ти — головний редактор Telegram-каналу "Новини UA 6/24".
 Створи фінальний дайджест із РІВНО {count} найкращих, найрезонансніших і принципово РІЗНИХ новин.
 
+━━━━━━━━━━━━━━━━━━━━
+АРХІВ ВЖЕ ОПУБЛІКОВАНИХ ТЕМ (СУВОРО ЗАБОРОНЕНО ПОВТОРЮВАТИ):
 {history_block}
+━━━━━━━━━━━━━━━━━━━━
 
 ВИМОГИ:
-1. 1 EVENT = 1 НОВИНА. Жодних повторів і поділу однієї події.
-2. МЕДІА: 7-8 новин повинні мати [ФОТО]/[ВІДЕО] (1-2 обов'язково [ВІДЕО]). Лише 1-2 можуть бути [ТЕКСТ].
-3. СТИЛЬ ТА ФОРМАТ ТЕКСТУ:
-   - До 350 символів на новину.
+1. 1 EVENT = 1 НОВИНА. Жодних дублів з архівом.
+2. ПРІОРИТЕТ МЕДІА: Більшість новин мають бути з [ФОТО] або [ВІДЕО].
+3. СТИЛЬ ТА ОФОРМЛЕННЯ:
+   - Розмір до 350 символів.
    - Перший рядок: ОДИН тематичний емодзі (🇺🇦, 🇺🇸, 💥, 🚀, ⚖️, 🏛, 🛢, 📹, 🌍, 💰, ⚡) + <b>Короткий жирний заголовок</b>.
-   - СУВОРА ЗАБОРОНА: НЕ пиши в тексті та заголовку слова на кшталт "[ФОТО]", "[ВІДЕО]", "[ТЕКСТ]", "ФОТО:", "ВІДЕО:". Ці теги були лише для твоєї службової аналітики.
-   - ЗАБОРОНЕНО використовувати маркери 📍, 📌, клікбейт та непідтверджені чутки.
-   - Основний текст: 2-3 короткі речення з фактами й цифрами.
+   - СУВОРО ЗАБОРОНЕНО вставляти у заголовок чи текст слова: "[ФОТО]", "[ВІДЕО]", "[ТЕКСТ]", "ФОТО:", "ВІДЕО:".
+   - ЗАБОРОНЕНО маркери 📍, 📌, клікбейт та непідтверджені чутки.
 
 Формат відповіді ТІЛЬКИ JSON:
 {{
@@ -254,7 +267,7 @@ TELEGRAM POSTS:
 
             text = text.strip()
 
-            # Примусово очищаємо залишки будь-яких службових тегів медіа з тексту
+            # Примусово очищаємо залишки службових слів
             text = re.sub(r'\[(ФОТО\vert{}ВІДЕО\vert{}ТЕКСТ\vert{}PHOTO\vert{}VIDEO\vert{}TEXT)\]\s*', '', text,
                           flags=re.IGNORECASE)
             text = re.sub(r'(ФОТО|ВІДЕО|ТЕКСТ):\s*', '', text, flags=re.IGNORECASE)
@@ -313,8 +326,7 @@ TELEGRAM POSTS:
         if not past_titles:
             return "Історія опублікованих тем відсутня."
         titles = [t.strip() for t in past_titles[-self.HISTORY_LIMIT:] if t and t.strip()]
-        return "ВЖЕ ОПУБЛІКОВАНІ ТЕМИ:\n" + "\n".join(
-            f"- {t}" for t in titles) if titles else "Історія опублікованих тем відсутня."
+        return "\n".join(f"- {t}" for t in titles) if titles else "Історія опублікованих тем відсутня."
 
     @staticmethod
     def _safe_score(val: Any) -> float:

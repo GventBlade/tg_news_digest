@@ -1,8 +1,10 @@
 import sqlite3
 import os
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import List
 
+logger = logging.getLogger(__name__)
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
 DB_PATH = os.path.join(DATA_DIR, "news_history.db")
@@ -25,7 +27,6 @@ class NewsHistory:
                     UNIQUE(channel_name, message_id)
                 )
             """)
-            # Міграція на випадок, якщо колонка ще не існує
             cursor = conn.cursor()
             cursor.execute("PRAGMA table_info(published_news)")
             columns = [col[1] for col in cursor.fetchall()]
@@ -52,11 +53,11 @@ class NewsHistory:
                     (channel_name, message_id, title)
                 )
                 conn.commit()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Не вдалося записати історію: {e}")
 
-    def get_recent_titles(self, hours: int = 24) -> List[str]:
-        """Отримує заголовки новин, опублікованих за останні години, для уникнення повторів."""
+    def get_recent_titles(self, hours: int = 48) -> List[str]:
+        """Отримує заголовки новин за останні 48 годин для суворого блокування дублів."""
         threshold = datetime.now(timezone.utc) - timedelta(hours=hours)
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
@@ -67,8 +68,8 @@ class NewsHistory:
             rows = cursor.fetchall()
             return [r[0] for r in rows if r[0]]
 
-    def cleanup_old_records(self, days: int = 2):
-        """Видаляє записи старші за 2 дні."""
+    def cleanup_old_records(self, days: int = 5):
+        """Видаляє записи старші за 5 днів."""
         threshold = datetime.now(timezone.utc) - timedelta(days=days)
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("DELETE FROM published_news WHERE published_at < ?", (threshold,))
