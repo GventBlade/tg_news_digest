@@ -19,16 +19,26 @@ class AIImageGenerator:
         ]
 
     def generate_news_image(self, headline: str, summary: str, news_id: int) -> str | None:
-        """Генерує швидку фотоілюстрацію стандартної HD якості для Telegram."""
+        """Генерує фотореалістичну репортажну ілюстрацію для Telegram."""
         prompt = (
-            f"Editorial news documentary photo: {headline}. "
-            f"Context: {summary}. Clean HD photo, realistic natural lighting, "
-            f"no text, no letters, no logos, no watermarks, 16:9 ratio."
+            f"Photorealistic editorial news photograph illustrating this event: {headline}. "
+            f"Context: {summary}. "
+            f"Create a realistic documentary-style photograph suitable for a reputable news publication. "
+            f"Focus on the main subject, location, event, or situation described in the news. "
+            f"Use natural lighting, realistic colors, authentic environments, believable human behavior, "
+            f"accurate proportions, natural composition, and realistic camera perspective. "
+            f"Do not invent specific people, quotes, brands, locations, or events that are not supported by the context. "
+            f"Avoid sensationalism, cinematic effects, exaggerated destruction, fantasy elements, "
+            f"staged-looking scenes, or misleading visual details. "
+            f"Professional photojournalism, high detail, sharp main subject, subtle photographic imperfections. "
+            f"No text, captions, letters, numbers, logos, watermarks, UI elements, or readable writing. "
+            f"Non-graphic and respectful photojournalism. "
+            f"Landscape 16:9 composition."
         )
 
         for model in self.image_models:
             try:
-                logger.info(f"Генерація HD-зображення для '{headline}' через {model}...")
+                logger.info(f"Генерація AI-зображення для '{headline}' через {model}...")
                 response = self.client.models.generate_content(
                     model=model,
                     contents=prompt,
@@ -47,7 +57,7 @@ class AIImageGenerator:
                             file_path = os.path.join(DOWNLOAD_DIR, f"ai_{news_id}_{int(time.time())}.jpg")
                             with open(file_path, "wb") as f:
                                 f.write(inline_data.data)
-                            logger.info(f"✅ HD-зображення створено: {file_path}")
+                            logger.info(f"✅ AI-зображення створено: {file_path}")
                             return file_path
 
             except Exception as e:
