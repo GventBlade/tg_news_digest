@@ -51,7 +51,7 @@ class NewsSummarizer:
         ranked_events = self._rank_events(analyzed_events, posts)
         ranked_events = ranked_events[:max(count * 2, self.ANALYZER_CANDIDATES)]
 
-        # Крок 3: Фінальна генерація текстів редактором
+        # Крок 3: Фінальна генерація текстів редактором із жорсткою прив'язкою за event_id
         final_news = self._generate_final_digest(ranked_events, posts, past_titles, count, max_retries_per_model)
 
         # Крок 4: Валідація результату
@@ -168,15 +168,17 @@ TELEGRAM POSTS:
 
                 score = (imp * 0.35 + scale * 0.15 + rel * 0.20 + pub * 0.12 + nov * 0.08 + med * 0.05 + min(
                     len(src_ids) * 2, 8))
-                score += 5 if has_video else (3 if has_media else -5)  # Штраф за відсутність медіа
+                score += 5 if has_video else (3 if has_media else -5)
                 if rel < 45:
                     score -= 15
                 elif rel < 60:
                     score -= 7
-                if len(src_ids) == 1: score -= 2
+                if len(src_ids) == 1:
+                    score -= 2
 
                 cat = ev.get("category", "other")
-                if cat not in self.ALLOWED_CATEGORIES: cat = "other"
+                if cat not in self.ALLOWED_CATEGORIES:
+                    cat = "other"
 
                 cur_c = cat_counts.get(cat, 0)
                 bal_score = score - (8 if cur_c >= 4 else (3 if cur_c >= 3 else 0))
@@ -202,23 +204,28 @@ TELEGRAM POSTS:
         self, events: List[Dict[str, Any]], posts: List[Dict[str, Any]],
         past_titles: Optional[List[str]], count: int, max_retries: int
     ) -> List[Dict[str, Any]]:
-        ev_blocks = []
-        for ev in events:
-            sources_txt = []
-            for s_id in ev.get("source_ids", []):
-                p = posts[s_id]
-                media = "[ВІДЕО]" if p.get("has_video") else ("[ФОТО]" if p.get("has_media") else "[ТЕКСТ]")
-                sources_txt.append(
-                    f"ID {s_id} {media} [{p.get('channel_title', 'Джерело')}]: {p.get('text', '')[:self.MAX_EVENT_SOURCE_CHARS]}")
+        # Відбираємо рівно потрібну кількість подій
+        target_events = events[:count]
+        if not target_events:
+            return []
 
+        ev_blocks = []
+        for ev in target_events:
+            best_id = ev.get("best_source_id")
+            p = posts[best_id]
+            media = "[ВІДЕО]" if p.get("has_video") else ("[ФОТО]" if p.get("has_media") else "[ТЕКСТ]")
+
+            # Передаємо лише першоджерело, закріплене за цією подією
             ev_blocks.append(
-                f"EVENT ID: {ev.get('event_id')} | CAT: {ev.get('category')} | SCORE: {ev.get('balanced_score')}\n"
-                f"SUMMARY: {ev.get('summary', '')}\nSOURCES:\n" + "\n".join(sources_txt)
+                f"=== EVENT_ID: {ev.get('event_id')} ===\n"
+                f"МЕДІА ДЖЕРЕЛА: {media} [{p.get('channel_title', 'Джерело')}]\n"
+                f"СУТЬ: {ev.get('summary', '')}\n"
+                f"ТЕКСТ ДЖЕРЕЛА: {p.get('text', '')[:self.MAX_EVENT_SOURCE_CHARS]}\n"
             )
 
         history_block = self._build_history_block(past_titles)
         prompt = f"""Ти — головний редактор Telegram-каналу "Новини UA 6/24".
-Створи фінальний дайджест із РІВНО {count} найкращих, найрезонансніших і принципово РІЗНИХ новин.
+Твоє завдання: написати лаконічні фінальні публікації для кожної події зі списку нижче.
 
 ━━━━━━━━━━━━━━━━━━━━
 АРХІВ ВЖЕ ОПУБЛІКОВАНИХ ТЕМ (СУВОРО ЗАБОРОНЕНО ПОВТОРЮВАТИ):
@@ -226,29 +233,46 @@ TELEGRAM POSTS:
 ━━━━━━━━━━━━━━━━━━━━
 
 ВИМОГИ:
-1. 1 EVENT = 1 НОВИНА. Жодних дублів з архівом.
-2. ПРІОРИТЕТ МЕДІА: Більшість новин мають бути з [ФОТО] або [ВІДЕО].
-3. СТИЛЬ ТА ОФОРМЛЕННЯ:
-   - Розмір до 350 символів.
-   - Перший рядок: ОДИН тематичний емодзі (🇺🇦, 🇺🇸, 💥, 🚀, ⚖️, 🏛, 🛢, 📹, 🌍, 💰, ⚡) + <b>Короткий жирний заголовок</b>.
-   - СУВОРО ЗАБОРОНЕНО вставляти у заголовок чи текст слова: "[ФОТО]", "[ВІДЕО]", "[ТЕКСТ]", "ФОТО:", "ВІДЕО:".
-   - ЗАБОРОНЕНО маркери 📍, 📌, клікбейт та непідтверджені чутки.
+1. Напиши новину ДЛЯ КОЖНОГО наданого EVENT_ID. Текст новини повинен строго описувати тільки свій EVENT_ID.
+2. Розмір: до 350 символів.
+3. Перший рядок: ОДИН тематичний емодзі (🇺🇦, 🇺🇸, 💥, 🚀, ⚖️, 🏛, 🛢, 📹, 🌍, 💰, ⚡) + <b>Короткий жирний заголовок</b>.
+4. Основний текст: 2-3 короткі речення з чіткими фактами і цифрами.
+5. СУВОРО ЗАБОРОНЕНО вставляти слова: "[ФОТО]", "[ВІДЕО]", "[ТЕКСТ]", "ФОТО:", "ВІДЕО:".
+6. ЗАБОРОНЕНО маркери 📍, 📌, клікбейт та непідтверджені чутки.
 
 Формат відповіді ТІЛЬКИ JSON:
 {{
   "news": [
     {{
-      "source_id": 0,
+      "event_id": "E1",
       "text": "🛢 <b>Заголовок новини</b>\\n\\nТекст події з фактами."
     }}
   ]
 }}
 
-ВІДІБРАНІ EVENT:
+ПОДІЇ ДЛЯ РЕДАГУВАННЯ:
 {chr(10).join(ev_blocks)}"""
 
         data = self._call_json_with_cascade(prompt, max_retries, "EDITOR")
-        return data.get("news", []) if data and isinstance(data.get("news"), list) else []
+        raw_news = data.get("news", []) if data and isinstance(data.get("news"), list) else []
+
+        # Співставляємо відповідь моделі суворо з закріпленим best_source_id
+        event_map = {ev["event_id"]: ev for ev in target_events}
+        final_list = []
+
+        for item in raw_news:
+            if not isinstance(item, dict):
+                continue
+            eid = item.get("event_id")
+            text = item.get("text")
+            if eid in event_map and isinstance(text, str) and text.strip():
+                ev = event_map[eid]
+                final_list.append({
+                    "source_id": ev["best_source_id"],  # Точний індекс поста
+                    "text": text.strip()
+                })
+
+        return final_list
 
     def _validate_final_news(self, news: List[Dict[str, Any]], posts: List[Dict[str, Any]], count: int) -> List[
         Dict[str, Any]]:
@@ -319,7 +343,8 @@ TELEGRAM POSTS:
             text = text[7:]
         elif text.startswith("```"):
             text = text[3:]
-        if text.endswith("```"): text = text[:-3]
+        if text.endswith("```"):
+            text = text[:-3]
         return text.strip()
 
     def _build_history_block(self, past_titles: Optional[List[str]]) -> str:
