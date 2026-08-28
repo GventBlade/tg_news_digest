@@ -1,4 +1,5 @@
 import os
+import time
 import logging
 from google import genai
 from google.genai import types
@@ -12,37 +13,45 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 class AIImageGenerator:
     def __init__(self):
         self.client = genai.Client(api_key=settings.GEMINI_API_KEY)
+        self.image_models = [
+            "gemini-3.1-flash-image",
+            "gemini-3.1-flash-lite-image"
+        ]
 
     def generate_news_image(self, headline: str, summary: str, news_id: int) -> str | None:
-        """Генерує тематичне фотореалістичне зображення через Imagen 3."""
-        try:
-            # Складаємо промт англійською мовою для кращої якості генерації
-            prompt = (
-                f"Editorial photojournalism style, realistic documentary shot of: {headline}. "
-                f"Context: {summary}. High resolution, 8k, cinematic, realistic lighting, "
-                f"no text, no watermark, no artifacts, neutral news documentary photography."
-            )
+        """Генерує швидку фотоілюстрацію стандартної HD якості для Telegram."""
+        prompt = (
+            f"Editorial news documentary photo: {headline}. "
+            f"Context: {summary}. Clean HD photo, realistic natural lighting, "
+            f"no text, no letters, no logos, no watermarks, 16:9 ratio."
+        )
 
-            logger.info(f"Генерація AI-зображення для новини: {headline}...")
-            result = self.client.models.generate_images(
-                model="imagen-3.0-generate-002",
-                prompt=prompt,
-                config=types.GenerateImagesConfig(
-                    number_of_images=1,
-                    output_mime_type="image/jpeg",
-                    aspect_ratio="16:9",
+        for model in self.image_models:
+            try:
+                logger.info(f"Генерація HD-зображення для '{headline}' через {model}...")
+                response = self.client.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="image/jpeg"
+                    ),
                 )
-            )
 
-            if result.generated_images:
-                file_path = os.path.join(DOWNLOAD_DIR, f"ai_gen_{news_id}_{int(os.times().system)}.jpg")
-                image = result.generated_images[0]
-                with open(file_path, "wb") as f:
-                    f.write(image.image.image_bytes)
-                logger.info(f"✅ AI-зображення успішно створено: {file_path}")
-                return file_path
+                for candidate in getattr(response, "candidates", []):
+                    content = getattr(candidate, "content", None)
+                    if not content:
+                        continue
+                    for part in getattr(content, "parts", []):
+                        inline_data = getattr(part, "inline_data", None)
+                        if inline_data and getattr(inline_data, "data", None):
+                            file_path = os.path.join(DOWNLOAD_DIR, f"ai_{news_id}_{int(time.time())}.jpg")
+                            with open(file_path, "wb") as f:
+                                f.write(inline_data.data)
+                            logger.info(f"✅ HD-зображення створено: {file_path}")
+                            return file_path
 
-        except Exception as e:
-            logger.warning(f"Не вдалося згенерувати AI-зображення: {e}")
+            except Exception as e:
+                logger.warning(f"Не вдалося згенерувати через {model}: {e}")
+                continue
 
         return None
