@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 class NewsSummarizer:
     DEFAULT_COUNT = 10
-    ANALYZER_CANDIDATES = 25
+    EDITOR_CANDIDATES = 25
     HISTORY_LIMIT = 100
     MAX_INPUT_CHARS = 55000
     MAX_EVENT_SOURCE_CHARS = 2500
@@ -37,25 +37,42 @@ class NewsSummarizer:
         if not posts:
             return []
 
-        logger.info(f"Формування дайджесту: {len(posts)} постів → TOP {count}")
+        logger.info(f"Формування дайджесту: {len(posts)} постів → пошук найкращих {count} новин")
         posts_context = self._build_posts_context(posts)
         if not posts_context:
             return []
 
-        # Крок 1: Аналіз, кластеризація та відсіювання дублів
+        # 1. AI шукає ВСІ унікальні події без штучного ліміту в 10
         analyzed_events = self._analyze_events(posts_context, past_titles, max_retries_per_model)
         if not analyzed_events:
+            logger.warning("Analyzer не повернув подій.")
             return []
 
-        # Крок 2: Python Scoring та балансування категорій
+        logger.info(f"Analyzer знайшов {len(analyzed_events)} унікальних подій.")
+
+        # 2. Python оцінює всі події та балансує категорії
         ranked_events = self._rank_events(analyzed_events, posts)
-        ranked_events = ranked_events[:max(count * 2, self.ANALYZER_CANDIDATES)]
+        if not ranked_events:
+            logger.warning("Після Python scoring не залишилося подій.")
+            return []
 
-        # Крок 3: Фінальна генерація текстів редактором
-        final_news = self._generate_final_digest(ranked_events, posts, past_titles, count, max_retries_per_model)
+        logger.info(f"Після ranking залишилося {len(ranked_events)} кандидатів.")
 
-        # Крок 4: Валідація результату
+        # 3. Передаємо редактору пул найкращих кандидатів (до 25)
+        editor_events = ranked_events[:self.EDITOR_CANDIDATES]
+        logger.info(f"EDITOR отримує TOP-{len(editor_events)} кандидатів для формування {count} новин.")
+
+        # 4. AI-редактор формує фінальні публікації
+        final_news = self._generate_final_digest(editor_events, posts, past_titles, count, max_retries_per_model)
+
+        # 5. Валідація тексту та медіа
         validated = self._validate_final_news(final_news, posts, count)
+
+        # 6. Fallback-добір з ranked_events, якщо валідацію пройшло менше ніж count
+        if len(validated) < count:
+            logger.warning(f"EDITOR сформував {len(validated)}/{count}. Запуск fallback-добору.")
+            validated = self._fill_missing_news(validated, ranked_events, posts, count)
+
         logger.info(f"Фінальний дайджест сформовано: {len(validated)}/{count} новин")
         return validated
 
@@ -97,24 +114,25 @@ class NewsSummarizer:
 
         return "\n\n---\n\n".join(result)
 
-    def _analyze_events(self, posts_context: str, past_titles: Optional[List[str]], max_retries: int) -> List[
-        Dict[str, Any]]:
+    def _analyze_events(self, posts_context: str, past_titles: Optional[List[str]], max_retries: int) -> List[Dict[str, Any]]:
         history_block = self._build_history_block(past_titles)
         prompt = f"""Ти — старший новинний аналітик редакції "Новини UA 6/24".
-ТВОЄ ЗАВДАННЯ:
-1. Знайти нові унікальні новинні події.
-2. Об'єднати всі повідомлення різних каналів про одну й ту саму подію в одну EVENT.
-3. СУВОРО ВІДСІЯТИ теми, які вже публікувалися (дивись список АРХІВ нижче).
+
+ТВОЄ ГОЛОВНЕ ЗАВДАННЯ:
+Проаналізуй ВСІ надані Telegram-повідомлення та знайди МАКСИМАЛЬНО ПОВНИЙ список унікальних, актуальних і суспільно значущих новинних подій.
+НЕ потрібно обмежуватися 10 подіями. Знайди ВСІ якісні події (від 15 до 40+), які варті уваги.
 
 ━━━━━━━━━━━━━━━━━━━━
-АРХІВ ВЖЕ ОПУБЛІКОВАНИХ ТЕМ (СУВОРО ЗАБОРОНЕНО ВИБИРАТИ СХОЖІ ТЕМИ):
+АРХІВ ВЖЕ ОПУБЛІКОВАНИХ ТЕМ (СУВОРО ЗАБОРОНЕНО ПОВТОРЮВАТИ):
 {history_block}
 ━━━━━━━━━━━━━━━━━━━━
 
-СУВОРІ ФІЛЬТРИ:
-- ЗАБОРОНЕНО брати теми з АРХІВУ (інше формулювання тієї самої новини НЕ робить її новою).
-- ЗАБОРОНЕНО рутинні обстріли прифронтових міст/сіл (Нікополь, прифронтовий Херсон, села Сумщини) без масових жертв (від 5 загиблих) чи руйнувань ТЕЦ/НПЗ.
-- ЗАБОРОНЕНО радарний шум (рух дронів, загрози балістики без влучань), комуналку, перекриття доріг, дрібні ДТП.
+СУВОРО ЗАБОРОНЕНО:
+1. Повторювати події з АРХІВУ (інше формулювання тієї самої теми НЕ робить її новою).
+2. Брати рутинні обстріли прифронтових міст/сіл без значних наслідків (від 5 загиблих чи руйнувань ТЕЦ/НПЗ).
+3. Брати радарний шум: рух дронів, загрози балістики без влучань, тривоги.
+4. Брати комунальні аварії, дрібні ДТП, локальні перекриття доріг.
+5. Брати непідтверджені чутки.
 
 ОЦІНКА ПОКАЗНИКІВ (0-100): importance, scale, reliability, public_interest, novelty, media_value.
 
@@ -123,7 +141,7 @@ class NewsSummarizer:
   "events": [
     {{
       "event_id": "E1",
-      "source_ids": [0, 2],
+      "source_ids": [0, 2, 5],
       "best_source_id": 0,
       "category": "war",
       "importance": 90,
@@ -132,8 +150,8 @@ class NewsSummarizer:
       "public_interest": 90,
       "novelty": 80,
       "media_value": 85,
-      "headline_hint": "Масована атака на об'єкти енергетики",
-      "summary": "Короткий опис основних фактів"
+      "headline_hint": "Масована атака на енергетику",
+      "summary": "Короткий фактологічний опис події"
     }}
   ]
 }}
@@ -145,7 +163,7 @@ TELEGRAM POSTS:
         return data.get("events", []) if data and isinstance(data.get("events"), list) else []
 
     def _rank_events(self, events: List[Dict[str, Any]], posts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        ranked, cat_counts = [], {}
+        ranked = []
 
         for ev in events:
             try:
@@ -166,21 +184,23 @@ TELEGRAM POSTS:
                 has_video = any(posts[s].get("has_video") for s in src_ids)
                 has_media = any(posts[s].get("has_media") for s in src_ids)
 
-                score = (imp * 0.35 + scale * 0.15 + rel * 0.20 + pub * 0.12 + nov * 0.08 + med * 0.05 + min(
-                    len(src_ids) * 2, 8))
-                score += 5 if has_video else (3 if has_media else 0)
-                if rel < 45:
-                    score -= 15
-                elif rel < 60:
-                    score -= 7
+                score = (imp * 0.35 + scale * 0.15 + rel * 0.20 + pub * 0.12 + nov * 0.08 + med * 0.05)
+                score += min(len(src_ids) * 2, 8)
+
+                if has_video:
+                    score += 5
+                elif has_media:
+                    score += 3
+                else:
+                    score -= 3
+
+                if rel < 45: score -= 15
+                elif rel < 60: score -= 7
                 if len(src_ids) == 1: score -= 2
 
                 cat = ev.get("category", "other")
-                if cat not in self.ALLOWED_CATEGORIES: cat = "other"
-
-                cur_c = cat_counts.get(cat, 0)
-                bal_score = score - (8 if cur_c >= 4 else (3 if cur_c >= 3 else 0))
-                cat_counts[cat] = cur_c + 1
+                if cat not in self.ALLOWED_CATEGORIES:
+                    cat = "other"
 
                 ev_copy = dict(ev)
                 ev_copy.update({
@@ -189,11 +209,23 @@ TELEGRAM POSTS:
                     "has_video": has_video,
                     "has_media": has_media,
                     "category": cat,
-                    "balanced_score": round(bal_score, 2)
+                    "raw_score": round(score, 2)
                 })
                 ranked.append(ev_copy)
             except Exception as e:
                 logger.warning(f"Помилка ранжування події: {e}")
+
+        # Сортуємо за якістю
+        ranked.sort(key=lambda x: x.get("raw_score", 0), reverse=True)
+
+        # Застосовуємо м'який баланс категорій
+        category_counts: Dict[str, int] = {}
+        for ev in ranked:
+            category = ev["category"]
+            current = category_counts.get(category, 0)
+            penalty = 8 if current >= 4 else (3 if current >= 3 else 0)
+            ev["balanced_score"] = round(ev["raw_score"] - penalty, 2)
+            category_counts[category] = current + 1
 
         ranked.sort(key=lambda x: x.get("balanced_score", 0), reverse=True)
         return ranked
@@ -202,27 +234,22 @@ TELEGRAM POSTS:
         self, events: List[Dict[str, Any]], posts: List[Dict[str, Any]],
         past_titles: Optional[List[str]], count: int, max_retries: int
     ) -> List[Dict[str, Any]]:
-        target_events = events[:count]
-        if not target_events:
-            return []
-
         ev_blocks = []
-        for ev in target_events:
+        for ev in events:
             best_id = ev.get("best_source_id")
             p = posts[best_id]
             media = "[ВІДЕО]" if p.get("has_video") else ("[ФОТО]" if p.get("has_media") else "[ТЕКСТ]")
 
             ev_blocks.append(
                 f"=== EVENT_ID: {ev.get('event_id')} ===\n"
-                f"МЕДІА ДЖЕРЕЛА: {media} [{p.get('channel_title', 'Джерело')}]\n"
-                f"ТЕМА: {ev.get('headline_hint', '')}\n"
+                f"МЕДІА: {media} [{p.get('channel_title', 'Джерело')}]\n"
                 f"СУТЬ: {ev.get('summary', '')}\n"
                 f"ТЕКСТ ДЖЕРЕЛА: {p.get('text', '')[:self.MAX_EVENT_SOURCE_CHARS]}\n"
             )
 
         history_block = self._build_history_block(past_titles)
         prompt = f"""Ти — головний редактор Telegram-каналу "Новини UA 6/24".
-Твоє завдання: написати лаконічні публікації для ВСІХ {len(target_events)} подій зі списку нижче.
+Створи фінальний дайджест із РІВНО {count} найкращих новин із наданого пулу кандидатів.
 
 ━━━━━━━━━━━━━━━━━━━━
 АРХІВ ВЖЕ ОПУБЛІКОВАНИХ ТЕМ (СУВОРО ЗАБОРОНЕНО ПОВТОРЮВАТИ):
@@ -230,8 +257,8 @@ TELEGRAM POSTS:
 ━━━━━━━━━━━━━━━━━━━━
 
 ВИМОГИ:
-1. Обов'язково поверни рівно {len(target_events)} новин — для кожного EVENT_ID окремий запис у масиві.
-2. Текст новини повинен описувати суворо свій EVENT_ID.
+1. Вибери РІВНО {count} найважливіших та найрізноманітніших EVENT_ID.
+2. Текст новини повинен строго відповідати своєму EVENT_ID.
 3. Розмір: до 350 символів.
 4. Перший рядок: ОДИН тематичний емодзі (🇺🇦, 🇺🇸, 💥, 🚀, ⚖️, 🏛, 🛢, 📹, 🌍, 💰, ⚡) + <b>Короткий жирний заголовок</b>.
 5. Основний текст: 2-3 короткі речення з чіткими фактами і цифрами.
@@ -248,15 +275,14 @@ TELEGRAM POSTS:
   ]
 }}
 
-ПОДІЇ ДЛЯ РЕДАГУВАННЯ:
+КАНДИДАТИ ДЛЯ ДАЙДЖЕСТУ:
 {chr(10).join(ev_blocks)}"""
 
         data = self._call_json_with_cascade(prompt, max_retries, "EDITOR")
         raw_news = data.get("news", []) if data and isinstance(data.get("news"), list) else []
 
-        event_map = {ev["event_id"]: ev for ev in target_events}
+        event_map = {ev["event_id"]: ev for ev in events}
         final_list = []
-        processed_eids = set()
 
         for item in raw_news:
             if not isinstance(item, dict):
@@ -269,24 +295,10 @@ TELEGRAM POSTS:
                     "source_id": ev["best_source_id"],
                     "text": text.strip()
                 })
-                processed_eids.add(eid)
 
-        # Гарантований фолбек: якщо редактор скоротив випуск, добираємо відсутні новини з першого етапу
-        for ev in target_events:
-            eid = ev.get("event_id")
-            if eid not in processed_eids:
-                headline = ev.get("headline_hint") or "Важлива новина"
-                summary = ev.get("summary") or posts[ev["best_source_id"]]["text"][:200]
-                text = f"⚡ <b>{headline}</b>\n\n{summary}"
-                final_list.append({
-                    "source_id": ev["best_source_id"],
-                    "text": text
-                })
+        return final_list
 
-        return final_list[:count]
-
-    def _validate_final_news(self, news: List[Dict[str, Any]], posts: List[Dict[str, Any]], count: int) -> List[
-        Dict[str, Any]]:
+    def _validate_final_news(self, news: List[Dict[str, Any]], posts: List[Dict[str, Any]], count: int) -> List[Dict[str, Any]]:
         if not isinstance(news, list):
             return []
 
@@ -301,9 +313,8 @@ TELEGRAM POSTS:
                 continue
 
             text = text.strip()
-            text = re.sub(r'\[(ФОТО\vert{}ВІДЕО\vert{}ТЕКСТ\vert{}PHOTO\vert{}VIDEO\vert{}TEXT)\]\s*', '', text,
-                          flags=re.IGNORECASE)
-            text = re.sub(r'(ФОТО|ВІДЕО|ТЕКСТ):\s*', '', text, flags=re.IGNORECASE)
+            text = re.sub(r'\[(?:ФОТО|ВІДЕО|ТЕКСТ|PHOTO|VIDEO|TEXT)\]\s*', '', text, flags=re.IGNORECASE)
+            text = re.sub(r'(?:ФОТО|ВІДЕО|ТЕКСТ):\s*', '', text, flags=re.IGNORECASE)
 
             if "📍" in text or "📌" in text or "<b>" not in text or "</b>" not in text:
                 continue
@@ -319,6 +330,71 @@ TELEGRAM POSTS:
                 break
 
         return validated
+
+    def _fill_missing_news(
+        self,
+        validated: List[Dict[str, Any]],
+        ranked_events: List[Dict[str, Any]],
+        posts: List[Dict[str, Any]],
+        count: int
+    ) -> List[Dict[str, Any]]:
+        result = list(validated)
+        used_source_ids = {
+            item["source_id"] for item in result
+            if isinstance(item, dict) and isinstance(item.get("source_id"), int)
+        }
+        used_event_ids = set()
+
+        for item in result:
+            s_id = item.get("source_id")
+            for ev in ranked_events:
+                if s_id in ev.get("source_ids", []):
+                    used_event_ids.add(ev.get("event_id"))
+                    break
+
+        emoji_map = {
+            "war": "💥", "politics": "🏛", "economy": "💰",
+            "international": "🌍", "society": "🇺🇦", "technology": "⚡",
+            "science": "🔬", "culture": "🎭", "other": "📰"
+        }
+
+        for ev in ranked_events:
+            if len(result) >= count:
+                break
+
+            event_id = ev.get("event_id")
+            if event_id in used_event_ids:
+                continue
+
+            source_id = ev.get("best_source_id")
+            if not isinstance(source_id, int) or source_id in used_source_ids:
+                continue
+
+            post = posts[source_id]
+            raw_text = (post.get("text") or "").strip()
+            if not raw_text:
+                continue
+
+            headline = (ev.get("headline_hint") or "Важлива новина").strip()
+            summary = (ev.get("summary") or raw_text[:280]).strip()
+            category = ev.get("category", "other")
+            emoji = emoji_map.get(category, "📰")
+
+            fallback_text = f"{emoji} <b>{headline}</b>\n\n{summary}"
+
+            if len(fallback_text) > self.MAX_NEWS_CHARS:
+                fallback_text = fallback_text[:self.MAX_NEWS_CHARS]
+                last_sp = fallback_text.rfind(" ")
+                fallback_text = (fallback_text[:last_sp].rstrip() if last_sp > 200 else fallback_text) + "…"
+
+            result.append({
+                "source_id": source_id,
+                "text": fallback_text
+            })
+            used_source_ids.add(source_id)
+            used_event_ids.add(event_id)
+
+        return result[:count]
 
     def _call_json_with_cascade(self, prompt: str, max_retries: int, op_name: str) -> Optional[Dict[str, Any]]:
         for model in self.models_priority:
@@ -348,10 +424,8 @@ TELEGRAM POSTS:
     @staticmethod
     def _clean_json_response(text: str) -> str:
         text = text.strip()
-        if text.startswith("```json"):
-            text = text[7:]
-        elif text.startswith("```"):
-            text = text[3:]
+        if text.startswith("```json"): text = text[7:]
+        elif text.startswith("```"): text = text[3:]
         if text.endswith("```"): text = text[:-3]
         return text.strip()
 
@@ -374,5 +448,4 @@ TELEGRAM POSTS:
             p = posts[s_id]
             bonus = 20 if p.get("has_video") else (10 if p.get("has_media") else 0)
             return bonus + min(math.log10(max(p.get("views", 0) or 0, 1)) * 2, 15)
-
         return max(source_ids, key=score)

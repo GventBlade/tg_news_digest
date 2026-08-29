@@ -19,7 +19,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def get_slot_header_text() -> str:
+def get_slot_header_text(news_count: int) -> str:
     kyiv_tz = ZoneInfo("Europe/Kyiv")
     now = datetime.now(kyiv_tz)
 
@@ -27,8 +27,14 @@ def get_slot_header_text() -> str:
     display_hour = rounded_time.strftime("%H:%M")
     date_str = rounded_time.strftime("%d.%m.%Y")
 
+    count_word = "НАЙСВІЖІШИХ НОВИН"
+    if news_count == 1:
+        count_word = "ГОЛОВНА НОВИНА"
+    elif 2 <= news_count <= 4:
+        count_word = "НАЙСВІЖІШІ НОВИНИ"
+
     return (
-        f"🔥 <b>10 НАЙСВІЖІШИХ НОВИН</b>\n"
+        f"🔥 <b>{news_count} {count_word}</b>\n"
         f"🕒 <i>Станом на {display_hour}, {date_str}</i>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"<i>Головні події за останні 4 години:</i>"
@@ -50,42 +56,41 @@ def cleanup_downloads_folder():
 
 
 async def process_and_publish_news_cycle():
-    logger.info("🚀 Початок новинного циклу 4/24 (ТОП-10)...")
+    logger.info("🚀 Початок новинного циклу 4/24...")
     collector = NewsCollector()
     summarizer = NewsSummarizer()
     publisher = NewsPublisher()
     history = NewsHistory()
 
     try:
-        # 1. Збір сирих новин за останні 4 години
-        posts = await collector.fetch_recent_posts(hours=4, limit_per_channel=10)
+        # 1. Збір сирих новин за останні 4 години (по 15 постів на канал)
+        posts = await collector.fetch_recent_posts(hours=4, limit_per_channel=15)
         logger.info(f"Зібрано {len(posts)} нових текстів для аналізу.")
 
         if not posts:
             logger.info("Нових новин за останні 4 години не виявлено.")
             return
 
-        # 2. Отримуємо історію опублікованого за 48 годин проти дублювання
+        # 2. Отримуємо історію за останні 48 годин для дедуплікації
         past_titles = history.get_recent_titles(hours=48)
 
-        # 3. Вибір та обробка ТОП-10 новин
+        # 3. Багаторівневий відбір подій
         top_news = summarizer.select_top_distinct_news(posts, past_titles=past_titles, count=10)
-        logger.info(f"AI сформував {len(top_news)} новин для випуску.")
+        logger.info(f"Фінальний список для публікації містить {len(top_news)} новин.")
 
         if not top_news:
             return
 
-        # 4. Публікація заголовка випуску
-        header_text = get_slot_header_text()
+        # 4. Публікація заголовка випуску з динамічним підрахунком
+        header_text = get_slot_header_text(len(top_news))
         await publisher.publish_news(text=header_text)
         await asyncio.sleep(2)
 
-        # 5. Публікація відібраних постів
+        # 5. Публікація кожної новини
         for item in top_news:
             source_idx = item.get("source_id", 0)
             target_post = posts[source_idx] if 0 <= source_idx < len(posts) else posts[0]
 
-            # Завантажуємо медіа оригінального поста (якщо є)
             media_path, media_type = await collector.download_post_media(target_post["message_obj"])
 
             await publisher.publish_news(
@@ -94,7 +99,7 @@ async def process_and_publish_news_cycle():
                 media_type=media_type
             )
 
-            # Фіксація в історії для дедуплікації
+            # Фіксація першого рядка в історії
             first_line = item["text"].strip().split("\n")[0]
             history.mark_as_published(
                 channel_name=target_post["channel_name"],
@@ -102,7 +107,6 @@ async def process_and_publish_news_cycle():
                 title=first_line
             )
 
-            # Видалення тимчасового файлу медіа
             if media_path and os.path.exists(media_path):
                 try:
                     os.remove(media_path)
@@ -114,7 +118,7 @@ async def process_and_publish_news_cycle():
         history.cleanup_old_records(days=5)
         cleanup_downloads_folder()
 
-        logger.info("✅ Випуск ТОП-10 успішно опубліковано!")
+        logger.info(f"✅ Випуск із {len(top_news)} новин успішно опубліковано!")
 
     except Exception as e:
         logger.error(f"Помилка новинного циклу: {e}", exc_info=True)

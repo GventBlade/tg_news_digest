@@ -16,7 +16,7 @@ class NewsCollector:
         self.client = TelegramClient(session_name, settings.TG_API_ID, settings.TG_API_HASH)
         self.history = NewsHistory()
 
-    async def fetch_recent_posts(self, hours: int = 6, limit_per_channel: int = 10) -> List[Dict[str, Any]]:
+    async def fetch_recent_posts(self, hours: int = 4, limit_per_channel: int = 15) -> List[Dict[str, Any]]:
         """Збирає сирі Telegram-пости з каналів-донорів за вказаний проміжок часу."""
         if not self.client.is_connected():
             await self.client.start()
