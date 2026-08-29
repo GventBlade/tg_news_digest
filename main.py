@@ -2,7 +2,6 @@ import asyncio
 from datetime import datetime, timedelta
 import logging
 import os
-import re
 import shutil
 from zoneinfo import ZoneInfo
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -10,7 +9,6 @@ from apscheduler.triggers.cron import CronTrigger
 
 from app.services.collector import NewsCollector
 from app.services.history import NewsHistory
-from app.services.image_generator import AIImageGenerator
 from app.services.publisher import NewsPublisher
 from app.services.summarizer import NewsSummarizer
 
@@ -57,10 +55,9 @@ async def process_and_publish_news_cycle():
     summarizer = NewsSummarizer()
     publisher = NewsPublisher()
     history = NewsHistory()
-    image_gen = AIImageGenerator()
 
     try:
-        # 1. Збір новин за останні 4 години
+        # 1. Збір сирих новин за останні 4 години
         posts = await collector.fetch_recent_posts(hours=4, limit_per_channel=10)
         logger.info(f"Зібрано {len(posts)} нових текстів для аналізу.")
 
@@ -68,52 +65,36 @@ async def process_and_publish_news_cycle():
             logger.info("Нових новин за останні 4 години не виявлено.")
             return
 
-        # 2. Отримуємо заголовки за останні 48 годин для суворого блокування дублів
+        # 2. Отримуємо історію опублікованого за 48 годин проти дублювання
         past_titles = history.get_recent_titles(hours=48)
 
-        # 3. Gemini відбирає ТОП-10 без повторів, радарних тривог та дрібниць
+        # 3. Вибір та обробка ТОП-10 новин
         top_news = summarizer.select_top_distinct_news(posts, past_titles=past_titles, count=10)
-        logger.info(f"AI відібрав {len(top_news)} унікальних тем.")
+        logger.info(f"AI сформував {len(top_news)} новин для випуску.")
 
         if not top_news:
             return
 
-        # 4. Публікуємо заголовок випуску
+        # 4. Публікація заголовка випуску
         header_text = get_slot_header_text()
         await publisher.publish_news(text=header_text)
         await asyncio.sleep(2)
 
-        # 5. Публікуємо відібрані новини
-        for idx, item in enumerate(top_news):
+        # 5. Публікація відібраних постів
+        for item in top_news:
             source_idx = item.get("source_id", 0)
             target_post = posts[source_idx] if 0 <= source_idx < len(posts) else posts[0]
 
-            # Спроба завантажити оригінальне медіа з донора
+            # Завантажуємо медіа оригінального поста (якщо є)
             media_path, media_type = await collector.download_post_media(target_post["message_obj"])
 
-            # Якщо оригінального фото/відео немає — генеруємо тематичну ілюстрацію через Imagen
-            if not media_path:
-                first_line = item["text"].strip().split("\n")[0]
-                clean_title = re.sub(r"<[^>]+>", "", first_line).strip()
-                clean_summary = re.sub(r"<[^>]+>", "", item["text"]).strip()
-
-                ai_image_path = image_gen.generate_news_image(
-                    headline=clean_title,
-                    summary=clean_summary[:200],
-                    news_id=idx
-                )
-                if ai_image_path:
-                    media_path = ai_image_path
-                    media_type = "photo"
-
-            # Публікація в канал
             await publisher.publish_news(
                 text=item["text"],
                 media_path=media_path,
                 media_type=media_type
             )
 
-            # Фіксація заголовка в базу (для дедуплікації наступних випусків)
+            # Фіксація в історії для дедуплікації
             first_line = item["text"].strip().split("\n")[0]
             history.mark_as_published(
                 channel_name=target_post["channel_name"],
@@ -121,7 +102,7 @@ async def process_and_publish_news_cycle():
                 title=first_line
             )
 
-            # Очищення тимчасового файлу медіа
+            # Видалення тимчасового файлу медіа
             if media_path and os.path.exists(media_path):
                 try:
                     os.remove(media_path)
@@ -133,7 +114,7 @@ async def process_and_publish_news_cycle():
         history.cleanup_old_records(days=5)
         cleanup_downloads_folder()
 
-        logger.info("✅ Випуск ТОП-10 успішно опубліковано, дублікати відфільтровано!")
+        logger.info("✅ Випуск ТОП-10 успішно опубліковано!")
 
     except Exception as e:
         logger.error(f"Помилка новинного циклу: {e}", exc_info=True)
@@ -146,11 +127,11 @@ async def main():
 
     scheduler.add_job(
         process_and_publish_news_cycle,
-        trigger=CronTrigger(hour="3,7,11,15,19,23", minute="57", timezone="Europe/Kyiv")
+        trigger=CronTrigger(hour="3,7,11,15,19,23", minute="58", timezone="Europe/Kyiv")
     )
 
     scheduler.start()
-    logger.info("⏳ Планувальник 4/24 запущено. Очікування наступного слоту (57 хв)...")
+    logger.info("⏳ Планувальник 4/24 запущено. Очікування наступного слоту (58 хв)...")
 
     while True:
         await asyncio.sleep(3600)

@@ -42,16 +42,16 @@ class NewsSummarizer:
         if not posts_context:
             return []
 
-        # Крок 1: Аналіз, дедуплікація та відсіювання вже опублікованого
+        # Крок 1: Аналіз, кластеризація та відсіювання дублів
         analyzed_events = self._analyze_events(posts_context, past_titles, max_retries_per_model)
         if not analyzed_events:
             return []
 
-        # Крок 2: Python Scoring та балансування
+        # Крок 2: Python Scoring та балансування категорій
         ranked_events = self._rank_events(analyzed_events, posts)
         ranked_events = ranked_events[:max(count * 2, self.ANALYZER_CANDIDATES)]
 
-        # Крок 3: Фінальна генерація текстів редактором із жорсткою прив'язкою за event_id
+        # Крок 3: Фінальна генерація текстів редактором
         final_news = self._generate_final_digest(ranked_events, posts, past_titles, count, max_retries_per_model)
 
         # Крок 4: Валідація результату
@@ -104,7 +104,7 @@ class NewsSummarizer:
 ТВОЄ ЗАВДАННЯ:
 1. Знайти нові унікальні новинні події.
 2. Об'єднати всі повідомлення різних каналів про одну й ту саму подію в одну EVENT.
-3. СУВОРО ВІДСІЯТИ теми, які вже публікувалися (дивись список АРХІВ нижче). Якщо подія про смерть монарха, зсуви в Непалі чи танкери/нафту вже була — ПОВТОРНО НЕ БРАТИ!
+3. СУВОРО ВІДСІЯТИ теми, які вже публікувалися (дивись список АРХІВ нижче).
 
 ━━━━━━━━━━━━━━━━━━━━
 АРХІВ ВЖЕ ОПУБЛІКОВАНИХ ТЕМ (СУВОРО ЗАБОРОНЕНО ВИБИРАТИ СХОЖІ ТЕМИ):
@@ -132,8 +132,8 @@ class NewsSummarizer:
       "public_interest": 90,
       "novelty": 80,
       "media_value": 85,
-      "headline_hint": "Масована атака на Київ",
-      "summary": "Короткий опис"
+      "headline_hint": "Масована атака на об'єкти енергетики",
+      "summary": "Короткий опис основних фактів"
     }}
   ]
 }}
@@ -168,17 +168,15 @@ TELEGRAM POSTS:
 
                 score = (imp * 0.35 + scale * 0.15 + rel * 0.20 + pub * 0.12 + nov * 0.08 + med * 0.05 + min(
                     len(src_ids) * 2, 8))
-                score += 5 if has_video else (3 if has_media else -5)
+                score += 5 if has_video else (3 if has_media else 0)
                 if rel < 45:
                     score -= 15
                 elif rel < 60:
                     score -= 7
-                if len(src_ids) == 1:
-                    score -= 2
+                if len(src_ids) == 1: score -= 2
 
                 cat = ev.get("category", "other")
-                if cat not in self.ALLOWED_CATEGORIES:
-                    cat = "other"
+                if cat not in self.ALLOWED_CATEGORIES: cat = "other"
 
                 cur_c = cat_counts.get(cat, 0)
                 bal_score = score - (8 if cur_c >= 4 else (3 if cur_c >= 3 else 0))
@@ -204,7 +202,6 @@ TELEGRAM POSTS:
         self, events: List[Dict[str, Any]], posts: List[Dict[str, Any]],
         past_titles: Optional[List[str]], count: int, max_retries: int
     ) -> List[Dict[str, Any]]:
-        # Відбираємо рівно потрібну кількість подій
         target_events = events[:count]
         if not target_events:
             return []
@@ -215,17 +212,17 @@ TELEGRAM POSTS:
             p = posts[best_id]
             media = "[ВІДЕО]" if p.get("has_video") else ("[ФОТО]" if p.get("has_media") else "[ТЕКСТ]")
 
-            # Передаємо лише першоджерело, закріплене за цією подією
             ev_blocks.append(
                 f"=== EVENT_ID: {ev.get('event_id')} ===\n"
                 f"МЕДІА ДЖЕРЕЛА: {media} [{p.get('channel_title', 'Джерело')}]\n"
+                f"ТЕМА: {ev.get('headline_hint', '')}\n"
                 f"СУТЬ: {ev.get('summary', '')}\n"
                 f"ТЕКСТ ДЖЕРЕЛА: {p.get('text', '')[:self.MAX_EVENT_SOURCE_CHARS]}\n"
             )
 
         history_block = self._build_history_block(past_titles)
         prompt = f"""Ти — головний редактор Telegram-каналу "Новини UA 6/24".
-Твоє завдання: написати лаконічні фінальні публікації для кожної події зі списку нижче.
+Твоє завдання: написати лаконічні публікації для ВСІХ {len(target_events)} подій зі списку нижче.
 
 ━━━━━━━━━━━━━━━━━━━━
 АРХІВ ВЖЕ ОПУБЛІКОВАНИХ ТЕМ (СУВОРО ЗАБОРОНЕНО ПОВТОРЮВАТИ):
@@ -233,12 +230,13 @@ TELEGRAM POSTS:
 ━━━━━━━━━━━━━━━━━━━━
 
 ВИМОГИ:
-1. Напиши новину ДЛЯ КОЖНОГО наданого EVENT_ID. Текст новини повинен строго описувати тільки свій EVENT_ID.
-2. Розмір: до 350 символів.
-3. Перший рядок: ОДИН тематичний емодзі (🇺🇦, 🇺🇸, 💥, 🚀, ⚖️, 🏛, 🛢, 📹, 🌍, 💰, ⚡) + <b>Короткий жирний заголовок</b>.
-4. Основний текст: 2-3 короткі речення з чіткими фактами і цифрами.
-5. СУВОРО ЗАБОРОНЕНО вставляти слова: "[ФОТО]", "[ВІДЕО]", "[ТЕКСТ]", "ФОТО:", "ВІДЕО:".
-6. ЗАБОРОНЕНО маркери 📍, 📌, клікбейт та непідтверджені чутки.
+1. Обов'язково поверни рівно {len(target_events)} новин — для кожного EVENT_ID окремий запис у масиві.
+2. Текст новини повинен описувати суворо свій EVENT_ID.
+3. Розмір: до 350 символів.
+4. Перший рядок: ОДИН тематичний емодзі (🇺🇦, 🇺🇸, 💥, 🚀, ⚖️, 🏛, 🛢, 📹, 🌍, 💰, ⚡) + <b>Короткий жирний заголовок</b>.
+5. Основний текст: 2-3 короткі речення з чіткими фактами і цифрами.
+6. СУВОРО ЗАБОРОНЕНО вставляти слова: "[ФОТО]", "[ВІДЕО]", "[ТЕКСТ]", "ФОТО:", "ВІДЕО:".
+7. ЗАБОРОНЕНО маркери 📍, 📌, клікбейт та непідтверджені чутки.
 
 Формат відповіді ТІЛЬКИ JSON:
 {{
@@ -256,9 +254,9 @@ TELEGRAM POSTS:
         data = self._call_json_with_cascade(prompt, max_retries, "EDITOR")
         raw_news = data.get("news", []) if data and isinstance(data.get("news"), list) else []
 
-        # Співставляємо відповідь моделі суворо з закріпленим best_source_id
         event_map = {ev["event_id"]: ev for ev in target_events}
         final_list = []
+        processed_eids = set()
 
         for item in raw_news:
             if not isinstance(item, dict):
@@ -268,11 +266,24 @@ TELEGRAM POSTS:
             if eid in event_map and isinstance(text, str) and text.strip():
                 ev = event_map[eid]
                 final_list.append({
-                    "source_id": ev["best_source_id"],  # Точний індекс поста
+                    "source_id": ev["best_source_id"],
                     "text": text.strip()
                 })
+                processed_eids.add(eid)
 
-        return final_list
+        # Гарантований фолбек: якщо редактор скоротив випуск, добираємо відсутні новини з першого етапу
+        for ev in target_events:
+            eid = ev.get("event_id")
+            if eid not in processed_eids:
+                headline = ev.get("headline_hint") or "Важлива новина"
+                summary = ev.get("summary") or posts[ev["best_source_id"]]["text"][:200]
+                text = f"⚡ <b>{headline}</b>\n\n{summary}"
+                final_list.append({
+                    "source_id": ev["best_source_id"],
+                    "text": text
+                })
+
+        return final_list[:count]
 
     def _validate_final_news(self, news: List[Dict[str, Any]], posts: List[Dict[str, Any]], count: int) -> List[
         Dict[str, Any]]:
@@ -290,8 +301,6 @@ TELEGRAM POSTS:
                 continue
 
             text = text.strip()
-
-            # Примусово очищаємо залишки службових слів
             text = re.sub(r'\[(ФОТО\vert{}ВІДЕО\vert{}ТЕКСТ\vert{}PHOTO\vert{}VIDEO\vert{}TEXT)\]\s*', '', text,
                           flags=re.IGNORECASE)
             text = re.sub(r'(ФОТО|ВІДЕО|ТЕКСТ):\s*', '', text, flags=re.IGNORECASE)
@@ -343,8 +352,7 @@ TELEGRAM POSTS:
             text = text[7:]
         elif text.startswith("```"):
             text = text[3:]
-        if text.endswith("```"):
-            text = text[:-3]
+        if text.endswith("```"): text = text[:-3]
         return text.strip()
 
     def _build_history_block(self, past_titles: Optional[List[str]]) -> str:
