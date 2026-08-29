@@ -43,10 +43,11 @@ class AIImageGenerator:
                     model=model,
                     contents=prompt,
                     config=types.GenerateContentConfig(
-                        response_mime_type="image/jpeg"
+                        response_modalities=["IMAGE"]
                     ),
                 )
 
+                # Витягуємо згенеровані байти зображення
                 for candidate in getattr(response, "candidates", []):
                     content = getattr(candidate, "content", None)
                     if not content:
