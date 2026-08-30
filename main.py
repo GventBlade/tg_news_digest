@@ -7,9 +7,10 @@ from zoneinfo import ZoneInfo
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
+from app.config import settings
 from app.services.collector import NewsCollector
 from app.services.history import NewsHistory
-from app.services.publisher import NewsPublisher
+from app.services.publisher import NewsPublisher, upload_temp_media
 from app.services.summarizer import NewsSummarizer
 
 logging.basicConfig(
@@ -41,6 +42,37 @@ def get_slot_header_text(news_count: int) -> str:
     )
 
 
+def build_instagram_carousel_caption(top_news: list) -> str:
+    """Формує лаконічний підпис для Instagram-каруселі із заголовками та лінком на Telegram."""
+    kyiv_tz = ZoneInfo("Europe/Kyiv")
+    now = datetime.now(kyiv_tz)
+    rounded_time = (now + timedelta(minutes=30)).replace(minute=0, second=0, microsecond=0)
+    display_hour = rounded_time.strftime("%H:%M")
+    date_str = rounded_time.strftime("%d.%m.%Y")
+
+    lines = [
+        "🔥 ТОП ГОЛОВНИХ НОВИН",
+        f"🕒 Станом на {display_hour}, {date_str}",
+        "━━━━━━━━━━━━━━━━━━━━"
+    ]
+
+    for i, item in enumerate(top_news, 1):
+        first_line = item["text"].strip().split("\n")[0]
+        lines.append(f"{i}. {first_line}")
+
+    channel_name = settings.TARGET_CHANNEL_ID.replace("@", "")
+    tg_link = f"https://t.me/{channel_name}"
+
+    lines.extend([
+        "━━━━━━━━━━━━━━━━━━━━",
+        "📲 Якщо хочете знати більше про ці та інші новини — підписуйтесь на наш Telegram-канал «Новини UA 6/24»:",
+        f"👉 {tg_link}",
+        "",
+        "#новини #україна #новиниукраїни #дайджест #ua #news"
+    ])
+    return "\n".join(lines)
+
+
 def cleanup_downloads_folder():
     downloads_dir = "downloads"
     if os.path.exists(downloads_dir):
@@ -63,7 +95,7 @@ async def process_and_publish_news_cycle():
     history = NewsHistory()
 
     try:
-        # 1. Збір сирих новин за останні 4 години (по 15 постів на канал)
+        # 1. Збір сирих постів
         posts = await collector.fetch_recent_posts(hours=4, limit_per_channel=15)
         logger.info(f"Зібрано {len(posts)} нових текстів для аналізу.")
 
@@ -71,35 +103,43 @@ async def process_and_publish_news_cycle():
             logger.info("Нових новин за останні 4 години не виявлено.")
             return
 
-        # 2. Отримуємо історію за останні 48 годин для дедуплікації
         past_titles = history.get_recent_titles(hours=48)
-
-        # 3. Багаторівневий відбір подій
         top_news = summarizer.select_top_distinct_news(posts, past_titles=past_titles, count=10)
-        logger.info(f"Фінальний список для публікації містить {len(top_news)} новин.")
+        logger.info(f"Фінальний список містить {len(top_news)} новин.")
 
         if not top_news:
             return
 
-        # 4. Публікація заголовка випуску з динамічним підрахунком
+        # 2. Публікація заголовка випуску в Telegram
         header_text = get_slot_header_text(len(top_news))
-        await publisher.publish_news(text=header_text)
+        await publisher.publish_telegram_post(text=header_text)
         await asyncio.sleep(2)
 
-        # 5. Публікація кожної новини
+        ig_media_items = []
+        downloaded_media_paths = []
+
+        # 3. Публікація кожної новини в Telegram та збереження медіа для Instagram
         for item in top_news:
             source_idx = item.get("source_id", 0)
             target_post = posts[source_idx] if 0 <= source_idx < len(posts) else posts[0]
 
             media_path, media_type = await collector.download_post_media(target_post["message_obj"])
 
-            await publisher.publish_news(
+            if media_path:
+                downloaded_media_paths.append(media_path)
+                if media_type in ["photo", "video"]:
+                    public_url = await upload_temp_media(media_path)
+                    if public_url:
+                        ig_media_items.append({"url": public_url, "type": media_type})
+
+            # Публікуємо в Telegram
+            await publisher.publish_telegram_post(
                 text=item["text"],
                 media_path=media_path,
                 media_type=media_type
             )
 
-            # Фіксація першого рядка в історії
+            # Фіксація новини в базі
             first_line = item["text"].strip().split("\n")[0]
             history.mark_as_published(
                 channel_name=target_post["channel_name"],
@@ -107,23 +147,36 @@ async def process_and_publish_news_cycle():
                 title=first_line
             )
 
-            if media_path and os.path.exists(media_path):
-                try:
-                    os.remove(media_path)
-                except Exception as e:
-                    logger.warning(f"Не вдалося видалити {media_path}: {e}")
-
             await asyncio.sleep(3)
+
+        # 4. Публікація єдиної каруселі в Instagram
+        if not ig_media_items:
+            ig_media_items.append({
+                "url": "https://images.unsplash.com/photo-1585829365295-ab7cd400c167?w=1080&q=80",
+                "type": "photo"
+            })
+
+        ig_caption = build_instagram_carousel_caption(top_news)
+        await publisher.publish_instagram_carousel(caption=ig_caption, media_items=ig_media_items)
+
+        # Очищення тимчасових локальних файлів та старих записів
+        for path in downloaded_media_paths:
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except Exception as e:
+                    logger.warning(f"Не вдалося видалити {path}: {e}")
 
         history.cleanup_old_records(days=5)
         cleanup_downloads_folder()
 
-        logger.info(f"✅ Випуск із {len(top_news)} новин успішно опубліковано!")
+        logger.info(f"✅ Цикл завершено: Telegram ({len(top_news)} постів) + Instagram (1 карусель із {len(ig_media_items)} слайдів)!")
 
     except Exception as e:
         logger.error(f"Помилка новинного циклу: {e}", exc_info=True)
     finally:
         await collector.close()
+        await publisher.close()
 
 
 async def main():

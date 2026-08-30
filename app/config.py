@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -9,6 +9,10 @@ class Settings(BaseSettings):
     TARGET_CHANNEL_ID: str
     GEMINI_API_KEY: str
     SOURCE_CHANNELS: str
+
+    # Instagram API
+    INSTAGRAM_ACCOUNT_ID: Optional[str] = None
+    INSTAGRAM_ACCESS_TOKEN: Optional[str] = None
 
     @property
     def source_channels_list(self) -> List[str]:
