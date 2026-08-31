@@ -1,4 +1,5 @@
 import os
+import uuid
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional, Tuple
@@ -81,21 +82,33 @@ class NewsCollector:
         return False
 
     async def download_post_media(self, message_obj) -> Tuple[Optional[str], Optional[str]]:
-        """Завантажує медіа лише для обраного поста (ліміт до 35 МБ)."""
+        """Завантажує медіа лише для обраного поста з безпечним латинським іменем файлу."""
         try:
+            # Генерація безпечного латинського імені файлу для Nginx URL
+            unique_id = uuid.uuid4().hex[:10]
+            msg_id = getattr(message_obj, "id", "media")
+
             if message_obj.photo:
-                path = await message_obj.download_media(file=DOWNLOAD_DIR)
-                return path, "photo"
+                target_path = os.path.join(DOWNLOAD_DIR, f"photo_{msg_id}_{unique_id}.jpg")
+                path = await message_obj.download_media(file=target_path)
+                if path and os.path.exists(path):
+                    # Права на читання для Nginx
+                    os.chmod(path, 0o644)
+                    return path, "photo"
 
             if self._is_video(message_obj):
                 file_size = getattr(message_obj.file, "size", 0) or 0
                 if 0 < file_size < 35 * 1024 * 1024:
-                    path = await message_obj.download_media(file=DOWNLOAD_DIR)
-                    return path, "video"
+                    target_path = os.path.join(DOWNLOAD_DIR, f"video_{msg_id}_{unique_id}.mp4")
+                    path = await message_obj.download_media(file=target_path)
+                    if path and os.path.exists(path):
+                        os.chmod(path, 0o644)
+                        return path, "video"
         except Exception as e:
             logger.error(f"Не вдалося завантажити медіа: {e}")
 
         return None, None
 
     async def close(self):
-        await self.client.disconnect()
+        if self.client.is_connected():
+            await self.client.disconnect()

@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     # Instagram API
     INSTAGRAM_ACCOUNT_ID: Optional[str] = None
     INSTAGRAM_ACCESS_TOKEN: Optional[str] = None
+    MEDIA_BASE_URL: str | None = None
 
     @property
     def source_channels_list(self) -> List[str]:

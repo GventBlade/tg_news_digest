@@ -3,6 +3,8 @@ services:
     build: .
     container_name: tg_news_digest
     restart: always
+    environment:
+      - TZ=Europe/Kyiv
     env_file:
       - .env
     volumes:

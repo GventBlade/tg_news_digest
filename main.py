@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import os
-import shutil
 import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -18,6 +17,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger(__name__)
+
 
 def get_slot_header_text(news_count: int) -> str:
     kyiv_tz = ZoneInfo("Europe/Kyiv")
@@ -38,6 +38,7 @@ def get_slot_header_text(news_count: int) -> str:
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"<i>Головні події за останні 4 години:</i>"
     )
+
 
 def build_instagram_carousel_caption(top_news: list) -> str:
     kyiv_tz = ZoneInfo("Europe/Kyiv")
@@ -65,7 +66,8 @@ def build_instagram_carousel_caption(top_news: list) -> str:
     ])
     return "\n".join(lines)
 
-def cleanup_old_downloads(max_age_minutes: int = 60):
+
+def cleanup_old_downloads(max_age_minutes: int = 120):
     downloads_dir = "downloads"
     if not os.path.exists(downloads_dir):
         return
@@ -80,20 +82,25 @@ def cleanup_old_downloads(max_age_minutes: int = 60):
         except Exception as e:
             logger.warning(f"Не вдалося видалити старий файл {file_path}: {e}")
 
+
 async def process_and_publish_news_cycle():
     logger.info("🚀 Початок новинного циклу 4/24...")
-    cleanup_old_downloads(max_age_minutes=60)
+    cleanup_old_downloads(max_age_minutes=120)
 
-    collector = NewsCollector()
-    summarizer = NewsSummarizer()
-    publisher = NewsPublisher()
-    history = NewsHistory()
+    collector = None
+    publisher = None
 
     try:
+        collector = NewsCollector()
+        summarizer = NewsSummarizer()
+        publisher = NewsPublisher()
+        history = NewsHistory()
+
         posts = await collector.fetch_recent_posts(hours=4, limit_per_channel=15)
         logger.info(f"Зібрано {len(posts)} сирих новин за останні 4 год.")
 
         if not posts:
+            logger.warning("Новин не знайдено, цикл завершено.")
             return
 
         past_titles = history.get_recent_titles(hours=48)
@@ -101,6 +108,7 @@ async def process_and_publish_news_cycle():
         logger.info(f"Фінальний список містить {len(top_news)} новин.")
 
         if not top_news:
+            logger.warning("Дайджест порожній, публікацію скасовано.")
             return
 
         # 1. Header Telegram
@@ -116,42 +124,58 @@ async def process_and_publish_news_cycle():
 
             media_path, media_type = None, None
             if target_post:
-                media_path, media_type = await collector.download_post_media(target_post["message_obj"])
+                try:
+                    media_path, media_type = await collector.download_post_media(target_post["message_obj"])
+                except Exception as dl_err:
+                    logger.warning(f"Помилка завантаження медіа для новини #{index}: {dl_err}")
 
             if media_path and media_type in {"photo", "video"}:
                 ig_media_items.append({"path": media_path, "type": media_type})
                 logger.info(f"Instagram media #{index}: {media_type} → {media_path}")
 
-            await publisher.publish_telegram_post(
+            # Публікуємо та фіксуємо в історію тільки при успішній публікації
+            published = await publisher.publish_telegram_post(
                 text=item["text"],
                 media_path=media_path,
                 media_type=media_type,
             )
 
-            if target_post:
+            if published and target_post:
                 first_line = item["text"].strip().split("\n")[0]
                 history.mark_as_published(
                     channel_name=target_post["channel_name"],
                     message_id=target_post["message_id"],
                     title=first_line,
                 )
+            elif not published:
+                logger.warning(f"Новина #{index} НЕ була опублікована, пропуск збереження в історію.")
+
             await asyncio.sleep(3)
 
         # 3. Публікація Instagram
         if ig_media_items:
-            logger.info(f"Instagram: підготовлено {len(ig_media_items)} медіа.")
+            logger.info(f"Instagram: підготовлено {len(ig_media_items)} медіа. Публікуємо...")
             caption = build_instagram_carousel_caption(top_news)
             await publisher.publish_instagram_carousel(caption=caption, media_items=ig_media_items)
         else:
-            logger.warning("Instagram: медіа відсутні, публікацію пропущено.")
+            logger.warning("Instagram: валідні медіа відсутні, публікацію пропущено.")
 
         history.cleanup_old_records(days=5)
 
     except Exception as e:
-        logger.error(f"Помилка циклу: {e}", exc_info=True)
+        logger.error(f"Помилка новинного циклу: {e}", exc_info=True)
     finally:
-        await collector.close()
-        await publisher.close()
+        if collector:
+            try:
+                await collector.close()
+            except Exception:
+                logger.exception("Помилка закриття Collector")
+        if publisher:
+            try:
+                await publisher.close()
+            except Exception:
+                logger.exception("Помилка закриття Publisher")
+
 
 async def main():
     scheduler = AsyncIOScheduler(timezone="Europe/Kyiv")
@@ -163,6 +187,7 @@ async def main():
     logger.info("⏳ Планувальник 4/24 запущено. Очікування наступного слоту...")
     while True:
         await asyncio.sleep(3600)
+
 
 if __name__ == "__main__":
     asyncio.run(main())

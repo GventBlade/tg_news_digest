@@ -1,3 +1,4 @@
+import html
 import json
 import logging
 import math
@@ -25,7 +26,7 @@ class NewsSummarizer:
 
     def __init__(self):
         self.client = genai.Client(api_key=settings.GEMINI_API_KEY)
-        self.models_priority = ["gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
+        self.models_priority = ["gemini-2.5-flash", "gemini-2.0-flash"]
 
     def select_top_distinct_news(
         self,
@@ -42,7 +43,7 @@ class NewsSummarizer:
         if not posts_context:
             return []
 
-        # 1. AI шукає ВСІ унікальні події без штучного ліміту в 10
+        # 1. AI шукає ВСІ унікальні події без штучного ліміту
         analyzed_events = self._analyze_events(posts_context, past_titles, max_retries_per_model)
         if not analyzed_events:
             logger.warning("Analyzer не повернув подій.")
@@ -58,7 +59,7 @@ class NewsSummarizer:
 
         logger.info(f"Після ranking залишилося {len(ranked_events)} кандидатів.")
 
-        # 3. Передаємо редактору пул найкращих кандидатів (до 25)
+        # 3. Передаємо редактору пул найкращих кандидатів
         editor_events = ranked_events[:self.EDITOR_CANDIDATES]
         logger.info(f"EDITOR отримує TOP-{len(editor_events)} кандидатів для формування {count} новин.")
 
@@ -88,6 +89,10 @@ class NewsSummarizer:
             channel_username = str(post.get("channel_username") or "").replace("@", "").strip()
             views = int(post.get("views") or 0)
 
+            score = (25 if media_tag == "[ВІДЕО]" else (15 if media_tag == "[ФОТО]" else 0)) + min(
+                math.log10(max(views, 1)) * 5, 35
+            )
+
             prepared.append({
                 "idx": idx,
                 "text": text,
@@ -95,8 +100,7 @@ class NewsSummarizer:
                 "channel_title": channel_title,
                 "channel_username": channel_username,
                 "views": views,
-                "score": (25 if media_tag == "[ВІДЕО]" else (15 if media_tag == "[ФОТО]" else 0)) + min(
-                    math.log10(max(views, 1)) * 5, 35)
+                "score": score
             })
 
         if not prepared:
@@ -116,7 +120,7 @@ class NewsSummarizer:
 
     def _analyze_events(self, posts_context: str, past_titles: Optional[List[str]], max_retries: int) -> List[Dict[str, Any]]:
         history_block = self._build_history_block(past_titles)
-        prompt = f"""Ти — старший новинний аналітик редакції "Новини UA 6/24".
+        prompt = f"""Ти — старший новинний аналітик новинної редакції.
 
 ТВОЄ ГОЛОВНЕ ЗАВДАННЯ:
 Проаналізуй ВСІ надані Telegram-повідомлення та знайди МАКСИМАЛЬНО ПОВНИЙ список унікальних, актуальних і суспільно значущих новинних подій.
@@ -215,10 +219,9 @@ TELEGRAM POSTS:
             except Exception as e:
                 logger.warning(f"Помилка ранжування події: {e}")
 
-        # Сортуємо за якістю
         ranked.sort(key=lambda x: x.get("raw_score", 0), reverse=True)
 
-        # Застосовуємо м'який баланс категорій
+        # Баланс категорій
         category_counts: Dict[str, int] = {}
         for ev in ranked:
             category = ev["category"]
@@ -248,7 +251,7 @@ TELEGRAM POSTS:
             )
 
         history_block = self._build_history_block(past_titles)
-        prompt = f"""Ти — головний редактор Telegram-каналу "Новини UA 6/24".
+        prompt = f"""Ти — головний редактор новинного Telegram-каналу.
 Створи фінальний дайджест із РІВНО {count} найкращих новин із наданого пулу кандидатів.
 
 ━━━━━━━━━━━━━━━━━━━━
@@ -315,14 +318,23 @@ TELEGRAM POSTS:
             text = text.strip()
             text = re.sub(r'\[(?:ФОТО|ВІДЕО|ТЕКСТ|PHOTO|VIDEO|TEXT)\]\s*', '', text, flags=re.IGNORECASE)
             text = re.sub(r'(?:ФОТО|ВІДЕО|ТЕКСТ):\s*', '', text, flags=re.IGNORECASE)
+            text = text.replace("📍", "").replace("📌", "")
 
-            if "📍" in text or "📌" in text or "<b>" not in text or "</b>" not in text:
-                continue
+            # Автовиправлення Markdown жирного шрифту на HTML
+            text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)
+
+            if "<b>" not in text or "</b>" not in text:
+                lines = text.split("\n", 1)
+                first_line = lines[0].strip()
+                rest = ("\n" + lines[1]) if len(lines) > 1 else ""
+                text = f"<b>{first_line}</b>{rest}"
 
             if len(text) > self.MAX_NEWS_CHARS:
                 text = text[:self.MAX_NEWS_CHARS]
                 last_sp = text.rfind(" ")
                 text = (text[:last_sp].rstrip() if last_sp > 200 else text) + "…"
+                if "<b>" in text and "</b>" not in text:
+                    text += "</b>"
 
             validated.append({"source_id": s_id, "text": text.strip()})
             used_ids.add(s_id)
@@ -386,6 +398,8 @@ TELEGRAM POSTS:
                 fallback_text = fallback_text[:self.MAX_NEWS_CHARS]
                 last_sp = fallback_text.rfind(" ")
                 fallback_text = (fallback_text[:last_sp].rstrip() if last_sp > 200 else fallback_text) + "…"
+                if "<b>" in fallback_text and "</b>" not in fallback_text:
+                    fallback_text += "</b>"
 
             result.append({
                 "source_id": source_id,
@@ -447,5 +461,7 @@ TELEGRAM POSTS:
         def score(s_id: int) -> float:
             p = posts[s_id]
             bonus = 20 if p.get("has_video") else (10 if p.get("has_media") else 0)
-            return bonus + min(math.log10(max(p.get("views", 0) or 0, 1)) * 2, 15)
+            views = int(p.get("views") or 0)
+            return bonus + min(math.log10(max(views, 1)) * 5, 30)
+
         return max(source_ids, key=score)

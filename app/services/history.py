@@ -23,7 +23,7 @@ class NewsHistory:
                     channel_name TEXT,
                     message_id INTEGER,
                     published_title TEXT DEFAULT '',
-                    published_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    published_at TEXT,
                     UNIQUE(channel_name, message_id)
                 )
             """)
@@ -40,17 +40,18 @@ class NewsHistory:
             cursor = conn.cursor()
             cursor.execute(
                 "SELECT 1 FROM published_news WHERE channel_name = ? AND message_id = ?",
-                (channel_name, message_id)
+                (str(channel_name), message_id)
             )
             return cursor.fetchone() is not None
 
     def mark_as_published(self, channel_name: str, message_id: int, title: str = ""):
-        """Зберігає факт публікації та заголовок новини."""
+        """Зберігає факт публікації та заголовок новини у єдиному форматі UTC ISO."""
+        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         try:
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute(
-                    "INSERT OR IGNORE INTO published_news (channel_name, message_id, published_title) VALUES (?, ?, ?)",
-                    (channel_name, message_id, title)
+                    "INSERT OR IGNORE INTO published_news (channel_name, message_id, published_title, published_at) VALUES (?, ?, ?, ?)",
+                    (str(channel_name), message_id, title.strip(), now_str)
                 )
                 conn.commit()
         except Exception as e:
@@ -58,7 +59,7 @@ class NewsHistory:
 
     def get_recent_titles(self, hours: int = 48) -> List[str]:
         """Отримує заголовки новин за останні 48 годин для суворого блокування дублів."""
-        threshold = datetime.now(timezone.utc) - timedelta(hours=hours)
+        threshold = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute(
@@ -70,7 +71,7 @@ class NewsHistory:
 
     def cleanup_old_records(self, days: int = 5):
         """Видаляє записи старші за 5 днів."""
-        threshold = datetime.now(timezone.utc) - timedelta(days=days)
+        threshold = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("DELETE FROM published_news WHERE published_at < ?", (threshold,))
             conn.commit()

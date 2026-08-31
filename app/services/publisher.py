@@ -12,6 +12,7 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
+
 class NewsPublisher:
     def __init__(self):
         self.bot = Bot(
@@ -28,30 +29,41 @@ class NewsPublisher:
         text: str,
         media_path: str | None = None,
         media_type: str | None = None,
-    ):
+    ) -> bool:
+        """Публікує пост у Telegram. Повертає True у разі успіху, інакше False."""
         try:
             if media_path and Path(media_path).exists():
-                if media_type == "photo":
-                    await self.bot.send_photo(
-                        chat_id=settings.TARGET_CHANNEL_ID,
-                        photo=FSInputFile(media_path),
-                        caption=text,
-                    )
-                elif media_type == "video":
-                    await self.bot.send_video(
-                        chat_id=settings.TARGET_CHANNEL_ID,
-                        video=FSInputFile(media_path),
-                        caption=text,
-                        supports_streaming=True,
-                    )
-            else:
-                await self.bot.send_message(
-                    chat_id=settings.TARGET_CHANNEL_ID,
-                    text=text,
-                )
-            logger.info("Пост опубліковано в Telegram.")
+                try:
+                    if media_type == "photo":
+                        await self.bot.send_photo(
+                            chat_id=settings.TARGET_CHANNEL_ID,
+                            photo=FSInputFile(media_path),
+                            caption=text,
+                        )
+                        logger.info("Фото-пост опубліковано в Telegram.")
+                        return True
+                    elif media_type == "video":
+                        await self.bot.send_video(
+                            chat_id=settings.TARGET_CHANNEL_ID,
+                            video=FSInputFile(media_path),
+                            caption=text,
+                            supports_streaming=True,
+                        )
+                        logger.info("Відео-пост опубліковано в Telegram.")
+                        return True
+                except Exception as media_err:
+                    logger.warning(f"Не вдалося відправити з медіа ({media_err}), пробуємо відправити текстом...")
+
+            await self.bot.send_message(
+                chat_id=settings.TARGET_CHANNEL_ID,
+                text=text,
+            )
+            logger.info("Текстовий пост опубліковано в Telegram.")
+            return True
+
         except Exception as e:
             logger.error(f"Помилка публікації в Telegram: {e}", exc_info=True)
+            return False
 
     def create_public_media_url(self, file_path: str) -> str:
         if not self.media_base_url:
@@ -66,7 +78,10 @@ class NewsPublisher:
 
     @staticmethod
     def _strip_html(text: str) -> str:
-        return re.sub(r"<.*?>", "", text)
+        clean = re.sub(r"<.*?>", "", text).strip()
+        if len(clean) > 2150:
+            clean = clean[:2140] + "...\n(продовження в Telegram)"
+        return clean
 
     async def _create_container(
         self,
@@ -124,7 +139,7 @@ class NewsPublisher:
             except Exception as e:
                 logger.warning(f"Очікування контейнера {creation_id}: {e}")
 
-            await asyncio.sleep(5)
+            await asyncio.sleep(4)
         return False
 
     async def _publish_container(
@@ -144,7 +159,7 @@ class NewsPublisher:
 
     async def publish_instagram_carousel(self, caption: str, media_items: list):
         if not self.ig_account_id or not self.ig_access_token or not self.media_base_url:
-            logger.warning("Instagram параметри не заповнені.")
+            logger.warning("Instagram параметри не заповнені або відсутній MEDIA_BASE_URL.")
             return
 
         if not media_items:
@@ -153,17 +168,21 @@ class NewsPublisher:
 
         clean_caption = self._strip_html(caption)
         items = media_items[:10]
+        is_carousel = len(items) > 1
 
         async with aiohttp.ClientSession() as session:
             try:
                 child_ids = []
                 for item in items:
                     public_url = self.create_public_media_url(item["path"])
+                    slide_caption = None if is_carousel else clean_caption
+
                     child_id = await self._create_container(
                         session=session,
                         media_url=public_url,
                         media_type=item["type"],
-                        is_carousel_item=(len(items) > 1),
+                        caption=slide_caption,
+                        is_carousel_item=is_carousel,
                     )
                     if not child_id:
                         continue
@@ -175,7 +194,7 @@ class NewsPublisher:
                     logger.error("Жоден слайд не пройшов валідацію в Meta.")
                     return
 
-                if len(child_ids) == 1:
+                if not is_carousel:
                     media_id = await self._publish_container(session, child_ids[0])
                 else:
                     parent_url = f"{self.graph_url}/{self.ig_account_id}/media"
@@ -189,13 +208,18 @@ class NewsPublisher:
                         parent_data = await resp.json()
                         carousel_id = parent_data.get("id")
 
-                    if not carousel_id or not await self._wait_for_container(session, carousel_id):
+                    if not carousel_id:
+                        logger.error(f"Не вдалося створити CAROUSEL контейнер: {parent_data}")
+                        return
+
+                    if not await self._wait_for_container(session, carousel_id):
+                        logger.error(f"CAROUSEL контейнер {carousel_id} не готовий до публікації.")
                         return
 
                     media_id = await self._publish_container(session, carousel_id)
 
                 if media_id:
-                    logger.info(f"✅ Instagram карусель опубліковано! ID: {media_id}")
+                    logger.info(f"✅ Instagram публікацію успішно виконано! ID: {media_id}")
 
             except Exception as e:
                 logger.error(f"Помилка при постінгу в Instagram: {e}", exc_info=True)
