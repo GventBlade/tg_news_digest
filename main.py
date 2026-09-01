@@ -1,4 +1,3 @@
-import asyncio
 import logging
 import os
 import time
@@ -21,10 +20,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Приховуємо лише мережевий шум httpx
+# Приховуємо мережевий шум httpx
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-# Ваш числовий Telegram ID
+# Числовий Telegram ID адміністратора
 ADMIN_TELEGRAM_ID = 6217500239
 
 
@@ -281,12 +280,12 @@ async def process_and_publish_news_cycle():
                 pass
 
 
-async def main():
+def main():
     # 1. Ініціалізація Telegram-додатка
     application = ApplicationBuilder().token(settings.BOT_TOKEN).build()
     application.add_handler(MessageHandler(filters.ALL, handle_admin_forwarded_message))
 
-    # 2. Налаштування APScheduler
+    # 2. Налаштування та запуск планувальника APScheduler
     scheduler = AsyncIOScheduler(timezone="Europe/Kyiv")
     scheduler.add_job(
         process_and_publish_news_cycle,
@@ -294,21 +293,15 @@ async def main():
     )
     scheduler.start()
     logger.info("⏳ Планувальник 4/24 запущено. Очікування наступного слоту...")
+    logger.info("🤖 Запуск Telegram-бота через run_polling()...")
 
-    # 3. Послідовна ініціалізація та запуск черги обробки повідомлень
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
-    logger.info("🤖 Telegram-бот для прийому новин від адміна успішно запущено!")
-
-    try:
-        while True:
-            await asyncio.sleep(3600)
-    finally:
-        await application.updater.stop()
-        await application.stop()
-        await application.shutdown()
+    # 3. run_polling створює і веде власний повноцінний цикл обробки оновлень
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=False,
+        close_loop=False
+    )
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
