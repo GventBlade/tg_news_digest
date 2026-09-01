@@ -21,10 +21,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Приховуємо часті службові логи long polling
+# Приховуємо лише мережевий шум httpx
 logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("telegram.ext").setLevel(logging.WARNING)
-logging.getLogger("telegram").setLevel(logging.WARNING)
 
 # Ваш числовий Telegram ID
 ADMIN_TELEGRAM_ID = 6217500239
@@ -99,7 +97,7 @@ async def handle_admin_forwarded_message(update: Update, context: ContextTypes.D
     logger.info(f"📩 Отримано повідомлення від Telegram user_id: {user_id}")
 
     if user_id != ADMIN_TELEGRAM_ID:
-        logger.warning(f"⛔ Відхилено: user_id {user_id} не є адміністратором.")
+        logger.warning(f"⛔ Відхилено: user_id {user_id} не є адміністратором ({ADMIN_TELEGRAM_ID}).")
         return
 
     message = update.message
@@ -107,6 +105,12 @@ async def handle_admin_forwarded_message(update: Update, context: ContextTypes.D
         return
 
     raw_text = message.text or message.caption or ""
+
+    # Обробка тестової команди /start
+    if raw_text.strip().startswith("/start"):
+        await message.reply_text("👋 Бот активний і готовий приймати новини від адміна!")
+        return
+
     channel_title = "Пріоритет (Адмін)"
     channel_username = ""
 
@@ -148,7 +152,7 @@ async def handle_admin_forwarded_message(update: Update, context: ContextTypes.D
     )
 
     await message.reply_text("✅ Новину збережено до черги! Вона матиме найвищий пріоритет у найближчому слоті.")
-    logger.info(f"✅ Ручну новину успішно додано до черги (ID повідомлення: {message.message_id}).")
+    logger.info(f"✅ Ручну новину успішно додано до черги (ID: {message.message_id}).")
 
 
 async def process_and_publish_news_cycle():
@@ -280,7 +284,7 @@ async def process_and_publish_news_cycle():
 async def main():
     # 1. Ініціалізація Telegram-додатка
     application = ApplicationBuilder().token(settings.BOT_TOKEN).build()
-    application.add_handler(MessageHandler(filters.ALL & (~filters.COMMAND), handle_admin_forwarded_message))
+    application.add_handler(MessageHandler(filters.ALL, handle_admin_forwarded_message))
 
     # 2. Налаштування APScheduler
     scheduler = AsyncIOScheduler(timezone="Europe/Kyiv")
@@ -291,18 +295,19 @@ async def main():
     scheduler.start()
     logger.info("⏳ Планувальник 4/24 запущено. Очікування наступного слоту...")
 
-    # 3. Асинхронний життєвий цикл бота
-    async with application:
-        await application.start()
-        await application.updater.start_polling(drop_pending_updates=True)
-        logger.info("🤖 Telegram-бот для прийому новин від адміна успішно запущено!")
+    # 3. Послідовна ініціалізація та запуск черги обробки повідомлень
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
+    logger.info("🤖 Telegram-бот для прийому новин від адміна успішно запущено!")
 
-        try:
-            while True:
-                await asyncio.sleep(3600)
-        finally:
-            await application.updater.stop()
-            await application.stop()
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    finally:
+        await application.updater.stop()
+        await application.stop()
+        await application.shutdown()
 
 
 if __name__ == "__main__":
