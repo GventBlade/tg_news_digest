@@ -17,6 +17,7 @@ class NewsHistory:
 
     def _init_db(self):
         with sqlite3.connect(self.db_path) as conn:
+            # Таблиця опублікованих новин
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS published_news (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -29,19 +30,74 @@ class NewsHistory:
                     UNIQUE(channel_name, message_id)
                 )
             """)
+            # Таблиця ручної черги пересланих новин від адміна
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS manual_news_queue (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    raw_text TEXT,
+                    channel_title TEXT DEFAULT 'Адмін-вибір',
+                    channel_username TEXT DEFAULT '',
+                    media_path TEXT DEFAULT NULL,
+                    media_type TEXT DEFAULT NULL,
+                    has_media INTEGER DEFAULT 0,
+                    has_video INTEGER DEFAULT 0,
+                    views INTEGER DEFAULT 50000,
+                    processed INTEGER DEFAULT 0,
+                    created_at TEXT
+                )
+            """)
+            conn.commit()
+
+    def add_manual_post(
+        self,
+        raw_text: str,
+        channel_title: str = "Адмін-вибір",
+        channel_username: str = "",
+        media_path: str = None,
+        media_type: str = None,
+        has_media: bool = False,
+        has_video: bool = False,
+    ) -> int:
+        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
-            cursor.execute("PRAGMA table_info(published_news)")
-            columns = [col[1] for col in cursor.fetchall()]
-            if "published_title" not in columns:
-                cursor.execute("ALTER TABLE published_news ADD COLUMN published_title TEXT DEFAULT ''")
-            if "summary" not in columns:
-                cursor.execute("ALTER TABLE published_news ADD COLUMN summary TEXT DEFAULT ''")
-            if "category" not in columns:
-                cursor.execute("ALTER TABLE published_news ADD COLUMN category TEXT DEFAULT ''")
+            cursor.execute(
+                """
+                INSERT INTO manual_news_queue 
+                (raw_text, channel_title, channel_username, media_path, media_type, has_media, has_video, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    raw_text.strip(),
+                    channel_title,
+                    channel_username,
+                    media_path,
+                    media_type,
+                    1 if has_media else 0,
+                    1 if has_video else 0,
+                    now_str
+                )
+            )
+            conn.commit()
+            return cursor.lastrowid
+
+    def get_pending_manual_posts(self) -> List[Dict[str, Any]]:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM manual_news_queue WHERE processed = 0 ORDER BY id ASC")
+            rows = cursor.fetchall()
+            return [dict(r) for r in rows]
+
+    def mark_manual_posts_processed(self, ids: List[int]):
+        if not ids:
+            return
+        placeholders = ",".join("?" for _ in ids)
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(f"UPDATE manual_news_queue SET processed = 1 WHERE id IN ({placeholders})", ids)
             conn.commit()
 
     def is_published(self, channel_name: str, message_id: int) -> bool:
-        """Перевіряє, чи публікувався вже цей конкретний пост."""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute(
@@ -58,7 +114,6 @@ class NewsHistory:
         summary: str = "",
         category: str = ""
     ):
-        """Зберігає факт публікації з заголовком та контекстом події."""
         now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         try:
             with sqlite3.connect(self.db_path) as conn:
@@ -75,7 +130,6 @@ class NewsHistory:
             logger.warning(f"Не вдалося записати історію: {e}")
 
     def get_recent_events(self, hours: int = 48) -> List[Dict[str, str]]:
-        """Отримує список опублікованих подій за останні N годин у порядку від найновіших."""
         threshold = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
@@ -100,8 +154,8 @@ class NewsHistory:
             ]
 
     def cleanup_old_records(self, days: int = 5):
-        """Видаляє записи старші за 5 днів."""
         threshold = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("DELETE FROM published_news WHERE published_at < ?", (threshold,))
+            conn.execute("DELETE FROM manual_news_queue WHERE processed = 1 AND created_at < ?", (threshold,))
             conn.commit()

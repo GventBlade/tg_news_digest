@@ -18,7 +18,7 @@ class NewsSummarizer:
     HISTORY_LIMIT = 150
     MAX_INPUT_CHARS = 55000
     MAX_EVENT_SOURCE_CHARS = 2500
-    MAX_NEWS_CHARS = 350
+    MAX_NEWS_CHARS = 400
     ALLOWED_CATEGORIES = {
         "war", "politics", "economy", "international", "society",
         "technology", "science", "culture", "other"
@@ -91,10 +91,14 @@ class NewsSummarizer:
             channel_title = post.get("channel_title") or post.get("channel_username") or "Джерело"
             channel_username = str(post.get("channel_username") or "").replace("@", "").strip()
             views = int(post.get("views") or 0)
+            is_priority = bool(post.get("is_priority"))
 
-            score = (25 if media_tag == "[ВІДЕО]" else (15 if media_tag == "[ФОТО]" else 0)) + min(
-                math.log10(max(views, 1)) * 5, 35
+            score = 1000 if is_priority else (
+                (25 if media_tag == "[ВІДЕО]" else (15 if media_tag == "[ФОТО]" else 0)) +
+                min(math.log10(max(views, 1)) * 5, 35)
             )
+
+            priority_flag = " ⭐ [ПРІОРИТЕТ АДМІНІСТРАТОРА]" if is_priority else ""
 
             prepared.append({
                 "idx": idx,
@@ -103,7 +107,8 @@ class NewsSummarizer:
                 "channel_title": channel_title,
                 "channel_username": channel_username,
                 "views": views,
-                "score": score
+                "score": score,
+                "priority_flag": priority_flag
             })
 
         if not prepared:
@@ -113,7 +118,7 @@ class NewsSummarizer:
         result, current_length = [], 0
 
         for item in prepared:
-            block = f"ID {item['idx']} {item['media_tag']} [{item['channel_title']}] @{item['channel_username']}\nПерегляди: {item['views']}\n{item['text']}"
+            block = f"ID {item['idx']} {item['media_tag']}{item['priority_flag']} [{item['channel_title']}] @{item['channel_username']}\nПерегляди: {item['views']}\n{item['text']}"
             if current_length + len(block) > self.MAX_INPUT_CHARS:
                 continue
             result.append(block)
@@ -133,6 +138,8 @@ class NewsSummarizer:
 ТВОЄ ГОЛОВНЕ ЗАВДАННЯ:
 Проаналізуй ВСІ надані Telegram-повідомлення та знайди МАКСИМАЛЬНО ПОВНИЙ список унікальних, актуальних і суспільно значущих новинних подій.
 Згрупуй повідомлення, які описують ОДНУ Й ТУ САМУ подію з різних джерел, під один спільний event_id.
+
+Якщо пост містить позначку "⭐ [ПРІОРИТЕТ АДМІНІСТРАТОРА]", обов'язково створи під нього окрему подію з показником importance=100 та novelty=100.
 
 ━━━━━━━━━━━━━━━━━━━━
 АРХІВ ВЖЕ ОПУБЛІКОВАНИХ ПОДІЙ ЗА 48 ГОДИН (СУВОРО ЗАБОРОНЕНО ПОВТОРЮВАТИ):
@@ -186,6 +193,8 @@ TELEGRAM POSTS:
                 if not src_ids:
                     continue
 
+                is_manual_priority = any(posts[s].get("is_priority") for s in src_ids)
+
                 imp = self._safe_score(ev.get("importance"))
                 scale = self._safe_score(ev.get("scale"))
                 rel = self._safe_score(ev.get("reliability"))
@@ -199,6 +208,9 @@ TELEGRAM POSTS:
                 score = (imp * 0.35 + scale * 0.15 + rel * 0.20 + pub * 0.12 + nov * 0.08 + med * 0.05)
                 score += min(len(src_ids) * 2, 8)
 
+                if is_manual_priority:
+                    score += 500  # Гарантований топ слот
+
                 if has_video:
                     score += 5
                 elif has_media:
@@ -206,9 +218,10 @@ TELEGRAM POSTS:
                 else:
                     score -= 3
 
-                if rel < 45: score -= 15
-                elif rel < 60: score -= 7
-                if len(src_ids) == 1: score -= 2
+                if not is_manual_priority:
+                    if rel < 45: score -= 15
+                    elif rel < 60: score -= 7
+                    if len(src_ids) == 1: score -= 2
 
                 cat = ev.get("category", "other")
                 if cat not in self.ALLOWED_CATEGORIES:
@@ -220,6 +233,7 @@ TELEGRAM POSTS:
                     "best_source_id": self._select_best_source(src_ids, posts),
                     "has_video": has_video,
                     "has_media": has_media,
+                    "is_priority": is_manual_priority,
                     "category": cat,
                     "raw_score": round(score, 2)
                 })
@@ -231,6 +245,9 @@ TELEGRAM POSTS:
 
         category_counts: Dict[str, int] = {}
         for ev in ranked:
+            if ev.get("is_priority"):
+                ev["balanced_score"] = ev["raw_score"]
+                continue
             category = ev["category"]
             current = category_counts.get(category, 0)
             penalty = 8 if current >= 4 else (3 if current >= 3 else 0)
@@ -253,9 +270,10 @@ TELEGRAM POSTS:
             best_id = ev.get("best_source_id")
             p = posts[best_id]
             media = "[ВІДЕО]" if p.get("has_video") else ("[ФОТО]" if p.get("has_media") else "[ТЕКСТ]")
+            p_flag = " ⭐ [ПРІОРИТЕТ АДМІНІСТРАТОРА]" if ev.get("is_priority") else ""
 
             ev_blocks.append(
-                f"=== EVENT_ID: {ev.get('event_id')} ===\n"
+                f"=== EVENT_ID: {ev.get('event_id')}{p_flag} ===\n"
                 f"МЕДІА: {media} [{p.get('channel_title', 'Джерело')}]\n"
                 f"СУТЬ: {ev.get('summary', '')}\n"
                 f"ТЕКСТ ДЖЕРЕЛА: {p.get('text', '')[:self.MAX_EVENT_SOURCE_CHARS]}\n"
@@ -265,6 +283,8 @@ TELEGRAM POSTS:
         prompt = f"""Ти — головний редактор новинного Telegram-каналу.
 Створи фінальний дайджест із РІВНО {count} найкращих новин із наданого пулу кандидатів.
 
+ОБОВ'ЯЗКОВО: Якщо серед кандидатів є новини з позначкою "⭐ [ПРІОРИТЕТ АДМІНІСТРАТОРА]", вони ПОВИННІ бути включені до випуску та розміщені на самому початку!
+
 ━━━━━━━━━━━━━━━━━━━━
 АРХІВ ВЖЕ ОПУБЛІКОВАНИХ ПОДІЙ ЗА 48 ГОДИН (СУВОРО ЗАБОРОНЕНО ПОВТОРЮВАТИ):
 {history_block}
@@ -273,9 +293,9 @@ TELEGRAM POSTS:
 ВИМОГИ:
 1. Вибери РІВНО {count} найважливіших та найрізноманітніших EVENT_ID.
 2. Текст новини повинен строго відповідати своєму EVENT_ID.
-3. Розмір: до 350 символів.
+3. Розмір: до {self.MAX_NEWS_CHARS} символів.
 4. Перший рядок: ОДИН тематичний емодзі (🇺🇦, 🇺🇸, 💥, 🚀, ⚖️, 🏛, 🛢, 📹, 🌍, 💰, ⚡) + <b>Короткий жирний заголовок</b>.
-5. Основний текст: 2-3 короткі речення з чіткими фактами і цифрами.
+5. Основний текст: 2-4 змістовні речення з фактами, цифрами та контекстом.
 6. СУВОРО ЗАБОРОНЕНО вставляти технічні маркери: "[ФОТО]", "[ВІДЕО]", "[ТЕКСТ]", "ФОТО:", "ВІДЕО:".
 7. ЗАБОРОНЕНО клікбейт та непідтверджені чутки.
 
@@ -284,7 +304,7 @@ TELEGRAM POSTS:
   "news": [
     {{
       "event_id": "E1",
-      "text": "🛢 <b>Заголовок новини</b>\\n\\nТекст події з фактами."
+      "text": "🛢 <b>Заголовок новини</b>\\n\\nРозширений фактологічний текст події."
     }}
   ]
 }}
@@ -354,7 +374,7 @@ TELEGRAM POSTS:
             if len(text) > self.MAX_NEWS_CHARS:
                 text = text[:self.MAX_NEWS_CHARS]
                 last_sp = text.rfind(" ")
-                text = (text[:last_sp].rstrip() if last_sp > 200 else text) + "…"
+                text = (text[:last_sp].rstrip() if last_sp > 250 else text) + "…"
                 if "<b>" in text and "</b>" not in text:
                     text += "</b>"
 
@@ -418,7 +438,7 @@ TELEGRAM POSTS:
                 continue
 
             headline = (ev.get("headline_hint") or "Важлива новина").strip()
-            summary = (ev.get("summary") or raw_text[:280]).strip()
+            summary = (ev.get("summary") or raw_text[:320]).strip()
             category = ev.get("category", "other")
             emoji = emoji_map.get(category, "📰")
 
@@ -427,7 +447,7 @@ TELEGRAM POSTS:
             if len(fallback_text) > self.MAX_NEWS_CHARS:
                 fallback_text = fallback_text[:self.MAX_NEWS_CHARS]
                 last_sp = fallback_text.rfind(" ")
-                fallback_text = (fallback_text[:last_sp].rstrip() if last_sp > 200 else fallback_text) + "…"
+                fallback_text = (fallback_text[:last_sp].rstrip() if last_sp > 250 else fallback_text) + "…"
                 if "<b>" in fallback_text and "</b>" not in fallback_text:
                     fallback_text += "</b>"
 
@@ -507,6 +527,8 @@ TELEGRAM POSTS:
     def _select_best_source(source_ids: List[int], posts: List[Dict[str, Any]]) -> int:
         def score(s_id: int) -> float:
             p = posts[s_id]
+            if p.get("is_priority"):
+                return 10000
             bonus = 20 if p.get("has_video") else (10 if p.get("has_media") else 0)
             views = int(p.get("views") or 0)
             return bonus + min(math.log10(max(views, 1)) * 5, 30)
