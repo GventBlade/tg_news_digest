@@ -21,6 +21,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Приховуємо часті службові логи long polling
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram.ext").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+
 # Ваш числовий Telegram ID
 ADMIN_TELEGRAM_ID = 6217500239
 
@@ -66,14 +71,14 @@ def build_instagram_carousel_caption(top_news: list) -> str:
     lines.extend([
         "━━━━━━━━━━━━━━━━━━━━",
         "📲 Більше деталей та всі новини — у нашому Telegram-каналі «Новини UA 6/24»:",
-        f"👉 [https://t.me/](https://t.me/){channel_name}",
+        f"👉 https://t.me/{channel_name}",
         "",
         "#новини #україна #новиниукраїни #дайджест #ua #news",
     ])
     return "\n".join(lines)
 
 
-def cleanup_old_downloads(max_age_minutes: int = 120):
+def cleanup_old_downloads(max_age_minutes: int = 360):
     downloads_dir = "downloads"
     if not os.path.exists(downloads_dir):
         return
@@ -83,6 +88,7 @@ def cleanup_old_downloads(max_age_minutes: int = 120):
         file_path = os.path.join(downloads_dir, filename)
         try:
             if os.path.isfile(file_path):
+                # Видаляємо лише старі тимчасові файли (старші 6 годин)
                 if now - os.path.getmtime(file_path) > (max_age_minutes * 60):
                     os.unlink(file_path)
         except Exception as e:
@@ -90,10 +96,6 @@ def cleanup_old_downloads(max_age_minutes: int = 120):
 
 
 async def handle_admin_forwarded_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id if update.effective_user else None
-    if user_id != ADMIN_TELEGRAM_ID:
-        return
-
     message = update.message
     if not message:
         return
@@ -144,7 +146,7 @@ async def handle_admin_forwarded_message(update: Update, context: ContextTypes.D
 
 async def process_and_publish_news_cycle():
     logger.info("🚀 Початок новинного циклу 4/24...")
-    cleanup_old_downloads(max_age_minutes=120)
+    cleanup_old_downloads(max_age_minutes=360)
 
     collector = None
     publisher = None
@@ -269,9 +271,10 @@ async def process_and_publish_news_cycle():
 
 
 async def main():
-    # Запуск бота для прийому пересланих повідомлень
+    # Запуск бота для прийому пересланих повідомлень (тільки від адміна)
     application = ApplicationBuilder().token(settings.BOT_TOKEN).build()
-    application.add_handler(MessageHandler(filters.ALL & (~filters.COMMAND), handle_admin_forwarded_message))
+    admin_filter = filters.User(user_id=ADMIN_TELEGRAM_ID) & filters.ALL & (~filters.COMMAND)
+    application.add_handler(MessageHandler(admin_filter, handle_admin_forwarded_message))
 
     await application.initialize()
     await application.start()
