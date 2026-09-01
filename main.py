@@ -105,7 +105,7 @@ async def handle_admin_forwarded_message(update: Update, context: ContextTypes.D
 
     raw_text = message.text or message.caption or ""
 
-    # Обробка тестової команди /start
+    # Тестовий відгук на /start
     if raw_text.strip().startswith("/start"):
         await message.reply_text("👋 Бот активний і готовий приймати новини від адміна!")
         return
@@ -280,22 +280,30 @@ async def process_and_publish_news_cycle():
                 pass
 
 
-def main():
-    # 1. Ініціалізація Telegram-додатка
-    application = ApplicationBuilder().token(settings.BOT_TOKEN).build()
-    application.add_handler(MessageHandler(filters.ALL, handle_admin_forwarded_message))
-
-    # 2. Налаштування та запуск планувальника APScheduler
+async def on_startup(application):
+    """Викликається всередині активного event loop одразу після ініціалізації бота."""
     scheduler = AsyncIOScheduler(timezone="Europe/Kyiv")
     scheduler.add_job(
         process_and_publish_news_cycle,
         trigger=CronTrigger(hour="3,7,11,15,19,23", minute="58", timezone="Europe/Kyiv"),
     )
     scheduler.start()
-    logger.info("⏳ Планувальник 4/24 запущено. Очікування наступного слоту...")
-    logger.info("🤖 Запуск Telegram-бота через run_polling()...")
+    logger.info("⏳ Планувальник 4/24 успішно запущено. Очікування наступного слоту...")
 
-    # 3. run_polling створює і веде власний повноцінний цикл обробки оновлень
+
+def main():
+    # 1. Створюємо додаток з прив'язкою хука post_init
+    application = (
+        ApplicationBuilder()
+        .token(settings.BOT_TOKEN)
+        .post_init(on_startup)
+        .build()
+    )
+    application.add_handler(MessageHandler(filters.ALL, handle_admin_forwarded_message))
+
+    logger.info("🤖 Запуск Telegram-бота...")
+
+    # 2. run_polling створює і веде власний повноцінний цикл обробки оновлень
     application.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=False,
