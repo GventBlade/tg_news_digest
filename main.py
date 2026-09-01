@@ -88,7 +88,6 @@ def cleanup_old_downloads(max_age_minutes: int = 360):
         file_path = os.path.join(downloads_dir, filename)
         try:
             if os.path.isfile(file_path):
-                # Видаляємо лише старі тимчасові файли (старші 6 годин)
                 if now - os.path.getmtime(file_path) > (max_age_minutes * 60):
                     os.unlink(file_path)
         except Exception as e:
@@ -96,6 +95,13 @@ def cleanup_old_downloads(max_age_minutes: int = 360):
 
 
 async def handle_admin_forwarded_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id if update.effective_user else None
+    logger.info(f"📩 Отримано повідомлення від Telegram user_id: {user_id}")
+
+    if user_id != ADMIN_TELEGRAM_ID:
+        logger.warning(f"⛔ Відхилено: user_id {user_id} не є адміністратором.")
+        return
+
     message = update.message
     if not message:
         return
@@ -142,6 +148,7 @@ async def handle_admin_forwarded_message(update: Update, context: ContextTypes.D
     )
 
     await message.reply_text("✅ Новину збережено до черги! Вона матиме найвищий пріоритет у найближчому слоті.")
+    logger.info(f"✅ Ручну новину успішно додано до черги (ID повідомлення: {message.message_id}).")
 
 
 async def process_and_publish_news_cycle():
@@ -271,17 +278,11 @@ async def process_and_publish_news_cycle():
 
 
 async def main():
-    # Запуск бота для прийому пересланих повідомлень (тільки від адміна)
+    # 1. Ініціалізація Telegram-додатка
     application = ApplicationBuilder().token(settings.BOT_TOKEN).build()
-    admin_filter = filters.User(user_id=ADMIN_TELEGRAM_ID) & filters.ALL & (~filters.COMMAND)
-    application.add_handler(MessageHandler(admin_filter, handle_admin_forwarded_message))
+    application.add_handler(MessageHandler(filters.ALL & (~filters.COMMAND), handle_admin_forwarded_message))
 
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling()
-    logger.info("🤖 Telegram-бот для прийому новин від адміна успішно запущено!")
-
-    # Планувальник чергових випусків
+    # 2. Налаштування APScheduler
     scheduler = AsyncIOScheduler(timezone="Europe/Kyiv")
     scheduler.add_job(
         process_and_publish_news_cycle,
@@ -290,13 +291,18 @@ async def main():
     scheduler.start()
     logger.info("⏳ Планувальник 4/24 запущено. Очікування наступного слоту...")
 
-    try:
-        while True:
-            await asyncio.sleep(3600)
-    finally:
-        await application.updater.stop()
-        await application.stop()
-        await application.shutdown()
+    # 3. Асинхронний життєвий цикл бота
+    async with application:
+        await application.start()
+        await application.updater.start_polling(drop_pending_updates=True)
+        logger.info("🤖 Telegram-бот для прийому новин від адміна успішно запущено!")
+
+        try:
+            while True:
+                await asyncio.sleep(3600)
+        finally:
+            await application.updater.stop()
+            await application.stop()
 
 
 if __name__ == "__main__":
