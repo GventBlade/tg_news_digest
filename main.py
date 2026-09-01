@@ -103,20 +103,21 @@ async def process_and_publish_news_cycle():
             logger.warning("Новин не знайдено, цикл завершено.")
             return
 
-        past_titles = history.get_recent_titles(hours=48)
-        top_news = summarizer.select_top_distinct_news(posts, past_titles=past_titles, count=10)
+        # 1. Отримуємо розширену історію за 48 годин для надійної дедуплікації подій
+        past_events = history.get_recent_events(hours=48)
+        top_news = summarizer.select_top_distinct_news(posts, past_events=past_events, count=10)
         logger.info(f"Фінальний список містить {len(top_news)} новин.")
 
         if not top_news:
             logger.warning("Дайджест порожній, публікацію скасовано.")
             return
 
-        # 1. Header Telegram
+        # 2. Header Telegram
         header_text = get_slot_header_text(len(top_news))
         await publisher.publish_telegram_post(text=header_text)
         await asyncio.sleep(2)
 
-        # 2. Telegram пости та збір медіа для Instagram
+        # 3. Telegram пости та збір медіа для Instagram
         ig_media_items = []
         for index, item in enumerate(top_news, start=1):
             source_idx = item.get("source_id", 0)
@@ -133,26 +134,29 @@ async def process_and_publish_news_cycle():
                 ig_media_items.append({"path": media_path, "type": media_type})
                 logger.info(f"Instagram media #{index}: {media_type} → {media_path}")
 
-            # Публікуємо та фіксуємо в історію тільки при успішній публікації
+            # Публікуємо в Telegram
             published = await publisher.publish_telegram_post(
                 text=item["text"],
                 media_path=media_path,
                 media_type=media_type,
             )
 
+            # Фіксуємо подію в історію разом із суттю (summary) та категорією (category)
             if published and target_post:
                 first_line = item["text"].strip().split("\n")[0]
                 history.mark_as_published(
-                    channel_name=target_post["channel_name"],
-                    message_id=target_post["message_id"],
+                    channel_name=target_post.get("channel_username") or target_post.get("channel_name", "unknown"),
+                    message_id=target_post.get("message_id", 0),
                     title=first_line,
+                    summary=item.get("summary", ""),
+                    category=item.get("category", "")
                 )
             elif not published:
                 logger.warning(f"Новина #{index} НЕ була опублікована, пропуск збереження в історію.")
 
             await asyncio.sleep(3)
 
-        # 3. Публікація Instagram
+        # 4. Публікація Instagram
         if ig_media_items:
             logger.info(f"Instagram: підготовлено {len(ig_media_items)} медіа. Публікуємо...")
             caption = build_instagram_carousel_caption(top_news)
@@ -160,6 +164,7 @@ async def process_and_publish_news_cycle():
         else:
             logger.warning("Instagram: валідні медіа відсутні, публікацію пропущено.")
 
+        # Очищення застарілих записів (старших за 5 днів)
         history.cleanup_old_records(days=5)
 
     except Exception as e:
