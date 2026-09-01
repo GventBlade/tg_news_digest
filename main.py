@@ -270,7 +270,7 @@ async def process_and_publish_news_cycle():
 
 async def main():
     # Запуск бота для прийому пересланих повідомлень
-    application = ApplicationBuilder().token(settings.TELEGRAM_BOT_TOKEN).build()
+    application = ApplicationBuilder().token(settings.BOT_TOKEN).build()
     application.add_handler(MessageHandler(filters.ALL & (~filters.COMMAND), handle_admin_forwarded_message))
 
     await application.initialize()
