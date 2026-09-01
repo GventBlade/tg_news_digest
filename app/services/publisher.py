@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import re
 from pathlib import Path
 from urllib.parse import quote
@@ -109,7 +110,7 @@ class NewsPublisher:
         async with session.post(url, data=params) as resp:
             data = await resp.json()
             if resp.status >= 400:
-                logger.error(f"Instagram Container Error: {data}")
+                logger.warning(f"Instagram Container Init Error ({media_type}): {data}")
                 return None
             return data.get("id")
 
@@ -117,7 +118,7 @@ class NewsPublisher:
         self,
         session: aiohttp.ClientSession,
         creation_id: str,
-        timeout: int = 180,
+        timeout: int = 120,
     ) -> bool:
         url = f"{self.graph_url}/{creation_id}"
         deadline = asyncio.get_running_loop().time() + timeout
@@ -134,10 +135,10 @@ class NewsPublisher:
                     if status_code == "FINISHED":
                         return True
                     if status_code in {"ERROR", "EXPIRED"}:
-                        logger.error(f"Instagram Container Error: {data}")
+                        logger.warning(f"Instagram медіа-елемент {creation_id} відхилено: {data}")
                         return False
             except Exception as e:
-                logger.warning(f"Очікування контейнера {creation_id}: {e}")
+                logger.warning(f"Очікування статусу контейнера {creation_id}: {e}")
 
             await asyncio.sleep(4)
         return False
@@ -163,44 +164,67 @@ class NewsPublisher:
             return
 
         if not media_items:
-            logger.warning("Немає медіа для створення каруселі в Instagram.")
+            logger.warning("Немає медіа для публікації в Instagram.")
             return
 
         clean_caption = self._strip_html(caption)
-        items = media_items[:10]
-        is_carousel = len(items) > 1
+
+        # 1. Попередня валідація файлів: відкидаємо занадто великі відео (>45MB)
+        filtered_items = []
+        for item in media_items[:10]:
+            path = Path(item["path"])
+            if not path.exists():
+                continue
+            file_size_mb = path.stat().st_size / (1024 * 1024)
+            if item["type"] == "video" and file_size_mb > 45:
+                logger.warning(f"Пропускаємо відео {path.name} для Instagram: розмір {file_size_mb:.1f} MB перевищує ліміт.")
+                continue
+            filtered_items.append(item)
+
+        if not filtered_items:
+            logger.warning("Після фільтрації розміру не залишилося доступних медіа для Instagram.")
+            return
 
         async with aiohttp.ClientSession() as session:
             try:
-                child_ids = []
-                for item in items:
-                    public_url = self.create_public_media_url(item["path"])
-                    slide_caption = None if is_carousel else clean_caption
+                valid_child_ids = []
+                for item in filtered_items:
+                    try:
+                        public_url = self.create_public_media_url(item["path"])
+                        # Створюємо як елемент каруселі
+                        child_id = await self._create_container(
+                            session=session,
+                            media_url=public_url,
+                            media_type=item["type"],
+                            caption=None,
+                            is_carousel_item=True,
+                        )
+                        if not child_id:
+                            continue
 
-                    child_id = await self._create_container(
-                        session=session,
-                        media_url=public_url,
-                        media_type=item["type"],
-                        caption=slide_caption,
-                        is_carousel_item=is_carousel,
-                    )
-                    if not child_id:
-                        continue
+                        # Чекаємо готовності конкретного слайда
+                        is_ready = await self._wait_for_container(session, child_id)
+                        if is_ready:
+                            valid_child_ids.append(child_id)
+                            logger.info(f"✅ Instagram слайд {child_id} успішно готовий.")
+                        else:
+                            logger.warning(f"⚠️ Слайд {item['path']} пропущено через помилку обробки Meta.")
+                    except Exception as item_err:
+                        logger.warning(f"Помилка створення слайда {item.get('path')}: {item_err}")
 
-                    if await self._wait_for_container(session, child_id):
-                        child_ids.append(child_id)
-
-                if not child_ids:
-                    logger.error("Жоден слайд не пройшов валідацію в Meta.")
+                if not valid_child_ids:
+                    logger.error("Жоден слайд не пройшов фінальну обробку в Instagram.")
                     return
 
-                if not is_carousel:
-                    media_id = await self._publish_container(session, child_ids[0])
-                else:
+                logger.info(f"Instagram: зібрано {len(valid_child_ids)} валідних слайдів. Формуємо публікацію...")
+
+                media_id = None
+                # Якщо валідних слайдів кілька — публікуємо карусель
+                if len(valid_child_ids) > 1:
                     parent_url = f"{self.graph_url}/{self.ig_account_id}/media"
                     parent_params = {
                         "media_type": "CAROUSEL",
-                        "children": ",".join(child_ids),
+                        "children": ",".join(valid_child_ids),
                         "caption": clean_caption,
                         "access_token": self.ig_access_token,
                     }
@@ -212,14 +236,24 @@ class NewsPublisher:
                         logger.error(f"Не вдалося створити CAROUSEL контейнер: {parent_data}")
                         return
 
-                    if not await self._wait_for_container(session, carousel_id):
-                        logger.error(f"CAROUSEL контейнер {carousel_id} не готовий до публікації.")
-                        return
-
-                    media_id = await self._publish_container(session, carousel_id)
+                    if await self._wait_for_container(session, carousel_id):
+                        media_id = await self._publish_container(session, carousel_id)
+                else:
+                    # Якщо валідний тільки 1 слайд — створюємо як одиночний пост
+                    single_item = filtered_items[0]
+                    public_url = self.create_public_media_url(single_item["path"])
+                    single_id = await self._create_container(
+                        session=session,
+                        media_url=public_url,
+                        media_type=single_item["type"],
+                        caption=clean_caption,
+                        is_carousel_item=False,
+                    )
+                    if single_id and await self._wait_for_container(session, single_id):
+                        media_id = await self._publish_container(session, single_id)
 
                 if media_id:
-                    logger.info(f"✅ Instagram публікацію успішно виконано! ID: {media_id}")
+                    logger.info(f"🚀 Instagram публікацію успішно опубліковано! ID: {media_id}")
 
             except Exception as e:
                 logger.error(f"Помилка при постінгу в Instagram: {e}", exc_info=True)
