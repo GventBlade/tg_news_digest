@@ -11,6 +11,35 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
+# Вагові коефіцієнти джерел за рівнями довіри та якості
+SOURCE_TIERS = {
+    # Tier A: Еталонні медіа (максимальна довіра) — коефіцієнт 1.2
+    "suspilnenews": 1.2,
+    "ukrpravda_news": 1.2,
+    "babel": 1.2,
+    "nvua_official": 1.2,
+    "liganet": 1.2,
+    "bbcukrainian": 1.2,
+    "radiosvoboda": 1.2,
+    "forbesukraine": 1.2,
+
+    # Tier B: Спеціалізовані першоджерела та мілітарна аналітика — коефіцієнт 1.1
+    "DeepStateUA": 1.1,
+    "DIUkraine": 1.1,
+    "milinua": 1.1,
+    "kpszsu": 1.1,
+    "operativnoZSU": 1.1,
+    "Tsaplienko": 1.1,
+
+    # Tier C: Швидкі агрегатори (оперативність/медіасигнал) — коефіцієнт 0.9
+    "TCH_channel": 0.9,
+    "times_ukraina": 0.9,
+    "truexanewsua": 0.9,
+    "voynareal": 0.9,
+    "lachentyt": 0.9,
+    "vanek_nikolaev": 0.9,
+}
+
 
 class NewsSummarizer:
     DEFAULT_COUNT = 10
@@ -54,7 +83,7 @@ class NewsSummarizer:
 
         logger.info(f"Analyzer знайшов {len(analyzed_events)} унікальних подій.")
 
-        # 2. Python-ранжування та баланс категорій
+        # 2. Python-ранжування та баланс категорій з урахуванням Tier-ваг
         ranked_events = self._rank_events(analyzed_events, posts)
         if not ranked_events:
             logger.warning("Після Python scoring не залишилося подій.")
@@ -93,11 +122,14 @@ class NewsSummarizer:
             views = int(post.get("views") or 0)
             is_priority = bool(post.get("is_priority"))
 
-            score = 1000 if is_priority else (
+            tier_mult = SOURCE_TIERS.get(channel_username, 1.0)
+
+            base_calc = (
                 (25 if media_tag == "[ВІДЕО]" else (15 if media_tag == "[ФОТО]" else 0)) +
                 min(math.log10(max(views, 1)) * 5, 35)
             )
 
+            score = 1000 if is_priority else (base_calc * tier_mult)
             priority_flag = " ⭐ [ПРІОРИТЕТ АДМІНІСТРАТОРА]" if is_priority else ""
 
             prepared.append({
@@ -205,7 +237,17 @@ TELEGRAM POSTS:
                 has_video = any(posts[s].get("has_video") for s in src_ids)
                 has_media = any(posts[s].get("has_media") for s in src_ids)
 
-                score = (imp * 0.35 + scale * 0.15 + rel * 0.20 + pub * 0.12 + nov * 0.08 + med * 0.05)
+                # Базовий розрахунок значущості
+                base_score = (imp * 0.35 + scale * 0.15 + rel * 0.20 + pub * 0.12 + nov * 0.08 + med * 0.05)
+
+                # Розрахунок середнього вагового коефіцієнта джерел
+                tier_multipliers = []
+                for s in src_ids:
+                    ch_name = str(posts[s].get("channel_username") or "").replace("@", "").strip()
+                    tier_multipliers.append(SOURCE_TIERS.get(ch_name, 1.0))
+                avg_tier_mult = (sum(tier_multipliers) / len(tier_multipliers)) if tier_multipliers else 1.0
+
+                score = base_score * avg_tier_mult
                 score += min(len(src_ids) * 2, 8)
 
                 if is_manual_priority:
@@ -531,6 +573,8 @@ TELEGRAM POSTS:
                 return 10000
             bonus = 20 if p.get("has_video") else (10 if p.get("has_media") else 0)
             views = int(p.get("views") or 0)
-            return bonus + min(math.log10(max(views, 1)) * 5, 30)
+            ch_name = str(p.get("channel_username") or "").replace("@", "").strip()
+            tier_mult = SOURCE_TIERS.get(ch_name, 1.0)
+            return (bonus + min(math.log10(max(views, 1)) * 5, 30)) * tier_mult
 
         return max(source_ids, key=score)
