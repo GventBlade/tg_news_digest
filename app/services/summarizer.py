@@ -56,7 +56,7 @@ class NewsSummarizer:
 
     MAX_INPUT_CHARS = 55000
     MAX_EVENT_SOURCE_CHARS = 2500
-    MAX_NEWS_CHARS = 500
+    MAX_NEWS_CHARS = 650
 
     ALLOWED_CATEGORIES = {
         "war", "politics", "economy", "international", "society",
@@ -86,7 +86,12 @@ class NewsSummarizer:
         if not posts_context:
             return []
 
-        analyzed_events = self._analyze_events(posts_context, past_events, max_retries_per_model)
+        analyzed_events = self._analyze_events(
+            posts_context,
+            past_events,
+            max_retries_per_model
+        )
+
         if not analyzed_events:
             logger.warning("Analyzer не повернув подій.")
             return []
@@ -101,17 +106,28 @@ class NewsSummarizer:
         logger.info(f"Після ranking залишилось {len(ranked_events)} подій.")
 
         editor_events = ranked_events[:self.EDITOR_CANDIDATES]
+
         final_news = self._generate_final_digest(
-            editor_events, posts, past_events, count, max_retries_per_model
+            editor_events,
+            posts,
+            past_events,
+            count,
+            max_retries_per_model
         )
 
-        validated = self._validate_final_news(final_news, ranked_events, posts, count)
+        validated = self._validate_final_news(
+            final_news,
+            ranked_events,
+            posts,
+            count
+        )
 
         if len(validated) < self.MIN_DIGEST_COUNT:
             logger.warning(
                 f"EDITOR сформував лише {len(validated)} новин. "
                 f"Fallback до мінімуму {self.MIN_DIGEST_COUNT}."
             )
+
             validated = self._fill_missing_news(
                 validated,
                 ranked_events,
@@ -134,8 +150,17 @@ class NewsSummarizer:
                 "[ФОТО]" if post.get("has_media") else "[ТЕКСТ]"
             )
 
-            channel_title = post.get("channel_title") or post.get("channel_username") or "Джерело"
-            channel_username = str(post.get("channel_username") or "").replace("@", "").strip()
+            channel_title = (
+                post.get("channel_title")
+                or post.get("channel_username")
+                or "Джерело"
+            )
+
+            channel_username = (
+                str(post.get("channel_username") or "")
+                .replace("@", "")
+                .strip()
+            )
 
             views = int(post.get("views") or 0)
             forwards = int(post.get("forwards") or 0)
@@ -150,8 +175,16 @@ class NewsSummarizer:
                 + min(math.log10(max(replies, 1)) * 2, 8)
             )
 
-            media_bonus = 8 if post.get("has_video") else (4 if post.get("has_media") else 0)
-            score = 10000 if is_priority else (engagement_score + media_bonus) * tier_mult
+            media_bonus = (
+                8 if post.get("has_video")
+                else (4 if post.get("has_media") else 0)
+            )
+
+            score = (
+                10000
+                if is_priority
+                else (engagement_score + media_bonus) * tier_mult
+            )
 
             prepared.append({
                 "idx": idx,
@@ -163,7 +196,10 @@ class NewsSummarizer:
                 "forwards": forwards,
                 "replies": replies,
                 "score": score,
-                "priority_flag": " ⭐ [ПРІОРИТЕТ АДМІНІСТРАТОРА]" if is_priority else ""
+                "priority_flag": (
+                    " ⭐ [ПРІОРИТЕТ АДМІНІСТРАТОРА]"
+                    if is_priority else ""
+                )
             })
 
         prepared.sort(key=lambda x: x["score"], reverse=True)
@@ -367,7 +403,11 @@ TELEGRAM POSTS:
         data = self._call_json_with_cascade(prompt, max_retries, "ANALYZER")
         return data.get("events", []) if data and isinstance(data.get("events"), list) else []
 
-    def _rank_events(self, events: List[Dict[str, Any]], posts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _rank_events(
+        self,
+        events: List[Dict[str, Any]],
+        posts: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
         ranked = []
 
         for ev in events:
@@ -387,6 +427,7 @@ TELEGRAM POSTS:
                 if not is_priority:
                     if not eligible:
                         continue
+
                     if event_type in LOW_VALUE_EVENT_TYPES:
                         continue
 
@@ -399,6 +440,7 @@ TELEGRAM POSTS:
                 national = self._safe_score(ev.get("national_relevance"))
 
                 category = ev.get("category", "other")
+
                 if category not in self.ALLOWED_CATEGORIES:
                     category = "other"
 
@@ -429,15 +471,25 @@ TELEGRAM POSTS:
                     score += 500
 
                 factual_source = self._select_factual_source(
-                    src_ids, posts, ev.get("best_factual_source_id")
-                )
-                media_source = self._select_media_source(
-                    src_ids, posts, ev.get("best_media_source_id")
+                    src_ids,
+                    posts,
+                    ev.get("best_factual_source_id")
                 )
 
-                publishing_source = media_source if media_source is not None else factual_source
+                media_source = self._select_media_source(
+                    src_ids,
+                    posts,
+                    ev.get("best_media_source_id")
+                )
+
+                publishing_source = (
+                    media_source
+                    if media_source is not None
+                    else factual_source
+                )
 
                 ev_copy = dict(ev)
+
                 ev_copy.update({
                     "source_ids": src_ids,
                     "best_factual_source_id": factual_source,
@@ -455,7 +507,10 @@ TELEGRAM POSTS:
             except Exception as e:
                 logger.warning(f"Помилка ranking події: {e}")
 
-        ranked.sort(key=lambda x: x.get("raw_score", 0), reverse=True)
+        ranked.sort(
+            key=lambda x: x.get("raw_score", 0),
+            reverse=True
+        )
 
         category_counts = {}
 
@@ -468,11 +523,19 @@ TELEGRAM POSTS:
             current = category_counts.get(category, 0)
 
             penalty = 10 if current >= 4 else (5 if current >= 3 else 0)
-            ev["balanced_score"] = round(ev["raw_score"] - penalty, 2)
+
+            ev["balanced_score"] = round(
+                ev["raw_score"] - penalty,
+                2
+            )
 
             category_counts[category] = current + 1
 
-        ranked.sort(key=lambda x: x.get("balanced_score", 0), reverse=True)
+        ranked.sort(
+            key=lambda x: x.get("balanced_score", 0),
+            reverse=True
+        )
+
         return ranked
 
     def _generate_final_digest(
@@ -499,9 +562,18 @@ TELEGRAM POSTS:
                     media_description = "реальне фото з події"
 
             key_facts = ev.get("key_facts", [])
-            key_facts_text = "; ".join(str(x) for x in key_facts[:5]) if isinstance(key_facts, list) else str(key_facts)
 
-            priority_flag = " ⭐ ПРІОРИТЕТ АДМІНІСТРАТОРА" if ev.get("is_priority") else ""
+            key_facts_text = (
+                "; ".join(str(x) for x in key_facts[:5])
+                if isinstance(key_facts, list)
+                else str(key_facts)
+            )
+
+            priority_flag = (
+                " ⭐ ПРІОРИТЕТ АДМІНІСТРАТОРА"
+                if ev.get("is_priority")
+                else ""
+            )
 
             event_blocks.append(
                 f"=== EVENT_ID: {ev.get('event_id')}{priority_flag} ===\n"
@@ -511,7 +583,8 @@ TELEGRAM POSTS:
                 f"СУТЬ: {ev.get('summary', '')}\n"
                 f"ЧОМУ ВАЖЛИВО: {ev.get('why_it_matters', '')}\n"
                 f"КЛЮЧОВІ ФАКТИ: {key_facts_text}\n"
-                f"ТЕКСТ ДЖЕРЕЛА: {str(factual_post.get('text') or '')[:self.MAX_EVENT_SOURCE_CHARS]}\n"
+                f"ТЕКСТ ДЖЕРЕЛА: "
+                f"{str(factual_post.get('text') or '')[:self.MAX_EVENT_SOURCE_CHARS]}\n"
             )
 
         history_block = self._build_history_block(past_events)
@@ -545,9 +618,16 @@ TELEGRAM POSTS:
 ВИМОГИ ДО ТЕКСТУ:
 
 Максимальна довжина однієї новини — {self.MAX_NEWS_CHARS} символів.
+Бажана довжина — приблизно 500-620 символів разом із заголовком.
 
-Кожна новина повинна містити НЕ МЕНШЕ 4 коротких речень.
-Оптимально 4-5 речень.
+Кожна новина повинна містити 4-5 ЗАВЕРШЕНИХ речень.
+
+ВАЖЛИВО:
+- ніколи не обривай останнє речення;
+- ніколи не завершуй новину на півслові або незакінченій думці;
+- якщо текст виходить задовгим, скороти формулювання попередніх речень;
+- краще 4 повні змістовні речення, ніж 5 речень із перевищенням ліміту;
+- останнє речення обов'язково повинно бути повністю завершене.
 
 Речення мають бути короткими, фактологічними та насиченими інформацією.
 
@@ -560,22 +640,24 @@ TELEGRAM POSTS:
 головний наслідок або результат.
 
 Речення 3:
-ключові цифри, масштаби або деталі.
+ключові цифри, масштаби або важливі деталі.
 
 Речення 4:
-важливий контекст або реакція сторін.
+контекст, реакція сторін або пояснення значення події.
 
 Речення 5:
-чому ця подія важлива або що вона змінює.
+лише якщо є ще один справді важливий факт, який додає цінність.
 
 Не розтягуй текст водою.
-Кожне речення повинно додавати новий факт.
+Кожне речення повинно додавати нову інформацію.
+
+Не повторюй один і той самий факт різними словами.
 
 Заголовок:
 - 4-9 слів;
 - без клікбейту;
 - максимально конкретний;
-- не повторює перше речення.
+- не повторює дослівно перше речення.
 
 Формат:
 
@@ -583,9 +665,10 @@ TELEGRAM POSTS:
 
 порожній рядок
 
-4-5 коротких речень.
+4-5 завершених коротких речень.
 
 НЕ ВИКОРИСТОВУЙ:
+
 "Стало відомо..."
 "Повідомляється, що..."
 "Наразі відомо..."
@@ -594,9 +677,18 @@ TELEGRAM POSTS:
 "Ситуація залишається..."
 
 Не вставляй технічні маркери:
+
 [ФОТО]
 [ВІДЕО]
 [ТЕКСТ]
+
+ПЕРЕД ВІДПОВІДДЮ ПЕРЕВІР КОЖНУ НОВИНУ:
+
+1. Чи не перевищує вона {self.MAX_NEWS_CHARS} символів?
+2. Чи має вона щонайменше 4 повні речення?
+3. Чи завершене останнє речення?
+4. Чи немає повторів і води?
+5. Чи всі твердження походять із наданих фактів?
 
 ВІДПОВІДЬ ТІЛЬКИ JSON:
 
@@ -604,7 +696,7 @@ TELEGRAM POSTS:
   "news": [
     {{
       "event_id": "E1",
-      "text": "💥 <b>Короткий заголовок</b>\\n\\nПерше речення. Друге речення. Третє речення. Четверте речення."
+      "text": "💥 <b>Короткий заголовок</b>\\n\\nПерше завершене речення. Друге завершене речення. Третє завершене речення. Четверте завершене речення."
     }}
   ]
 }}
@@ -613,10 +705,23 @@ TELEGRAM POSTS:
 {chr(10).join(event_blocks)}
 """
 
-        data = self._call_json_with_cascade(prompt, max_retries, "EDITOR")
-        raw_news = data.get("news", []) if data and isinstance(data.get("news"), list) else []
+        data = self._call_json_with_cascade(
+            prompt,
+            max_retries,
+            "EDITOR"
+        )
 
-        event_map = {ev["event_id"]: ev for ev in events}
+        raw_news = (
+            data.get("news", [])
+            if data and isinstance(data.get("news"), list)
+            else []
+        )
+
+        event_map = {
+            ev["event_id"]: ev
+            for ev in events
+        }
+
         final_list = []
 
         for item in raw_news:
@@ -626,7 +731,11 @@ TELEGRAM POSTS:
             event_id = item.get("event_id")
             text = item.get("text")
 
-            if event_id not in event_map or not isinstance(text, str) or not text.strip():
+            if (
+                event_id not in event_map
+                or not isinstance(text, str)
+                or not text.strip()
+            ):
                 continue
 
             ev = event_map[event_id]
@@ -665,7 +774,10 @@ TELEGRAM POSTS:
             if event_id not in valid_event_ids:
                 continue
 
-            if not isinstance(source_id, int) or not 0 <= source_id < len(posts):
+            if (
+                not isinstance(source_id, int)
+                or not 0 <= source_id < len(posts)
+            ):
                 continue
 
             if event_id in used_event_ids:
@@ -675,6 +787,7 @@ TELEGRAM POSTS:
                 continue
 
             text = self._clean_generated_news_text(text)
+
             if not text:
                 continue
 
@@ -700,7 +813,12 @@ TELEGRAM POSTS:
         count: int
     ) -> List[Dict[str, Any]]:
         result = list(validated)
-        used_source_ids = {item["source_id"] for item in result if isinstance(item.get("source_id"), int)}
+
+        used_source_ids = {
+            item["source_id"]
+            for item in result
+            if isinstance(item.get("source_id"), int)
+        }
 
         emoji_map = {
             "war": "💥",
@@ -720,31 +838,80 @@ TELEGRAM POSTS:
 
             source_id = ev.get("best_source_id")
 
-            if not isinstance(source_id, int) or source_id in used_source_ids:
+            if (
+                not isinstance(source_id, int)
+                or source_id in used_source_ids
+            ):
                 continue
 
-            headline = (ev.get("headline_hint") or "Важлива подія").strip()
+            headline = (
+                ev.get("headline_hint")
+                or "Важлива подія"
+            ).strip()
+
             category = ev.get("category", "other")
             emoji = emoji_map.get(category, "📰")
 
             key_facts = ev.get("key_facts", [])
-            facts = [str(x).strip() for x in key_facts if str(x).strip()] if isinstance(key_facts, list) else []
+
+            facts = (
+                [
+                    str(x).strip()
+                    for x in key_facts
+                    if str(x).strip()
+                ]
+                if isinstance(key_facts, list)
+                else []
+            )
 
             summary = (ev.get("summary") or "").strip()
             why = (ev.get("why_it_matters") or "").strip()
 
             sentences = []
+
             if summary:
-                sentences.append(summary.rstrip(".") + ".")
-            sentences.extend(fact.rstrip(".") + "." for fact in facts[:4])
+                sentences.append(
+                    self._ensure_sentence_end(summary)
+                )
+
+            for fact in facts[:4]:
+                sentence = self._ensure_sentence_end(fact)
+
+                if sentence not in sentences:
+                    sentences.append(sentence)
 
             if why:
-                sentences.append(why.rstrip(".") + ".")
+                sentence = self._ensure_sentence_end(why)
 
-            while len(sentences) < 5 and summary:
-                sentences.append(summary.rstrip(".") + ".")
+                if sentence not in sentences:
+                    sentences.append(sentence)
 
-            text = f"{emoji} <b>{headline}</b>\n\n{' '.join(sentences[:6])}"
+            original_text = (
+                posts[source_id].get("text") or ""
+                if 0 <= source_id < len(posts)
+                else ""
+            )
+
+            if len(sentences) < 4 and original_text:
+                source_sentences = self._extract_sentences(original_text)
+
+                for sentence in source_sentences:
+                    clean_sentence = self._ensure_sentence_end(sentence)
+
+                    if clean_sentence not in sentences:
+                        sentences.append(clean_sentence)
+
+                    if len(sentences) >= 4:
+                        break
+
+            if len(sentences) < 4:
+                continue
+
+            text = (
+                f"{emoji} <b>{headline}</b>\n\n"
+                f"{' '.join(sentences[:5])}"
+            )
+
             text = self._clean_generated_news_text(text)
 
             result.append({
@@ -764,10 +931,16 @@ TELEGRAM POSTS:
         posts: List[Dict[str, Any]],
         preferred_id: Any = None
     ) -> int:
-        if isinstance(preferred_id, int) and preferred_id in source_ids:
+        if (
+            isinstance(preferred_id, int)
+            and preferred_id in source_ids
+        ):
             return preferred_id
 
-        return max(source_ids, key=lambda s: self._factual_source_score(posts[s]))
+        return max(
+            source_ids,
+            key=lambda s: self._factual_source_score(posts[s])
+        )
 
     def _select_media_source(
         self,
@@ -777,22 +950,37 @@ TELEGRAM POSTS:
     ) -> Optional[int]:
         media_ids = [
             s for s in source_ids
-            if posts[s].get("has_video") or posts[s].get("has_media")
+            if posts[s].get("has_video")
+            or posts[s].get("has_media")
         ]
 
         if not media_ids:
             return None
 
-        if isinstance(preferred_id, int) and preferred_id in media_ids:
+        if (
+            isinstance(preferred_id, int)
+            and preferred_id in media_ids
+        ):
             return preferred_id
 
-        return max(media_ids, key=lambda s: self._media_source_score(posts[s]))
+        return max(
+            media_ids,
+            key=lambda s: self._media_source_score(posts[s])
+        )
 
-    def _factual_source_score(self, post: Dict[str, Any]) -> float:
+    def _factual_source_score(
+        self,
+        post: Dict[str, Any]
+    ) -> float:
         if post.get("is_priority"):
             return 10000
 
-        username = str(post.get("channel_username") or "").replace("@", "").strip()
+        username = (
+            str(post.get("channel_username") or "")
+            .replace("@", "")
+            .strip()
+        )
+
         views = int(post.get("views") or 0)
         forwards = int(post.get("forwards") or 0)
         text_length = len(post.get("text") or "")
@@ -806,14 +994,26 @@ TELEGRAM POSTS:
         return score * self._get_source_multiplier(username)
 
     @staticmethod
-    def _media_source_score(post: Dict[str, Any]) -> float:
-        score = 40 if post.get("has_video") else (20 if post.get("has_media") else 0)
+    def _media_source_score(
+        post: Dict[str, Any]
+    ) -> float:
+        score = (
+            40 if post.get("has_video")
+            else (20 if post.get("has_media") else 0)
+        )
 
         views = int(post.get("views") or 0)
         forwards = int(post.get("forwards") or 0)
 
-        score += min(math.log10(max(views, 1)) * 3, 18)
-        score += min(math.log10(max(forwards, 1)) * 2, 8)
+        score += min(
+            math.log10(max(views, 1)) * 3,
+            18
+        )
+
+        score += min(
+            math.log10(max(forwards, 1)) * 2,
+            8
+        )
 
         return score
 
@@ -825,10 +1025,21 @@ TELEGRAM POSTS:
         multipliers = []
 
         for source_id in source_ids:
-            username = str(posts[source_id].get("channel_username") or "").replace("@", "").strip()
-            multipliers.append(self._get_source_multiplier(username))
+            username = (
+                str(posts[source_id].get("channel_username") or "")
+                .replace("@", "")
+                .strip()
+            )
 
-        return sum(multipliers) / len(multipliers) if multipliers else 1.0
+            multipliers.append(
+                self._get_source_multiplier(username)
+            )
+
+        return (
+            sum(multipliers) / len(multipliers)
+            if multipliers
+            else 1.0
+        )
 
     @staticmethod
     def _get_source_multiplier(username: str) -> float:
@@ -852,7 +1063,10 @@ TELEGRAM POSTS:
         for model in self.models_priority:
             for attempt in range(1, max_retries + 1):
                 try:
-                    logger.info(f"{op_name}: спроба {attempt}/{max_retries} через {model}")
+                    logger.info(
+                        f"{op_name}: спроба "
+                        f"{attempt}/{max_retries} через {model}"
+                    )
 
                     response = self.client.models.generate_content(
                         model=model,
@@ -863,7 +1077,10 @@ TELEGRAM POSTS:
                         ),
                     )
 
-                    raw_text = self._clean_json_response((response.text or "").strip())
+                    raw_text = self._clean_json_response(
+                        (response.text or "").strip()
+                    )
+
                     data = json.loads(raw_text)
 
                     if isinstance(data, dict):
@@ -872,20 +1089,35 @@ TELEGRAM POSTS:
                 except Exception as e:
                     err = str(e)
 
-                    if any(x in err for x in ["503", "429", "UNAVAILABLE", "ResourceExhausted", "NOT_FOUND"]):
+                    if any(
+                        x in err
+                        for x in [
+                            "503",
+                            "429",
+                            "UNAVAILABLE",
+                            "ResourceExhausted",
+                            "NOT_FOUND"
+                        ]
+                    ):
                         if attempt < max_retries:
                             time.sleep(3 * attempt)
                             continue
+
                         break
 
-                    logger.error(f"Помилка {op_name} ({model}): {e}")
+                    logger.error(
+                        f"Помилка {op_name} ({model}): {e}"
+                    )
+
                     break
 
         return None
 
     def _build_history_block(
         self,
-        past_events: Optional[Union[List[str], List[Dict[str, str]]]]
+        past_events: Optional[
+            Union[List[str], List[Dict[str, str]]]
+        ]
     ) -> str:
         if not past_events:
             return "Історія опублікованих подій порожня."
@@ -894,19 +1126,45 @@ TELEGRAM POSTS:
 
         for item in past_events[:self.HISTORY_LIMIT]:
             if isinstance(item, dict):
-                title = (item.get("title") or "").strip()
-                summary = (item.get("summary") or "").strip()
-                published_at = (item.get("published_at") or "").strip()
+                title = (
+                    item.get("title") or ""
+                ).strip()
+
+                summary = (
+                    item.get("summary") or ""
+                ).strip()
+
+                published_at = (
+                    item.get("published_at") or ""
+                ).strip()
 
                 if title or summary:
-                    time_info = f" [{published_at}]" if published_at else ""
-                    desc = f" — {summary}" if summary else ""
-                    lines.append(f"- {title}{desc}{time_info}")
+                    time_info = (
+                        f" [{published_at}]"
+                        if published_at
+                        else ""
+                    )
+
+                    desc = (
+                        f" — {summary}"
+                        if summary
+                        else ""
+                    )
+
+                    lines.append(
+                        f"- {title}{desc}{time_info}"
+                    )
 
             elif isinstance(item, str) and item.strip():
-                lines.append(f"- {item.strip()}")
+                lines.append(
+                    f"- {item.strip()}"
+                )
 
-        return "\n".join(lines) if lines else "Історія опублікованих подій порожня."
+        return (
+            "\n".join(lines)
+            if lines
+            else "Історія опублікованих подій порожня."
+        )
 
     def _clean_generated_news_text(self, text: str) -> str:
         text = text.strip()
@@ -925,23 +1183,27 @@ TELEGRAM POSTS:
             flags=re.IGNORECASE
         )
 
-        text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)
+        text = re.sub(
+            r'\*\*(.*?)\*\*',
+            r'<b>\1</b>',
+            text
+        )
+
         text = text.replace("📍", "").replace("📌", "")
+        text = re.sub(r'\n{3,}', '\n\n', text)
 
         if "<b>" not in text or "</b>" not in text:
             lines = text.split("\n", 1)
             first_line = lines[0].strip()
             rest = "\n" + lines[1] if len(lines) > 1 else ""
+
             text = f"<b>{first_line}</b>{rest}"
 
         if len(text) > self.MAX_NEWS_CHARS:
-            text = text[:self.MAX_NEWS_CHARS]
-            last_space = text.rfind(" ")
-
-            if last_space > 350:
-                text = text[:last_space].rstrip()
-
-            text += "…"
+            text = self._truncate_to_complete_sentence(
+                text,
+                self.MAX_NEWS_CHARS
+            )
 
         if "<b>" in text and "</b>" not in text:
             text += "</b>"
@@ -949,9 +1211,74 @@ TELEGRAM POSTS:
         return text.strip()
 
     @staticmethod
+    def _truncate_to_complete_sentence(
+        text: str,
+        max_chars: int
+    ) -> str:
+        if len(text) <= max_chars:
+            return text.strip()
+
+        candidate = text[:max_chars].rstrip()
+
+        sentence_endings = []
+
+        for match in re.finditer(r'[.!?](?=\s|$)', candidate):
+            sentence_endings.append(match.end())
+
+        if sentence_endings:
+            safe_endings = [
+                pos for pos in sentence_endings
+                if pos >= int(max_chars * 0.55)
+            ]
+
+            if safe_endings:
+                return candidate[:safe_endings[-1]].strip()
+
+        last_space = candidate.rfind(" ")
+
+        if last_space > int(max_chars * 0.70):
+            candidate = candidate[:last_space].rstrip()
+
+        return candidate.rstrip(",;:- ") + "…"
+
+    @staticmethod
+    def _extract_sentences(text: str) -> List[str]:
+        text = re.sub(r'\s+', ' ', text).strip()
+
+        if not text:
+            return []
+
+        parts = re.split(
+            r'(?<=[.!?])\s+',
+            text
+        )
+
+        return [
+            part.strip()
+            for part in parts
+            if len(part.strip()) >= 20
+        ]
+
+    @staticmethod
+    def _ensure_sentence_end(text: str) -> str:
+        text = re.sub(r'\s+', ' ', text).strip()
+
+        if not text:
+            return ""
+
+        if text[-1] not in ".!?":
+            text += "."
+
+        return text
+
+    @staticmethod
     def _safe_score(value: Any) -> float:
         try:
-            return max(0.0, min(100.0, float(value)))
+            return max(
+                0.0,
+                min(100.0, float(value))
+            )
+
         except (TypeError, ValueError):
             return 0.0
 
@@ -961,6 +1288,7 @@ TELEGRAM POSTS:
 
         if text.startswith("```json"):
             text = text[7:]
+
         elif text.startswith("```"):
             text = text[3:]
 
