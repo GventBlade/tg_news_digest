@@ -9,6 +9,7 @@ from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.types import FSInputFile
+from PIL import Image, ImageOps
 
 from app.config import settings
 
@@ -19,13 +20,17 @@ class NewsPublisher:
     def __init__(self):
         self.bot = Bot(
             token=settings.BOT_TOKEN,
-            default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+            default=DefaultBotProperties(
+                parse_mode=ParseMode.HTML
+            ),
         )
 
         self.ig_account_id = settings.INSTAGRAM_ACCOUNT_ID
         self.ig_access_token = settings.INSTAGRAM_ACCESS_TOKEN
         self.graph_url = "https://graph.facebook.com/v26.0"
-        self.media_base_url = (settings.MEDIA_BASE_URL or "").rstrip("/")
+        self.media_base_url = (
+            settings.MEDIA_BASE_URL or ""
+        ).rstrip("/")
 
     async def publish_telegram_post(
         self,
@@ -42,7 +47,9 @@ class NewsPublisher:
                             photo=FSInputFile(media_path),
                             caption=text,
                         )
-                        logger.info("Фото-пост опубліковано в Telegram.")
+                        logger.info(
+                            "Фото-пост опубліковано в Telegram."
+                        )
                         return True
 
                     if media_type == "video":
@@ -52,13 +59,15 @@ class NewsPublisher:
                             caption=text,
                             supports_streaming=True,
                         )
-                        logger.info("Відео-пост опубліковано в Telegram.")
+                        logger.info(
+                            "Відео-пост опубліковано в Telegram."
+                        )
                         return True
 
                 except Exception as media_error:
                     logger.warning(
-                        f"Не вдалося відправити медіа ({media_error}), "
-                        f"відправляємо текстом."
+                        f"Не вдалося відправити медіа "
+                        f"({media_error}), відправляємо текстом."
                     )
 
             await self.bot.send_message(
@@ -66,108 +75,150 @@ class NewsPublisher:
                 text=text,
             )
 
-            logger.info("Текстовий пост опубліковано в Telegram.")
+            logger.info(
+                "Текстовий пост опубліковано в Telegram."
+            )
             return True
 
         except Exception as e:
             logger.error(
                 f"Помилка публікації в Telegram: {e}",
-                exc_info=True
+                exc_info=True,
             )
             return False
 
-    def create_public_media_url(self, file_path: str) -> str:
+    def create_public_media_url(
+        self,
+        file_path: str,
+    ) -> str:
         if not self.media_base_url:
-            raise RuntimeError("MEDIA_BASE_URL не налаштований у .env")
+            raise RuntimeError(
+                "MEDIA_BASE_URL не налаштований у .env"
+            )
 
         path = Path(file_path)
 
         if not path.exists():
-            raise FileNotFoundError(f"Файл не знайдено: {file_path}")
+            raise FileNotFoundError(
+                f"Файл не знайдено: {file_path}"
+            )
 
         filename = quote(path.name)
-        return f"{self.media_base_url}/media/{filename}"
+        return (
+            f"{self.media_base_url}/media/{filename}"
+        )
 
-    async def publish_instagram_carousel(self, caption: str, media_items: list):
-        if not self.ig_account_id or not self.ig_access_token or not self.media_base_url:
+    async def publish_instagram_carousel(
+        self,
+        caption: str,
+        media_items: list,
+    ):
+        if (
+            not self.ig_account_id
+            or not self.ig_access_token
+            or not self.media_base_url
+        ):
             logger.warning(
                 "Instagram параметри не заповнені або "
                 "відсутній MEDIA_BASE_URL."
             )
             return
 
-        filtered_items = self._filter_instagram_media(media_items)
+        filtered_items = self._filter_instagram_media(
+            media_items
+        )
 
         if not filtered_items:
-            logger.warning("Немає валідних медіа для Instagram.")
+            logger.warning(
+                "Немає валідних медіа для Instagram."
+            )
             return
 
         clean_caption = self._strip_html(caption)
 
-        async with aiohttp.ClientSession() as session:
+        timeout = aiohttp.ClientTimeout(total=180)
+
+        async with aiohttp.ClientSession(
+            timeout=timeout
+        ) as session:
             try:
-                valid_child_ids = []
+                valid_children = []
 
                 for item in filtered_items:
                     child_id = await self._prepare_carousel_item(
                         session,
-                        item
+                        item,
                     )
 
                     if child_id:
-                        valid_child_ids.append(child_id)
+                        valid_children.append({
+                            "id": child_id,
+                            "item": item,
+                        })
 
-                if not valid_child_ids:
+                if not valid_children:
                     logger.error(
                         "Жоден слайд не пройшов "
                         "обробку Instagram."
                     )
                     return
 
-                if len(valid_child_ids) == 1:
+                # Якщо після фільтрації лишився один валідний елемент,
+                # публікуємо його як звичайний пост, а не карусель.
+                if len(valid_children) == 1:
                     await self._publish_single_item(
                         session,
-                        filtered_items[0],
-                        clean_caption
+                        valid_children[0]["item"],
+                        clean_caption,
                     )
                     return
 
+                child_ids = [
+                    child["id"]
+                    for child in valid_children
+                ]
+
                 carousel_id = await self._create_carousel(
                     session,
-                    valid_child_ids,
-                    clean_caption
+                    child_ids,
+                    clean_caption,
                 )
 
                 if not carousel_id:
                     return
 
-                if not await self._wait_for_container(session, carousel_id):
+                if not await self._wait_for_container(
+                    session,
+                    carousel_id,
+                ):
                     return
 
                 media_id = await self._publish_container(
                     session,
-                    carousel_id
+                    carousel_id,
                 )
 
                 if media_id:
                     logger.info(
-                        f"Instagram carousel опубліковано. "
+                        "Instagram carousel опубліковано. "
                         f"ID: {media_id}"
                     )
 
             except Exception as e:
                 logger.error(
                     f"Помилка Instagram-публікації: {e}",
-                    exc_info=True
+                    exc_info=True,
                 )
 
     async def _prepare_carousel_item(
         self,
         session: aiohttp.ClientSession,
-        item: dict
+        item: dict,
     ) -> str | None:
         try:
-            public_url = self.create_public_media_url(item["path"])
+            public_url = self.create_public_media_url(
+                item["path"]
+            )
 
             child_id = await self._create_container(
                 session=session,
@@ -180,14 +231,17 @@ class NewsPublisher:
             if not child_id:
                 return None
 
-            if not await self._wait_for_container(session, child_id):
+            if not await self._wait_for_container(
+                session,
+                child_id,
+            ):
                 return None
 
             return child_id
 
         except Exception as e:
             logger.warning(
-                f"Помилка підготовки Instagram media "
+                "Помилка підготовки Instagram media "
                 f"{item.get('path')}: {e}"
             )
             return None
@@ -196,9 +250,11 @@ class NewsPublisher:
         self,
         session: aiohttp.ClientSession,
         item: dict,
-        caption: str
+        caption: str,
     ):
-        public_url = self.create_public_media_url(item["path"])
+        public_url = self.create_public_media_url(
+            item["path"]
+        )
 
         creation_id = await self._create_container(
             session=session,
@@ -211,17 +267,20 @@ class NewsPublisher:
         if not creation_id:
             return
 
-        if not await self._wait_for_container(session, creation_id):
+        if not await self._wait_for_container(
+            session,
+            creation_id,
+        ):
             return
 
         media_id = await self._publish_container(
             session,
-            creation_id
+            creation_id,
         )
 
         if media_id:
             logger.info(
-                f"Instagram post опубліковано. "
+                "Instagram post опубліковано. "
                 f"ID: {media_id}"
             )
 
@@ -229,9 +288,12 @@ class NewsPublisher:
         self,
         session: aiohttp.ClientSession,
         child_ids: list,
-        caption: str
+        caption: str,
     ) -> str | None:
-        url = f"{self.graph_url}/{self.ig_account_id}/media"
+        url = (
+            f"{self.graph_url}/"
+            f"{self.ig_account_id}/media"
+        )
 
         params = {
             "media_type": "CAROUSEL",
@@ -240,12 +302,18 @@ class NewsPublisher:
             "access_token": self.ig_access_token,
         }
 
-        async with session.post(url, data=params) as response:
-            data = await response.json()
+        async with session.post(
+            url,
+            data=params,
+        ) as response:
+            data = await response.json(
+                content_type=None
+            )
 
             if response.status >= 400:
                 logger.error(
-                    f"Помилка створення Instagram carousel: {data}"
+                    "Помилка створення Instagram "
+                    f"carousel: {data}"
                 )
                 return None
 
@@ -259,7 +327,10 @@ class NewsPublisher:
         caption: str | None = None,
         is_carousel_item: bool = False,
     ) -> str | None:
-        url = f"{self.graph_url}/{self.ig_account_id}/media"
+        url = (
+            f"{self.graph_url}/"
+            f"{self.ig_account_id}/media"
+        )
 
         params = {
             "access_token": self.ig_access_token
@@ -277,12 +348,17 @@ class NewsPublisher:
         if caption:
             params["caption"] = caption
 
-        async with session.post(url, data=params) as response:
-            data = await response.json()
+        async with session.post(
+            url,
+            data=params,
+        ) as response:
+            data = await response.json(
+                content_type=None
+            )
 
             if response.status >= 400:
                 logger.warning(
-                    f"Instagram container error "
+                    "Instagram container error "
                     f"({media_type}): {data}"
                 )
                 return None
@@ -296,53 +372,83 @@ class NewsPublisher:
         timeout: int = 120,
     ) -> bool:
         url = f"{self.graph_url}/{creation_id}"
-        deadline = asyncio.get_running_loop().time() + timeout
+        deadline = (
+            asyncio.get_running_loop().time()
+            + timeout
+        )
 
-        while asyncio.get_running_loop().time() < deadline:
+        while (
+            asyncio.get_running_loop().time()
+            < deadline
+        ):
             params = {
                 "fields": "status_code,status",
                 "access_token": self.ig_access_token,
             }
 
             try:
-                async with session.get(url, params=params) as response:
-                    data = await response.json()
-                    status_code = data.get("status_code")
+                async with session.get(
+                    url,
+                    params=params,
+                ) as response:
+                    data = await response.json(
+                        content_type=None
+                    )
+
+                    status_code = data.get(
+                        "status_code"
+                    )
 
                     if status_code == "FINISHED":
                         return True
 
-                    if status_code in {"ERROR", "EXPIRED"}:
+                    if status_code in {
+                        "ERROR",
+                        "EXPIRED",
+                    }:
                         logger.warning(
-                            f"Instagram container "
+                            "Instagram container "
                             f"{creation_id} відхилено: {data}"
                         )
                         return False
 
             except Exception as e:
                 logger.warning(
-                    f"Помилка перевірки Instagram "
+                    "Помилка перевірки Instagram "
                     f"container {creation_id}: {e}"
                 )
 
             await asyncio.sleep(4)
 
+        logger.warning(
+            "Instagram container "
+            f"{creation_id} не завершив обробку "
+            f"за {timeout} с."
+        )
         return False
 
     async def _publish_container(
         self,
         session: aiohttp.ClientSession,
-        creation_id: str
+        creation_id: str,
     ) -> str | None:
-        url = f"{self.graph_url}/{self.ig_account_id}/media_publish"
+        url = (
+            f"{self.graph_url}/"
+            f"{self.ig_account_id}/media_publish"
+        )
 
         params = {
             "creation_id": creation_id,
             "access_token": self.ig_access_token,
         }
 
-        async with session.post(url, data=params) as response:
-            data = await response.json()
+        async with session.post(
+            url,
+            data=params,
+        ) as response:
+            data = await response.json(
+                content_type=None
+            )
 
             if response.status >= 400:
                 logger.error(
@@ -352,42 +458,145 @@ class NewsPublisher:
 
             return data.get("id")
 
-    @staticmethod
-    def _filter_instagram_media(media_items: list) -> list:
+    def _filter_instagram_media(
+        self,
+        media_items: list,
+    ) -> list:
+        """
+        Instagram іноді відхиляє фото через aspect ratio або EXIF.
+        Тому кожне фото перед завантаженням:
+        - повертаємо відповідно до EXIF;
+        - переводимо в RGB;
+        - вписуємо без обрізання в 1080x1350 (4:5);
+        - перевидаємо як звичайний JPEG.
+
+        Це усуває помилку OAuthException 36003 для нестандартних фото.
+        """
         filtered = []
 
         for item in media_items[:10]:
-            path = Path(item.get("path", ""))
+            path = Path(
+                item.get("path", "")
+            )
             media_type = item.get("type")
 
             if not path.exists():
                 continue
 
-            if media_type not in {"photo", "video"}:
+            if media_type not in {
+                "photo",
+                "video",
+            }:
                 continue
 
-            file_size_mb = path.stat().st_size / (1024 * 1024)
+            if media_type == "photo":
+                try:
+                    normalized_path = (
+                        self._prepare_instagram_photo(
+                            path
+                        )
+                    )
+                    path = Path(normalized_path)
 
-            if media_type == "video" and file_size_mb > 45:
+                except Exception as e:
+                    logger.warning(
+                        "Instagram photo "
+                        f"{path.name} пропущено: "
+                        f"не вдалося нормалізувати ({e})"
+                    )
+                    continue
+
+            file_size_mb = (
+                path.stat().st_size
+                / (1024 * 1024)
+            )
+
+            if (
+                media_type == "video"
+                and file_size_mb > 45
+            ):
                 logger.warning(
-                    f"Instagram video {path.name} пропущено: "
-                    f"{file_size_mb:.1f} MB"
+                    f"Instagram video {path.name} "
+                    f"пропущено: {file_size_mb:.1f} MB"
                 )
                 continue
 
             filtered.append({
                 "path": str(path),
-                "type": media_type
+                "type": media_type,
             })
 
         return filtered
 
     @staticmethod
-    def _strip_html(text: str) -> str:
-        clean = re.sub(r"<.*?>", "", text).strip()
+    def _prepare_instagram_photo(
+        path: Path,
+    ) -> str:
+        target_size = (1080, 1350)
+
+        output_path = path.with_name(
+            f"ig_{path.stem}.jpg"
+        )
+
+        with Image.open(path) as image:
+            image = ImageOps.exif_transpose(
+                image
+            ).convert("RGB")
+
+            # Колір фону беремо з усередненого пікселя самого фото,
+            # щоб поля не виглядали різко білими або чорними.
+            sample = image.resize((1, 1))
+            background_color = sample.getpixel(
+                (0, 0)
+            )
+
+            image.thumbnail(
+                target_size,
+                Image.Resampling.LANCZOS,
+            )
+
+            canvas = Image.new(
+                "RGB",
+                target_size,
+                background_color,
+            )
+
+            x = (
+                target_size[0] - image.width
+            ) // 2
+            y = (
+                target_size[1] - image.height
+            ) // 2
+
+            canvas.paste(
+                image,
+                (x, y),
+            )
+
+            canvas.save(
+                output_path,
+                format="JPEG",
+                quality=92,
+                optimize=True,
+            )
+
+        return str(output_path)
+
+    @staticmethod
+    def _strip_html(
+        text: str,
+    ) -> str:
+        clean = re.sub(
+            r"<.*?>",
+            "",
+            text,
+        ).strip()
 
         if len(clean) > 2150:
-            clean = clean[:2140] + "...\n(продовження в Telegram)"
+            clean = (
+                clean[:2140]
+                + "...\n(продовження в Telegram)"
+            )
 
         return clean
 
