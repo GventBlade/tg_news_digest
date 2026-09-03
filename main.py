@@ -782,7 +782,7 @@ async def on_startup(
         process_and_publish_news_cycle,
         trigger=CronTrigger(
             hour="3,7,11,15,19,23",
-            minute="58",
+            minute="59",
             timezone="Europe/Kyiv",
         ),
         id="news_cycle_4h",
