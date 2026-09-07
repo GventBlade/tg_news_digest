@@ -63,6 +63,11 @@ class NewsSummarizer:
     EDITOR_CANDIDATES = 30
     HISTORY_LIMIT = 150
 
+    # Якщо та сама подія вже була у попередньому 4-годинному випуску,
+    # не дозволяємо дрібним уточненням/іншому формулюванню повернути її
+    # одразу вдруге. Це окрема жорстка страховка саме від сусідніх випусків.
+    ADJACENT_DUPLICATE_LOCK_HOURS = 6.5
+
     MAX_INPUT_CHARS = 55000
     PRIORITY_RECOVERY_MAX_CHARS = 30000
 
@@ -2265,11 +2270,16 @@ MANUAL POSTS:
             base.get("is_history_repeat", False)
             or incoming.get("is_history_repeat", False)
         )
+        history_hard_duplicate = bool(
+            base.get("history_hard_duplicate", False)
+            or incoming.get("history_hard_duplicate", False)
+        )
         history_update = max(
             self._safe_score(base.get("history_update_strength")),
             self._safe_score(incoming.get("history_update_strength")),
         )
         merged["is_history_repeat"] = history_repeat
+        merged["history_hard_duplicate"] = history_hard_duplicate
         merged["history_update_strength"] = history_update
 
         has_priority = any(
@@ -2641,12 +2651,24 @@ MANUAL POSTS:
                 is_history_repeat = bool(
                     ev.get("is_history_repeat", False)
                 )
+                history_hard_duplicate = bool(
+                    ev.get("history_hard_duplicate", False)
+                )
 
                 history_update = self._safe_score(
                     ev.get("history_update_strength")
                 )
 
                 if not is_priority:
+                    if history_hard_duplicate:
+                        rejected["history_repeat"] += 1
+                        logger.info(
+                            "History hard-block: event_id=%s matched='%s'.",
+                            ev.get("event_id"),
+                            str(ev.get("history_match_title") or "")[:120],
+                        )
+                        continue
+
                     if not eligible:
                         rejected["ineligible"] += 1
                         continue
@@ -4602,6 +4624,169 @@ discovery-блок.
             ),
         }
 
+    @staticmethod
+    def _history_age_hours(
+        history: Dict[str, str],
+    ) -> Optional[float]:
+        """Повертає вік history-запису у годинах, якщо timestamp валідний."""
+        raw = str(history.get("published_at") or "").strip()
+        if not raw:
+            return None
+
+        value = raw.replace("Z", "+00:00")
+        parsed: Optional[datetime] = None
+
+        # sqlite CURRENT_TIMESTAMP: 2026-09-06 20:59:50
+        # ISO: 2026-09-06T20:59:50+00:00
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            for fmt in (
+                "%Y-%m-%d %H:%M:%S",
+                "%Y-%m-%d %H:%M",
+                "%Y-%m-%dT%H:%M:%S",
+                "%Y-%m-%dT%H:%M",
+            ):
+                try:
+                    parsed = datetime.strptime(value, fmt)
+                    break
+                except ValueError:
+                    continue
+
+        if parsed is None:
+            return None
+
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        else:
+            parsed = parsed.astimezone(timezone.utc)
+
+        return max(
+            0.0,
+            (datetime.now(timezone.utc) - parsed).total_seconds() / 3600.0,
+        )
+
+    @staticmethod
+    def _entity_signature(text: str) -> set:
+        """
+        Витягує грубі fingerprints власних назв/імен.
+
+        Це допомагає впізнати одну подію, коли заголовок повністю
+        переписаний, але лишаються ті самі люди/міста/організації.
+        """
+        clean = str(text or "")
+        clean = re.sub(r"https?://\S+|t\.me/\S+", " ", clean)
+        clean = re.sub(r"<[^>]+>", " ", clean)
+
+        generic = {
+            "Суд", "Сторони", "Сама", "Слідство", "Окрім",
+            "Зустріч", "Переговори", "Візит", "Україна",
+            "України", "Україні", "Росія", "Росії", "США",
+        }
+
+        result = set()
+        for token in re.findall(
+            r"\b[A-ZА-ЯІЇЄҐ][A-Za-zА-Яа-яІіЇїЄєҐґ'’\-]{2,}\b",
+            clean,
+        ):
+            if token in generic:
+                continue
+            normalized = token.lower().replace("’", "'")
+            if len(normalized) < 6:
+                result.add(normalized)
+            else:
+                result.add(normalized[:5])
+
+        return result
+
+    def _is_recent_hard_duplicate(
+        self,
+        event: Dict[str, Any],
+        history: Dict[str, str],
+    ) -> bool:
+        """
+        Жорсткий захист від повтору тієї самої історії у сусідньому випуску.
+
+        Тут навмисно суворіше, ніж у звичайному history-match: якщо запис
+        свіжіший за ~6.5 год і збігаються або дуже близькі заголовки, або
+        велика частина змісту + ті самі власні назви, це вважаємо тим самим
+        сюжетом і не даємо LLM підняти його назад дрібними уточненнями.
+        """
+        age_hours = self._history_age_hours(history)
+        if age_hours is None or age_hours > self.ADJACENT_DUPLICATE_LOCK_HOURS:
+            return False
+
+        headline = str(event.get("headline_hint") or "").strip()
+        summary = str(event.get("summary") or "").strip()
+
+        facts = event.get("key_facts")
+        facts_text = ""
+        if isinstance(facts, list):
+            facts_text = " ".join(
+                str(value).strip()
+                for value in facts[:6]
+                if str(value).strip()
+            )
+
+        history_title = str(history.get("title") or "").strip()
+        history_summary = str(history.get("summary") or "").strip()
+
+        title_stats = self._history_similarity_stats(
+            headline,
+            history_title,
+        )
+        summary_stats = self._history_similarity_stats(
+            summary or facts_text,
+            history_summary,
+        )
+
+        # Майже той самий конкретний заголовок у наступному циклі.
+        if (
+            title_stats["seq"] >= 0.80
+            and title_stats["common"] >= 4
+            and title_stats["overlap"] >= 0.68
+        ):
+            return True
+
+        if (
+            title_stats["common"] >= 4
+            and title_stats["overlap"] >= 0.78
+            and title_stats["jaccard"] >= 0.42
+        ):
+            return True
+
+        current_full = " ".join(
+            value
+            for value in [headline, summary, facts_text]
+            if value
+        )
+        history_full = " ".join(
+            value
+            for value in [history_title, history_summary]
+            if value
+        )
+        current_entities = self._entity_signature(current_full)
+        history_entities = self._entity_signature(history_full)
+        shared_entities = current_entities & history_entities
+
+        # Переписаний заголовок, але фактично той самий сюжет:
+        # багато спільних змістових stems + ті самі 2+ власні назви.
+        if (
+            summary_stats["common"] >= 9
+            and summary_stats["overlap"] >= 0.38
+            and len(shared_entities) >= 2
+        ):
+            return True
+
+        if (
+            summary_stats["common"] >= 14
+            and summary_stats["jaccard"] >= 0.24
+            and len(shared_entities) >= 2
+        ):
+            return True
+
+        return False
+
     def _event_matches_history_entry(
         self,
         event: Dict[str, Any],
@@ -4700,6 +4885,21 @@ discovery-блок.
             )
 
             if title_numeric_exact:
+                return True
+
+            # У свіжій історії дуже близький конкретний заголовок уже є
+            # достатнім сигналом дубля, навіть якщо друге джерело переказало
+            # summary зовсім іншими словами.
+            age_hours = self._history_age_hours(history)
+            recent_title_repeat = (
+                age_hours is not None
+                and age_hours <= self.ADJACENT_DUPLICATE_LOCK_HOURS
+                and title_stats["seq"] >= 0.80
+                and title_stats["common"] >= 4
+                and title_stats["overlap"] >= 0.68
+            )
+
+            if recent_title_repeat:
                 return True
 
             if title_strong and (
@@ -4850,8 +5050,14 @@ discovery-блок.
             event["source_ids"] = source_ids
 
             matched_history: Optional[Dict[str, str]] = None
+            hard_duplicate = False
 
             for history in history_entries:
+                if self._is_recent_hard_duplicate(event, history):
+                    matched_history = history
+                    hard_duplicate = True
+                    break
+
                 if self._event_matches_history_entry(
                     event,
                     history,
@@ -4864,7 +5070,12 @@ discovery-блок.
                     event.get("is_history_repeat", False)
                 )
                 event["is_history_repeat"] = True
-                event["history_match_method"] = "python_similarity"
+                event["history_hard_duplicate"] = hard_duplicate
+                event["history_match_method"] = (
+                    "recent_hard_duplicate"
+                    if hard_duplicate
+                    else "python_similarity"
+                )
                 event["history_match_title"] = matched_history.get(
                     "title",
                     "",
@@ -4878,9 +5089,10 @@ discovery-блок.
                     forced_matches += 1
 
                 logger.info(
-                    "History guard: event_id=%s repeat=True "
+                    "History guard: event_id=%s repeat=True hard=%s "
                     "update=%.0f current='%s' matched='%s'.",
                     event.get("event_id"),
+                    hard_duplicate,
                     self._safe_score(
                         event.get("history_update_strength")
                     ),
