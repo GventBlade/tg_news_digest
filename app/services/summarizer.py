@@ -68,6 +68,12 @@ class NewsSummarizer:
     # одразу вдруге. Це окрема жорстка страховка саме від сусідніх випусків.
     ADJACENT_DUPLICATE_LOCK_HOURS = 6.5
 
+    # Повтор старої історії повертаємо у дайджест лише при справді
+    # великому розвитку. 60 виявилося занадто м'яким порогом: модель
+    # могла вважати +1 пораненого або кілька локальних пошкоджень
+    # достатнім апдейтом.
+    HISTORY_SIGNIFICANT_UPDATE_MIN = 80
+
     MAX_INPUT_CHARS = 55000
     PRIORITY_RECOVERY_MAX_CHARS = 30000
 
@@ -1179,7 +1185,7 @@ curiosity >= 70 або practical_value >= 75. Не підганяй оцінки
 ПОВТОРИ:
 Якщо ця сама реальна подія вже була в архіві, став is_history_repeat=true.
 Повтор може бути eligible_for_digest=true лише якщо history_update_strength
->= 60 і є справді новий значущий розвиток. Інше відкидай.
+>= 80 і є справді новий значущий розвиток. Інше відкидай.
 
 Одна реальна подія = один event_id. Об'єднуй дублікати різних каналів, фото
 та відео однієї події. Обирай найкраще factual-source і найкраще media-source.
@@ -1314,7 +1320,11 @@ history_update_strength 40-59:
 є невелике уточнення, але його недостатньо для повторної появи
 у короткому дайджесті — зазвичай eligible_for_digest=false.
 
-history_update_strength 60-100:
+history_update_strength 60-79:
+є помітне уточнення, але для повторної появи у короткому дайджесті
+цього ще недостатньо — зазвичай eligible_for_digest=false.
+
+history_update_strength 80-100:
 з'явився реально новий значущий розвиток: нові великі наслідки,
 важливе рішення, підтвердження масштабу, нові жертви, новий об'єкт,
 результат операції або інший факт, який змінює картину події.
@@ -2605,6 +2615,219 @@ MANUAL POSTS:
 
         return "society", "social_event"
 
+    @staticmethod
+    def _event_text_bundle(ev: Dict[str, Any]) -> str:
+        parts = [
+            str(ev.get("headline_hint") or "").strip(),
+            str(ev.get("summary") or "").strip(),
+            str(ev.get("why_it_matters") or "").strip(),
+        ]
+        facts = ev.get("key_facts")
+        if isinstance(facts, list):
+            parts.extend(
+                str(item).strip()
+                for item in facts[:8]
+                if str(item).strip()
+            )
+        return " ".join(part for part in parts if part)
+
+    @staticmethod
+    def _looks_like_attack_text(text: str) -> bool:
+        t = NewsSummarizer._normalize_similarity_text(text)
+        return any(
+            stem in t
+            for stem in (
+                "обстр", "атак", "удар", "дрон", "бпла",
+                "ракет", "влуч", "вибух", "шахед",
+            )
+        )
+
+    @staticmethod
+    def _extract_casualty_counts(text: str) -> Dict[str, int]:
+        """Грубо витягує числа загиблих/поранених із короткого опису."""
+        normalized = NewsSummarizer._normalize_similarity_text(text)
+        tokens = re.findall(r"[0-9а-яіїєґa-z'-]+", normalized)
+
+        word_numbers = {
+            "один": 1, "одна": 1, "одну": 1, "одного": 1,
+            "два": 2, "дві": 2, "двоє": 2, "двох": 2,
+            "три": 3, "троє": 3, "трьох": 3,
+            "чотири": 4, "четверо": 4, "чотирьох": 4,
+            "п'ять": 5, "пять": 5, "п'ятеро": 5, "пятеро": 5,
+            "шість": 6, "шестеро": 6,
+            "сім": 7, "семеро": 7,
+            "вісім": 8, "восьмеро": 8,
+            "дев'ять": 9, "девять": 9, "дев'ятеро": 9,
+            "десять": 10, "десятеро": 10,
+        }
+
+        def token_number(token: str) -> Optional[int]:
+            if token.isdigit():
+                try:
+                    value = int(token)
+                except ValueError:
+                    return None
+                return value if 0 <= value <= 500 else None
+            return word_numbers.get(token)
+
+        result = {"dead": 0, "wounded": 0}
+        for idx, token in enumerate(tokens):
+            if any(stem in token for stem in ("загин", "жертв")):
+                kind = "dead"
+            elif any(stem in token for stem in ("поран", "постраж")):
+                kind = "wounded"
+            else:
+                continue
+
+            candidates = []
+            for pos in range(max(0, idx - 4), min(len(tokens), idx + 5)):
+                number = token_number(tokens[pos])
+                if number is not None:
+                    candidates.append((abs(pos - idx), number))
+
+            if candidates:
+                candidates.sort(key=lambda item: item[0])
+                result[kind] = max(result[kind], candidates[0][1])
+
+        return result
+
+    @staticmethod
+    def _strong_attack_signal_set(text: str) -> set:
+        t = NewsSummarizer._normalize_similarity_text(text)
+        signals = {
+            "mass_attack": ("масован", "комбінован"),
+            "critical": ("критичн", "стратегічн"),
+            "energy": ("енергет", "підстанц", "електростанц", " тес ", " гес "),
+            "oil": ("нпз", "нафтоперероб", "нафтобаз"),
+            "military_target": ("аеродром", "військов", "склад боєприпас"),
+            "transport": ("порт", "залізнич", "пункт пропуску", "мост"),
+            "shutdown": ("зупинено роботу", "зупинив роботу", "припинив роботу", "припинено роботу"),
+            "blackout": ("знеструм", "без світла", "відключен"),
+            "evacuation": ("евакуац",),
+            "destroyed": ("зруйнован", "знищен"),
+            "large_fire": ("масштабн пожеж", "велика пожеж"),
+        }
+        found = set()
+        padded = f" {t} "
+        for name, stems in signals.items():
+            if any(stem in padded for stem in stems):
+                found.add(name)
+        return found
+
+    def _has_strong_attack_consequence(self, text: str) -> bool:
+        casualties = self._extract_casualty_counts(text)
+        if casualties["dead"] > 0:
+            return True
+        if casualties["wounded"] >= 8:
+            return True
+        return bool(self._strong_attack_signal_set(text))
+
+    def _is_low_value_attack_event(
+        self,
+        ev: Dict[str, Any],
+        posts: List[Dict[str, Any]],
+    ) -> bool:
+        """
+        Python-gate для рутинних атак, незалежний від event_type LLM.
+
+        1-3 поранених + локальні пошкодження без загиблих, критичного /
+        стратегічного об'єкта, масштабних руйнувань або сильних кадрів
+        не повинні займати слот у короткому загальнонаціональному дайджесті.
+        """
+        if str(ev.get("category") or "") != "war":
+            return False
+
+        text = self._event_text_bundle(ev)
+        if not self._looks_like_attack_text(text):
+            return False
+
+        if self._has_strong_attack_consequence(text):
+            return False
+
+        casualties = self._extract_casualty_counts(text)
+        wounded = casualties["wounded"]
+
+        src_ids = self._valid_source_ids(ev.get("source_ids"), posts)
+        has_video = any(posts[s].get("has_video") for s in src_ids)
+        has_media = any(posts[s].get("has_media") for s in src_ids)
+        media_quality = self._safe_score(ev.get("media_quality"))
+
+        # Сильні реальні кадри можуть зробити подію самостійно вагомою,
+        # але звичайна картинка/ілюстрація — ні.
+        if has_video and media_quality >= 82:
+            return False
+        if has_media and media_quality >= 92:
+            return False
+
+        if 0 < wounded <= 3:
+            return True
+
+        # Якщо кількість жертв не витягнулась, все одно прибираємо типову
+        # локальну атаку, коли сама модель дала дуже низьку цікавість/користь
+        # і немає жодного сильного наслідку.
+        return (
+            self._safe_score(ev.get("curiosity")) < 50
+            and self._safe_score(ev.get("practical_value")) < 50
+            and self._safe_score(ev.get("scale")) < 75
+            and media_quality < 75
+        )
+
+    def _repeat_update_is_substantial(self, ev: Dict[str, Any]) -> bool:
+        """Чи достатньо сильний апдейт, щоб вдруге показати стару історію."""
+        update = self._safe_score(ev.get("history_update_strength"))
+        if update < self.HISTORY_SIGNIFICANT_UPDATE_MIN:
+            return False
+
+        category = str(ev.get("category") or "")
+        current_text = self._event_text_bundle(ev)
+        previous_text = " ".join(
+            value
+            for value in [
+                str(ev.get("history_match_title") or ""),
+                str(ev.get("history_match_summary") or ""),
+            ]
+            if value
+        )
+
+        if category == "war" and self._looks_like_attack_text(current_text):
+            current_casualties = self._extract_casualty_counts(current_text)
+            previous_casualties = self._extract_casualty_counts(previous_text)
+
+            if current_casualties["dead"] > previous_casualties["dead"]:
+                return True
+
+            wounded_delta = (
+                current_casualties["wounded"]
+                - previous_casualties["wounded"]
+            )
+            if (
+                current_casualties["wounded"] >= 8
+                and wounded_delta >= 5
+            ):
+                return True
+
+            new_signals = (
+                self._strong_attack_signal_set(current_text)
+                - self._strong_attack_signal_set(previous_text)
+            )
+            if new_signals:
+                return True
+
+            return False
+
+        # Для політики/економіки/міжнародних подій лишаємо LLM оцінювати
+        # зміст, але вимагаємо одночасно високої новизни й редакційної ваги.
+        return (
+            self._safe_score(ev.get("novelty")) >= 75
+            and self._safe_score(ev.get("importance")) >= 75
+            and (
+                self._safe_score(ev.get("scale")) >= 70
+                or self._safe_score(ev.get("national_relevance")) >= 75
+                or self._safe_score(ev.get("urgency")) >= 85
+                or self._safe_score(ev.get("practical_value")) >= 80
+            )
+        )
+
     def _rank_events(
         self,
         events: List[Dict[str, Any]],
@@ -2679,9 +2902,25 @@ MANUAL POSTS:
 
                     if (
                         is_history_repeat
-                        and history_update < 60
+                        and not self._repeat_update_is_substantial(ev)
                     ):
                         rejected["history_repeat"] += 1
+                        logger.info(
+                            "History update rejected: event_id=%s update=%.0f "
+                            "matched='%s'.",
+                            ev.get("event_id"),
+                            history_update,
+                            str(ev.get("history_match_title") or "")[:120],
+                        )
+                        continue
+
+                    if self._is_low_value_attack_event(ev, posts):
+                        rejected["low_value"] += 1
+                        logger.info(
+                            "Low-value attack rejected: event_id=%s headline='%s'.",
+                            ev.get("event_id"),
+                            str(ev.get("headline_hint") or ev.get("summary") or "")[:120],
+                        )
                         continue
 
                 imp = self._safe_score(ev.get("importance"))
@@ -2848,11 +3087,11 @@ MANUAL POSTS:
 
                 if (
                     is_history_repeat
-                    and history_update >= 60
+                    and history_update >= self.HISTORY_SIGNIFICANT_UPDATE_MIN
                 ):
                     score += min(
-                        (history_update - 60) * 0.10,
-                        4,
+                        (history_update - self.HISTORY_SIGNIFICANT_UPDATE_MIN) * 0.10,
+                        2,
                     )
 
                 if rel < 45:
@@ -4699,6 +4938,74 @@ discovery-блок.
 
         return result
 
+    def _is_recent_attack_continuation(
+        self,
+        event: Dict[str, Any],
+        history: Dict[str, str],
+    ) -> bool:
+        """
+        Ловить не буквальний дубль, а продовження тієї самої атаки у
+        сусідньому 4-годинному випуску: наприклад Дніпро -> Дніпропетровщина,
+        2 поранених -> 3 поранених + локальні пошкодження.
+
+        Це НЕ hard-block: подія позначається history repeat і може повернутися
+        лише якщо пройде окремий строгий substantial-update gate.
+        """
+        age_hours = self._history_age_hours(history)
+        if age_hours is None or age_hours > self.ADJACENT_DUPLICATE_LOCK_HOURS:
+            return False
+
+        current_text = self._event_text_bundle(event)
+        history_text = " ".join(
+            value
+            for value in [
+                str(history.get("title") or ""),
+                str(history.get("summary") or ""),
+            ]
+            if value
+        )
+
+        if not (
+            self._looks_like_attack_text(current_text)
+            and self._looks_like_attack_text(history_text)
+        ):
+            return False
+
+        stats = self._history_similarity_stats(current_text, history_text)
+        shared_entities = (
+            self._entity_signature(current_text)
+            & self._entity_signature(history_text)
+        )
+
+        # Одна спільна конкретна географічна/власна назва + кілька
+        # однакових фактологічних stems достатні для сусіднього випуску.
+        # Для Дніпро/Дніпропетровщина fingerprint однаковий: "дніпр".
+        if (
+            len(shared_entities) >= 1
+            and stats["common"] >= 4
+            and (
+                stats["overlap"] >= 0.22
+                or stats["jaccard"] >= 0.14
+                or stats["seq"] >= 0.42
+            )
+        ):
+            return True
+
+        # Окремий casualty-pattern: те саме місце + обстріл + поранені /
+        # загиблі в обох повідомленнях часто є просто раннім і пізнім зведенням.
+        casualty_markers = ("поран", "постраж", "загин", "жертв")
+        current_norm = self._normalize_similarity_text(current_text)
+        history_norm = self._normalize_similarity_text(history_text)
+        if (
+            len(shared_entities) >= 1
+            and any(stem in current_norm for stem in casualty_markers)
+            and any(stem in history_norm for stem in casualty_markers)
+            and stats["common"] >= 3
+        ):
+            return True
+
+        return False
+
     def _is_recent_hard_duplicate(
         self,
         event: Dict[str, Any],
@@ -5028,8 +5335,8 @@ discovery-блок.
 
         LLM лишається відповідальним за силу нового розвитку. Python лише
         примусово виставляє is_history_repeat=True для дуже схожої вже
-        опублікованої події. Якщо модель дала history_update_strength >= 60,
-        ranking все одно може пропустити реальний значущий апдейт.
+        опублікованої події. Повтор проходить далі лише через строгий
+        substantial-update gate (80+ і реальна зміна наслідків).
         """
         history_entries = self._prepare_history_entries(past_events)
         if not history_entries:
@@ -5051,11 +5358,18 @@ discovery-блок.
 
             matched_history: Optional[Dict[str, str]] = None
             hard_duplicate = False
+            match_method = ""
 
             for history in history_entries:
                 if self._is_recent_hard_duplicate(event, history):
                     matched_history = history
                     hard_duplicate = True
+                    match_method = "recent_hard_duplicate"
+                    break
+
+                if self._is_recent_attack_continuation(event, history):
+                    matched_history = history
+                    match_method = "recent_attack_continuation"
                     break
 
                 if self._event_matches_history_entry(
@@ -5063,6 +5377,7 @@ discovery-блок.
                     history,
                 ):
                     matched_history = history
+                    match_method = "python_similarity"
                     break
 
             if matched_history is not None:
@@ -5071,13 +5386,13 @@ discovery-блок.
                 )
                 event["is_history_repeat"] = True
                 event["history_hard_duplicate"] = hard_duplicate
-                event["history_match_method"] = (
-                    "recent_hard_duplicate"
-                    if hard_duplicate
-                    else "python_similarity"
-                )
+                event["history_match_method"] = match_method
                 event["history_match_title"] = matched_history.get(
                     "title",
+                    "",
+                )
+                event["history_match_summary"] = matched_history.get(
+                    "summary",
                     "",
                 )
                 event["history_match_published_at"] = matched_history.get(
@@ -5089,10 +5404,11 @@ discovery-блок.
                     forced_matches += 1
 
                 logger.info(
-                    "History guard: event_id=%s repeat=True hard=%s "
+                    "History guard: event_id=%s repeat=True hard=%s method=%s "
                     "update=%.0f current='%s' matched='%s'.",
                     event.get("event_id"),
                     hard_duplicate,
+                    match_method,
                     self._safe_score(
                         event.get("history_update_strength")
                     ),
