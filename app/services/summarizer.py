@@ -74,6 +74,17 @@ class NewsSummarizer:
     # достатнім апдейтом.
     HISTORY_SIGNIFICANT_UPDATE_MIN = 80
 
+    # Друга лінія захисту від семантичних дублів. Python ловить очевидні
+    # збіги детерміновано, а короткий окремий LLM-review розбирає лише
+    # неоднозначні пари "поточна подія ↔ архів". Це особливо важливо для
+    # історій, де заголовок повністю переписано (Claude/Anthropic, звіти,
+    # дослідження, дипломатія тощо).
+    SEMANTIC_HISTORY_REVIEW_ENABLED = True
+    SEMANTIC_HISTORY_CANDIDATES_PER_EVENT = 3
+    SEMANTIC_HISTORY_REVIEW_MAX_EVENTS = 18
+    SEMANTIC_HISTORY_MIN_CANDIDATE_SCORE = 20.0
+    SEMANTIC_HISTORY_LOOKBACK_HOURS = 48.0
+
     MAX_INPUT_CHARS = 55000
     PRIORITY_RECOVERY_MAX_CHARS = 30000
 
@@ -183,6 +194,12 @@ class NewsSummarizer:
             posts,
             past_events,
         )
+        analyzed_events = self._apply_semantic_history_review(
+            analyzed_events,
+            posts,
+            past_events,
+            max_retries_per_model,
+        )
 
         if not analyzed_events:
             logger.warning(
@@ -253,6 +270,12 @@ class NewsSummarizer:
                 analyzed_events,
                 posts,
                 past_events,
+            )
+            analyzed_events = self._apply_semantic_history_review(
+                analyzed_events,
+                posts,
+                past_events,
+                max_retries_per_model,
             )
 
             # Після discovery-recovery обов'язково ранжуємо весь пул заново:
@@ -1184,6 +1207,9 @@ curiosity >= 70 або practical_value >= 75. Не підганяй оцінки
 
 ПОВТОРИ:
 Якщо ця сама реальна подія вже була в архіві, став is_history_repeat=true.
+Інший заголовок, інше фото, інше джерело, розширений список деталей або
+інший кут подачі НЕ створюють нової події. Для атак водночас не склеюй
+різні удари без збігу конкретної локації/цілі/хвилі атаки.
 Повтор може бути eligible_for_digest=true лише якщо history_update_strength
 >= 80 і є справді новий значущий розвиток. Інше відкидай.
 
@@ -1308,6 +1334,16 @@ TELEGRAM POSTS FOR DISCOVERY SEARCH:
 Архів — це вже опубліковані новини.
 Не повторюй ту саму реальну подію тільки через новий пост,
 інше формулювання, інший канал або нове фото.
+
+"Та сама подія" означає той самий базовий інцидент, звіт, дослідження,
+оголошення, рішення, операцію або розслідування — навіть якщо новий пост
+подає інший кут, інший заголовок чи додає подробиці. Наприклад, новий список
+методів кібератаки в тому самому звіті про Claude/Anthropic — це уточнення
+тієї самої історії, а не нова подія.
+
+Для атак НЕ склеюй різні удари лише тому, що в них той самий нападник,
+тип зброї або загальна тема. Для однієї атаки мають збігатися конкретна
+локація/ціль/хвиля атаки або інша унікальна прив'язка події.
 
 Якщо подія вже є в архіві:
 - is_history_repeat=true;
@@ -2291,6 +2327,12 @@ MANUAL POSTS:
         merged["is_history_repeat"] = history_repeat
         merged["history_hard_duplicate"] = history_hard_duplicate
         merged["history_update_strength"] = history_update
+        # Якщо до вже перевіреної події домерджився НОВИЙ recovery-event,
+        # semantic review треба виконати ще раз уже на розширеному наборі фактів.
+        merged["history_semantic_reviewed"] = bool(
+            base.get("history_semantic_reviewed", False)
+            and incoming.get("history_semantic_reviewed", False)
+        )
 
         has_priority = any(
             bool(posts[source_id].get("is_priority"))
@@ -2300,7 +2342,10 @@ MANUAL POSTS:
         if has_priority:
             merged["eligible_for_digest"] = True
             merged["rejection_reason"] = ""
-        elif history_repeat and history_update < 60:
+        elif (
+            history_repeat
+            and history_update < self.HISTORY_SIGNIFICANT_UPDATE_MIN
+        ):
             merged["eligible_for_digest"] = False
             merged["rejection_reason"] = (
                 str(
@@ -2634,6 +2679,20 @@ MANUAL POSTS:
     @staticmethod
     def _looks_like_attack_text(text: str) -> bool:
         t = NewsSummarizer._normalize_similarity_text(text)
+
+        # "кібератака" не є фізичним ударом. Раніше substring "атак"
+        # заводив Claude/Anthropic та інші cyber-історії в attack-matcher.
+        cyber_only = any(
+            marker in t
+            for marker in ("кібератак", "cyberattack", "кібершпиг", "хакер")
+        )
+        physical_markers = (
+            "обстр", " удар", "удар ", "дрон", "бпла",
+            "ракет", "влуч", "вибух", "шахед",
+        )
+        if cyber_only and not any(marker in t for marker in physical_markers):
+            return False
+
         return any(
             stem in t
             for stem in (
@@ -2641,6 +2700,19 @@ MANUAL POSTS:
                 "ракет", "влуч", "вибух", "шахед",
             )
         )
+
+    def _event_is_physical_attack(self, ev: Dict[str, Any]) -> bool:
+        category = str(ev.get("category") or "").strip().lower()
+        event_type = str(ev.get("event_type") or "").strip().lower()
+        attack_types = {
+            "major_attack",
+            "routine_attack",
+            "military_event",
+            "critical_infrastructure",
+        }
+        if category != "war" and event_type not in attack_types:
+            return False
+        return self._looks_like_attack_text(self._event_text_bundle(ev))
 
     @staticmethod
     def _extract_casualty_counts(text: str) -> Dict[str, int]:
@@ -2772,13 +2844,80 @@ MANUAL POSTS:
             and media_quality < 75
         )
 
+    @staticmethod
+    def _concrete_numbers(text: str) -> set:
+        normalized = NewsSummarizer._normalize_similarity_text(text)
+        return set(re.findall(r"\b\d+(?:[.,]\d+)?\b", normalized))
+
+    @staticmethod
+    def _status_transition_signature(text: str) -> set:
+        """Матеріальні переходи стану, а не просто нові подробиці."""
+        t = NewsSummarizer._normalize_similarity_text(text)
+        groups = {
+            "approved": ("ухвал", "затверд", "проголос", "ратифік"),
+            "signed": ("підпис", "укладено угоду", "уклали угоду", "контракт уклад"),
+            "effective": ("набув чинності", "набула чинності", "вступив у силу", "почало діяти"),
+            "launched": ("запуст", "відкрив", "почав роботу", "розпочав виробниц"),
+            "completed": ("заверш", "закінч", "досягнуто домовлен"),
+            "confirmed": ("офіційно підтверд", "підтвердив результат", "підтверджено результат"),
+            "sanctioned": ("запровадили санкц", "ввели санкц", "зняли санкц"),
+            "legal_result": ("вирок", "засуд", "арешт", "затрим", "оголосили підозр"),
+            "operational_result": ("знищено", "уражено", "виведено з ладу", "зупинено роботу"),
+        }
+        found = set()
+        for name, needles in groups.items():
+            if any(needle in t for needle in needles):
+                found.add(name)
+        return found
+
+    def _non_attack_material_update(
+        self,
+        current_text: str,
+        previous_text: str,
+    ) -> bool:
+        """
+        Для звітів/технологій/політики додатковий опис не є апдейтом.
+        Потрібна конкретна зміна стану, результат або нова значуща цифра.
+        """
+        if not previous_text.strip():
+            # Якщо в БД старий запис без summary, не блокуємо справжній update
+            # лише через нестачу історичного контексту — але нижче все одно
+            # потрібні високі novelty/importance від Analyzer/reviewer.
+            return True
+
+        current_status = self._status_transition_signature(current_text)
+        previous_status = self._status_transition_signature(previous_text)
+        if current_status - previous_status:
+            return True
+
+        current_numbers = self._concrete_numbers(current_text)
+        previous_numbers = self._concrete_numbers(previous_text)
+        new_numbers = current_numbers - previous_numbers
+        if new_numbers:
+            # Нові цифри самі по собі не завжди матеріальні, але в парі з
+            # новою конкретною сутністю/результатом це вже сильний сигнал.
+            current_entities = self._entity_signature(current_text)
+            previous_entities = self._entity_signature(previous_text)
+            if current_entities - previous_entities:
+                return True
+
+            quantitative_markers = (
+                "загиб", "поран", "постраж", "млрд", "млн", "%",
+                "відсот", "голос", "місц", "країн", "систем", "одиниц",
+                "контракт", "тариф", "подат", "ставк",
+            )
+            current_norm = self._normalize_similarity_text(current_text)
+            if any(marker in current_norm for marker in quantitative_markers):
+                return True
+
+        return False
+
     def _repeat_update_is_substantial(self, ev: Dict[str, Any]) -> bool:
         """Чи достатньо сильний апдейт, щоб вдруге показати стару історію."""
         update = self._safe_score(ev.get("history_update_strength"))
         if update < self.HISTORY_SIGNIFICANT_UPDATE_MIN:
             return False
 
-        category = str(ev.get("category") or "")
         current_text = self._event_text_bundle(ev)
         previous_text = " ".join(
             value
@@ -2789,6 +2928,12 @@ MANUAL POSTS:
             if value
         )
 
+        # Якщо semantic-review прямо сказав, що це лише інший кут/деталі,
+        # жодні високі LLM-оцінки з попереднього Analyzer не повинні оживити дубль.
+        if ev.get("history_material_update") is False:
+            return False
+
+        category = str(ev.get("category") or "")
         if category == "war" and self._looks_like_attack_text(current_text):
             current_casualties = self._extract_casualty_counts(current_text)
             previous_casualties = self._extract_casualty_counts(previous_text)
@@ -2800,10 +2945,7 @@ MANUAL POSTS:
                 current_casualties["wounded"]
                 - previous_casualties["wounded"]
             )
-            if (
-                current_casualties["wounded"] >= 8
-                and wounded_delta >= 5
-            ):
+            if current_casualties["wounded"] >= 8 and wounded_delta >= 5:
                 return True
 
             new_signals = (
@@ -2815,16 +2957,31 @@ MANUAL POSTS:
 
             return False
 
-        # Для політики/економіки/міжнародних подій лишаємо LLM оцінювати
-        # зміст, але вимагаємо одночасно високої новизни й редакційної ваги.
+        reviewer_confirmed_material = (
+            ev.get("history_material_update") is True
+        )
+
+        # Якщо спеціальний semantic-review уже підтвердив матеріальний update,
+        # його рішення можна використати як semantic evidence. Інакше Python
+        # вимагає конкретний transition/результат/нову значущу цифру.
+        if (
+            not reviewer_confirmed_material
+            and not self._non_attack_material_update(
+                current_text,
+                previous_text,
+            )
+        ):
+            return False
+
         return (
-            self._safe_score(ev.get("novelty")) >= 75
-            and self._safe_score(ev.get("importance")) >= 75
+            self._safe_score(ev.get("novelty")) >= 72
+            and self._safe_score(ev.get("importance")) >= 68
             and (
-                self._safe_score(ev.get("scale")) >= 70
-                or self._safe_score(ev.get("national_relevance")) >= 75
-                or self._safe_score(ev.get("urgency")) >= 85
-                or self._safe_score(ev.get("practical_value")) >= 80
+                self._safe_score(ev.get("scale")) >= 65
+                or self._safe_score(ev.get("national_relevance")) >= 70
+                or self._safe_score(ev.get("urgency")) >= 82
+                or self._safe_score(ev.get("practical_value")) >= 78
+                or self._safe_score(ev.get("public_interest")) >= 78
             )
         )
 
@@ -2883,7 +3040,10 @@ MANUAL POSTS:
                 )
 
                 if not is_priority:
-                    if history_hard_duplicate:
+                    if (
+                        history_hard_duplicate
+                        and not self._repeat_update_is_substantial(ev)
+                    ):
                         rejected["history_repeat"] += 1
                         logger.info(
                             "History hard-block: event_id=%s matched='%s'.",
@@ -3015,7 +3175,7 @@ MANUAL POSTS:
                         )
                         or (
                             is_history_repeat
-                            and history_update >= 75
+                            and history_update >= self.HISTORY_SIGNIFICANT_UPDATE_MIN
                         )
                     )
 
@@ -4908,35 +5068,275 @@ discovery-блок.
     @staticmethod
     def _entity_signature(text: str) -> set:
         """
-        Витягує грубі fingerprints власних назв/імен.
+        Власні назви/імена у морфологічно стійкому вигляді.
 
-        Це допомагає впізнати одну подію, коли заголовок повністю
-        переписаний, але лишаються ті самі люди/міста/організації.
+        Критично: не вважаємо слова на кшталт "Удар", "Атака", "Російський"
+        або "Перший" сутностями. Саме такі псевдо-сутності раніше давали
+        false-positive між Звягелем, Луцьком, Рівненщиною тощо.
         """
         clean = str(text or "")
         clean = re.sub(r"https?://\S+|t\.me/\S+", " ", clean)
         clean = re.sub(r"<[^>]+>", " ", clean)
 
-        generic = {
-            "Суд", "Сторони", "Сама", "Слідство", "Окрім",
-            "Зустріч", "Переговори", "Візит", "Україна",
-            "України", "Україні", "Росія", "Росії", "США",
+        generic_exact = {
+            "суд", "сторони", "сама", "слідство", "окрім", "зустріч",
+            "переговори", "візит", "україна", "україни", "україні",
+            "росія", "росії", "сша", "рф", "єс", "нато", "мвс",
+            "уряд", "кабмін", "рада", "президент", "міністр",
+            "генштаб", "зсу", "сбу", "гур",
+        }
+        generic_stems = {
+            "удар", "атака", "вибух", "обстр", "масов", "росій",
+            "украї", "ворог", "перш", "новин", "стало", "повід",
+            "заяв", "компа", "влада", "війсь", "дрони", "дрон",
+            "бпла", "ракет", "пожеж", "загин", "поран", "постр",
         }
 
         result = set()
-        for token in re.findall(
+        for match in re.finditer(
             r"\b[A-ZА-ЯІЇЄҐ][A-Za-zА-Яа-яІіЇїЄєҐґ'’\-]{2,}\b",
             clean,
         ):
-            if token in generic:
-                continue
+            token = match.group(0)
             normalized = token.lower().replace("’", "'")
-            if len(normalized) < 6:
-                result.add(normalized)
-            else:
-                result.add(normalized[:5])
+            if normalized in generic_exact:
+                continue
+
+            stem = normalized if len(normalized) < 6 else normalized[:5]
+            if stem in generic_stems:
+                continue
+
+            result.add(stem)
 
         return result
+
+    @staticmethod
+    def _story_signature(text: str) -> set:
+        """Змістові fingerprints без загального новинного шуму."""
+        signature = NewsSummarizer._history_signature(text)
+        generic = {
+            "росій", "украї", "новин", "повід", "заяв", "стало",
+            "атака", "атаку", "удар", "удари", "обстр", "дрон",
+            "дрони", "бпла", "ракет", "ворог", "війсь", "загин",
+            "поран", "постр", "жертв", "пошко", "руйну", "вибух",
+            "пожеж", "масов", "об'єк", "обєкт", "через", "також",
+            "можут", "буде", "було", "були", "після", "проти",
+            "зокре", "серед", "даним", "повід", "викор", "спроб",
+        }
+        return {token for token in signature if token not in generic}
+
+    @staticmethod
+    def _topic_family_signature(text: str) -> set:
+        t = NewsSummarizer._normalize_similarity_text(text)
+        padded = f" {t} "
+        families = {
+            "cyber_ai": (
+                "claude", "anthropic", "штучн", "інтелект", "нейромереж",
+                "кібер", "хакер", "фішинг", "malware", "ai ",
+            ),
+            "attack": (
+                "обстр", "атак", "удар", "дрон", "бпла", "ракет",
+                "влуч", "шахед", "вибух",
+            ),
+            "energy": (
+                "енергет", "електр", "підстанц", "нафт", "нпз", "газ",
+            ),
+            "transport": (
+                "залізнич", "потяг", "метро", "аеропорт", "порт", "мост",
+            ),
+            "diplomacy": (
+                "переговор", "зустріч", "саміт", "g20", "мирн", "угод",
+            ),
+            "sanctions": ("санкц", "оліг", "актив", "заморож"),
+            "politics_law": (
+                "закон", "уряд", "рада", "кабмін", "вибор", "пдв",
+                "подат", "постан", "рішенн",
+            ),
+            "health_science": (
+                "дослід", "вчен", "ризик", "рак ", "онколог", "медицин",
+                "лікуван", "здоров",
+            ),
+            "defense_industry": (
+                "виробниц", "контракт", "ракета", "дрон", "озброєн",
+                "перехоп", "рсзв", "patriot",
+            ),
+            "crime": (
+                "затрим", "обшук", "підозр", "шахрай", "злочин", "суд",
+            ),
+        }
+        found = set()
+        for family, needles in families.items():
+            if any(needle in padded for needle in needles):
+                found.add(family)
+
+        # Не додаємо physical-attack family лише через слово "кібератака".
+        if "cyber_ai" in found and "attack" in found:
+            physical = (
+                "обстр", " удар", "удар ", "дрон", "бпла",
+                "ракет", "влуч", "вибух", "шахед",
+            )
+            if not any(marker in padded for marker in physical):
+                found.discard("attack")
+
+        return found
+
+    @staticmethod
+    def _attack_specific_entity_signature(text: str) -> set:
+        entities = NewsSummarizer._entity_signature(text)
+        # Для атак військові/державні органи — занадто загальні якорі.
+        generic = {
+            "сбу", "гур", "зсу", "мвс", "нато", "сша", "геншт",
+            "росій", "украї",
+        }
+        return {item for item in entities if item not in generic}
+
+    @staticmethod
+    def _attack_anchor_signature(text: str) -> set:
+        """Конкретні якорі атаки: місце/ціль/об'єкт, а не сам факт удару."""
+        anchors = set(NewsSummarizer._attack_specific_entity_signature(text))
+        content = NewsSummarizer._story_signature(text)
+        attack_noise = {
+            "атак", "удар", "обстр", "дрон", "бпла", "ракет", "влуч",
+            "шахед", "вибух", "загин", "поран", "постр", "жертв",
+            "пошко", "руйну", "масов", "війсь", "росій", "украї",
+            "нічн", "повіт", "сили", "засоб", "наслі", "людей",
+        }
+        anchors.update(token for token in content if token not in attack_noise)
+        return anchors
+
+    def _attack_same_story_anchor_match(
+        self,
+        current_text: str,
+        history_text: str,
+    ) -> bool:
+        if not (
+            self._looks_like_attack_text(current_text)
+            and self._looks_like_attack_text(history_text)
+        ):
+            return False
+
+        stats = self._history_similarity_stats(current_text, history_text)
+        shared_entities = (
+            self._attack_specific_entity_signature(current_text)
+            & self._attack_specific_entity_signature(history_text)
+        )
+        shared_anchors = (
+            self._attack_anchor_signature(current_text)
+            & self._attack_anchor_signature(history_text)
+        )
+
+        # Один конкретний спільний топонім/об'єкт + змістова підтримка.
+        if (
+            len(shared_entities) >= 1
+            and stats["common"] >= 3
+            and (
+                stats["overlap"] >= 0.20
+                or stats["jaccard"] >= 0.12
+                or stats["seq"] >= 0.38
+                or len(shared_anchors) >= 2
+            )
+        ):
+            return True
+
+        # Якщо власна назва загубилась у переказі, потрібні щонайменше
+        # три конкретні спільні якорі. Це навмисно суворо.
+        if (
+            len(shared_anchors) >= 3
+            and stats["common"] >= 5
+            and (
+                stats["overlap"] >= 0.28
+                or stats["jaccard"] >= 0.16
+                or stats["seq"] >= 0.46
+            )
+        ):
+            return True
+
+        return False
+
+    def _semantic_story_duplicate(
+        self,
+        event: Dict[str, Any],
+        history: Dict[str, str],
+    ) -> bool:
+        """
+        Консервативний semantic-anchor matcher.
+
+        Він ловить переписані сюжети на кшталт Claude/Anthropic, але для атак
+        делегує рішення окремому строгому matcher-у, щоб не склеювати різні
+        удари лише через слова "дрон/ракета/РФ".
+        """
+        current_text = self._event_text_bundle(event)
+        history_text = " ".join(
+            value
+            for value in [
+                str(history.get("title") or ""),
+                str(history.get("summary") or ""),
+            ]
+            if value
+        )
+        if not current_text or not history_text:
+            return False
+
+        current_is_attack = self._event_is_physical_attack(event)
+        history_is_attack = self._looks_like_attack_text(history_text)
+        if current_is_attack:
+            if not history_is_attack:
+                return False
+            return self._attack_same_story_anchor_match(
+                current_text,
+                history_text,
+            )
+
+        stats = self._history_similarity_stats(current_text, history_text)
+        shared_entities = (
+            self._entity_signature(current_text)
+            & self._entity_signature(history_text)
+        )
+        shared_story = (
+            self._story_signature(current_text)
+            & self._story_signature(history_text)
+        )
+        shared_topics = (
+            self._topic_family_signature(current_text)
+            & self._topic_family_signature(history_text)
+        )
+
+        # Два конкретні спільні entity + спільна тема — дуже сильний сигнал.
+        if (
+            len(shared_entities) >= 2
+            and len(shared_topics) >= 1
+            and len(shared_story) >= 2
+        ):
+            return True
+
+        # Один унікальний бренд/продукт/організація (Claude, Anthropic тощо)
+        # + кілька змістових збігів + та сама тематична сім'я.
+        if (
+            len(shared_entities) >= 1
+            and len(shared_topics) >= 1
+            and len(shared_story) >= 2
+            and (
+                stats["common"] >= 5
+                or stats["overlap"] >= 0.30
+                or stats["jaccard"] >= 0.18
+            )
+        ):
+            return True
+
+        # Без entity дозволяємо лише дуже насичений змістовий збіг.
+        if (
+            len(shared_topics) >= 1
+            and len(shared_story) >= 6
+            and stats["common"] >= 8
+            and (
+                stats["overlap"] >= 0.42
+                or stats["jaccard"] >= 0.24
+                or stats["seq"] >= 0.62
+            )
+        ):
+            return True
+
+        return False
 
     def _is_recent_attack_continuation(
         self,
@@ -4944,15 +5344,17 @@ discovery-блок.
         history: Dict[str, str],
     ) -> bool:
         """
-        Ловить не буквальний дубль, а продовження тієї самої атаки у
-        сусідньому 4-годинному випуску: наприклад Дніпро -> Дніпропетровщина,
-        2 поранених -> 3 поранених + локальні пошкодження.
+        Продовження ТІЄЇ САМОЇ атаки у сусідньому випуску.
 
-        Це НЕ hard-block: подія позначається history repeat і може повернутися
-        лише якщо пройде окремий строгий substantial-update gate.
+        Старий варіант дозволяв одному випадковому capitalized-word + кільком
+        загальним attack-stems склеювати різні міста. Тепер обов'язковий
+        конкретний спільний якір місця/цілі/об'єкта.
         """
         age_hours = self._history_age_hours(history)
         if age_hours is None or age_hours > self.ADJACENT_DUPLICATE_LOCK_HOURS:
+            return False
+
+        if not self._event_is_physical_attack(event):
             return False
 
         current_text = self._event_text_bundle(event)
@@ -4965,67 +5367,34 @@ discovery-блок.
             if value
         )
 
-        if not (
-            self._looks_like_attack_text(current_text)
-            and self._looks_like_attack_text(history_text)
-        ):
+        if not self._attack_same_story_anchor_match(current_text, history_text):
             return False
 
-        stats = self._history_similarity_stats(current_text, history_text)
         shared_entities = (
-            self._entity_signature(current_text)
-            & self._entity_signature(history_text)
+            self._attack_specific_entity_signature(current_text)
+            & self._attack_specific_entity_signature(history_text)
+        )
+        shared_anchors = (
+            self._attack_anchor_signature(current_text)
+            & self._attack_anchor_signature(history_text)
         )
 
-        # Одна спільна конкретна географічна/власна назва + кілька
-        # однакових фактологічних stems достатні для сусіднього випуску.
-        # Для Дніпро/Дніпропетровщина fingerprint однаковий: "дніпр".
-        if (
-            len(shared_entities) >= 1
-            and stats["common"] >= 4
-            and (
-                stats["overlap"] >= 0.22
-                or stats["jaccard"] >= 0.14
-                or stats["seq"] >= 0.42
-            )
-        ):
-            return True
-
-        # Окремий casualty-pattern: те саме місце + обстріл + поранені /
-        # загиблі в обох повідомленнях часто є просто раннім і пізнім зведенням.
-        casualty_markers = ("поран", "постраж", "загин", "жертв")
-        current_norm = self._normalize_similarity_text(current_text)
-        history_norm = self._normalize_similarity_text(history_text)
-        if (
-            len(shared_entities) >= 1
-            and any(stem in current_norm for stem in casualty_markers)
-            and any(stem in history_norm for stem in casualty_markers)
-            and stats["common"] >= 3
-        ):
-            return True
-
-        return False
+        # Хоча базовий matcher уже суворий, для continuation залишаємо
+        # додаткову вимогу: або конкретна спільна власна назва, або 3+ anchors.
+        return bool(shared_entities) or len(shared_anchors) >= 3
 
     def _is_recent_hard_duplicate(
         self,
         event: Dict[str, Any],
         history: Dict[str, str],
     ) -> bool:
-        """
-        Жорсткий захист від повтору тієї самої історії у сусідньому випуску.
-
-        Тут навмисно суворіше, ніж у звичайному history-match: якщо запис
-        свіжіший за ~6.5 год і збігаються або дуже близькі заголовки, або
-        велика частина змісту + ті самі власні назви, це вважаємо тим самим
-        сюжетом і не даємо LLM підняти його назад дрібними уточненнями.
-        """
+        """Дуже сильний збіг тієї самої історії у сусідньому випуску."""
         age_hours = self._history_age_hours(history)
         if age_hours is None or age_hours > self.ADJACENT_DUPLICATE_LOCK_HOURS:
             return False
 
         headline = str(event.get("headline_hint") or "").strip()
         summary = str(event.get("summary") or "").strip()
-
         facts = event.get("key_facts")
         facts_text = ""
         if isinstance(facts, list):
@@ -5038,46 +5407,55 @@ discovery-блок.
         history_title = str(history.get("title") or "").strip()
         history_summary = str(history.get("summary") or "").strip()
 
-        title_stats = self._history_similarity_stats(
-            headline,
-            history_title,
-        )
+        title_stats = self._history_similarity_stats(headline, history_title)
         summary_stats = self._history_similarity_stats(
             summary or facts_text,
             history_summary,
         )
 
-        # Майже той самий конкретний заголовок у наступному циклі.
         if (
-            title_stats["seq"] >= 0.80
+            title_stats["seq"] >= 0.84
             and title_stats["common"] >= 4
-            and title_stats["overlap"] >= 0.68
+            and title_stats["overlap"] >= 0.70
         ):
             return True
 
         if (
-            title_stats["common"] >= 4
-            and title_stats["overlap"] >= 0.78
-            and title_stats["jaccard"] >= 0.42
+            title_stats["common"] >= 5
+            and title_stats["overlap"] >= 0.80
+            and title_stats["jaccard"] >= 0.44
         ):
             return True
 
         current_full = " ".join(
-            value
-            for value in [headline, summary, facts_text]
-            if value
+            value for value in [headline, summary, facts_text] if value
         )
         history_full = " ".join(
-            value
-            for value in [history_title, history_summary]
-            if value
+            value for value in [history_title, history_summary] if value
         )
-        current_entities = self._entity_signature(current_full)
-        history_entities = self._entity_signature(history_full)
-        shared_entities = current_entities & history_entities
 
-        # Переписаний заголовок, але фактично той самий сюжет:
-        # багато спільних змістових stems + ті самі 2+ власні назви.
+        # Для фізичних атак — тільки строгий location/target anchor matcher.
+        # Technology/cyber event не вважаємо фізичною атакою лише через слова
+        # "ракети/дрони" в переліку можливих застосувань.
+        current_attack = self._event_is_physical_attack(event)
+        history_attack = self._looks_like_attack_text(history_full)
+        if current_attack:
+            if not history_attack:
+                return False
+            return self._attack_same_story_anchor_match(
+                current_full,
+                history_full,
+            ) and (
+                summary_stats["common"] >= 6
+                or title_stats["common"] >= 4
+                or summary_stats["seq"] >= 0.58
+            )
+
+        shared_entities = (
+            self._entity_signature(current_full)
+            & self._entity_signature(history_full)
+        )
+
         if (
             summary_stats["common"] >= 9
             and summary_stats["overlap"] >= 0.38
@@ -5092,6 +5470,8 @@ discovery-блок.
         ):
             return True
 
+        # Семантичні (але не lexical-hard) збіги нижче обробляє окремий
+        # soft matcher + HISTORY_REVIEW, щоб модель могла виправити false-positive.
         return False
 
     def _event_matches_history_entry(
@@ -5229,6 +5609,11 @@ discovery-блок.
         if not history_summary and title_stats["seq"] >= 0.90:
             return True
         if not history_title and summary_stats["seq"] >= 0.88:
+            return True
+
+        # Переписаний заголовок/summary, але той самий базовий сюжет.
+        # Для атак цей helper уже вимагає конкретний збіг location/target.
+        if self._semantic_story_duplicate(event, history):
             return True
 
         return False
@@ -5372,6 +5757,11 @@ discovery-блок.
                     match_method = "recent_attack_continuation"
                     break
 
+                if self._semantic_story_duplicate(event, history):
+                    matched_history = history
+                    match_method = "semantic_anchor"
+                    break
+
                 if self._event_matches_history_entry(
                     event,
                     history,
@@ -5427,6 +5817,399 @@ discovery-блок.
                 "History guard примусово позначив %s подій як repeat.",
                 forced_matches,
             )
+
+        return result
+
+    def _history_candidate_score(
+        self,
+        event: Dict[str, Any],
+        history: Dict[str, str],
+    ) -> float:
+        current_text = self._event_text_bundle(event)
+        history_text = " ".join(
+            value
+            for value in [
+                str(history.get("title") or ""),
+                str(history.get("summary") or ""),
+            ]
+            if value
+        )
+        if not current_text or not history_text:
+            return 0.0
+
+        stats = self._history_similarity_stats(current_text, history_text)
+        shared_entities = (
+            self._entity_signature(current_text)
+            & self._entity_signature(history_text)
+        )
+        shared_story = (
+            self._story_signature(current_text)
+            & self._story_signature(history_text)
+        )
+        shared_topics = (
+            self._topic_family_signature(current_text)
+            & self._topic_family_signature(history_text)
+        )
+
+        score = (
+            stats["seq"] * 18.0
+            + stats["overlap"] * 18.0
+            + stats["jaccard"] * 12.0
+            + min(stats["common"], 12.0) * 1.6
+            + min(len(shared_entities), 3) * 14.0
+            + min(len(shared_story), 8) * 1.8
+            + min(len(shared_topics), 2) * 8.0
+        )
+
+        age_hours = self._history_age_hours(history)
+        if age_hours is not None:
+            if age_hours <= 8:
+                score += 5.0
+            elif age_hours <= self.SEMANTIC_HISTORY_LOOKBACK_HOURS:
+                score += 2.0
+            elif age_hours > self.SEMANTIC_HISTORY_LOOKBACK_HOURS:
+                score -= 8.0
+
+        current_attack = self._event_is_physical_attack(event)
+        history_attack = self._looks_like_attack_text(history_text)
+        if current_attack:
+            if not history_attack:
+                score -= 25.0
+            elif not self._attack_same_story_anchor_match(
+                current_text,
+                history_text,
+            ):
+                # Різні удари мають майже не потрапляти в semantic-review.
+                score *= 0.30
+
+        if (
+            shared_entities
+            and shared_topics
+            and len(shared_story) >= 2
+        ):
+            score += 10.0
+
+        return round(max(0.0, score), 2)
+
+    def _semantic_review_source_excerpt(
+        self,
+        event: Dict[str, Any],
+        posts: List[Dict[str, Any]],
+    ) -> str:
+        chunks = []
+        total = 0
+        for source_id in self._valid_source_ids(event.get("source_ids"), posts)[:3]:
+            text = re.sub(
+                r"\s+",
+                " ",
+                str(posts[source_id].get("text") or "").strip(),
+            )
+            if not text:
+                continue
+            text = self._truncate_plain_text(text, 850)
+            if total + len(text) > 1800:
+                break
+            chunks.append(text)
+            total += len(text)
+        return " | ".join(chunks)
+
+    def _apply_semantic_history_review(
+        self,
+        events: List[Dict[str, Any]],
+        posts: List[Dict[str, Any]],
+        past_events: Optional[
+            Union[
+                List[str],
+                List[Dict[str, str]],
+            ]
+        ],
+        max_retries: int,
+    ) -> List[Dict[str, Any]]:
+        """
+        Точковий LLM-adjudicator для семантичних дублів.
+
+        Він НЕ сканує весь архів моделлю. Python спочатку вибирає 1-3
+        найімовірніші history-кандидати. Це дешево, прозоро в логах і дає
+        моделі саме ту задачу, де lexical matcher найслабший: "та сама базова
+        історія чи справді нова подія?".
+        """
+        if not self.SEMANTIC_HISTORY_REVIEW_ENABLED or not events:
+            return events
+
+        history_entries = self._prepare_history_entries(past_events)
+        if not history_entries:
+            return events
+
+        result = [dict(ev) for ev in events if isinstance(ev, dict)]
+        cases = []
+        case_map: Dict[str, Dict[str, Any]] = {}
+
+        for event_index, event in enumerate(result):
+            if event.get("history_semantic_reviewed"):
+                continue
+
+            source_ids = self._valid_source_ids(event.get("source_ids"), posts)
+            if any(posts[s].get("is_priority") for s in source_ids):
+                event["history_semantic_reviewed"] = True
+                continue
+
+            forced_title = str(event.get("history_match_title") or "").strip()
+            forced_summary = str(event.get("history_match_summary") or "").strip()
+
+            scored = []
+            for history_index, history in enumerate(history_entries):
+                age_hours = self._history_age_hours(history)
+                forced = bool(
+                    forced_title
+                    and str(history.get("title") or "").strip() == forced_title
+                    and (
+                        not forced_summary
+                        or str(history.get("summary") or "").strip() == forced_summary
+                    )
+                )
+
+                # Для дуже старих записів review не потрібен, окрім already-matched.
+                if (
+                    not forced
+                    and age_hours is not None
+                    and age_hours > self.SEMANTIC_HISTORY_LOOKBACK_HOURS
+                ):
+                    continue
+
+                score = self._history_candidate_score(event, history)
+                if forced:
+                    score = max(score, 999.0)
+
+                if (
+                    forced
+                    or score >= self.SEMANTIC_HISTORY_MIN_CANDIDATE_SCORE
+                ):
+                    scored.append((score, history_index, history))
+
+            if not scored:
+                event["history_semantic_reviewed"] = True
+                continue
+
+            scored.sort(key=lambda item: item[0], reverse=True)
+            selected = scored[: self.SEMANTIC_HISTORY_CANDIDATES_PER_EVENT]
+
+            case_id = f"C{len(cases) + 1}"
+            candidate_payload = []
+            candidate_map = {}
+            for candidate_number, (score, history_index, history) in enumerate(
+                selected,
+                start=1,
+            ):
+                candidate_id = f"H{candidate_number}"
+                candidate_payload.append({
+                    "candidate_id": candidate_id,
+                    "title": history.get("title", ""),
+                    "summary": history.get("summary", ""),
+                    "published_at": history.get("published_at", ""),
+                    "python_candidate_score": score,
+                })
+                candidate_map[candidate_id] = history
+
+            cases.append({
+                "case_id": case_id,
+                "current": {
+                    "event_id": str(event.get("event_id") or ""),
+                    "headline": str(event.get("headline_hint") or ""),
+                    "summary": str(event.get("summary") or ""),
+                    "key_facts": event.get("key_facts", []),
+                    "category": str(event.get("category") or ""),
+                    "event_type": str(event.get("event_type") or ""),
+                    "source_excerpt": self._semantic_review_source_excerpt(
+                        event,
+                        posts,
+                    ),
+                },
+                "history_candidates": candidate_payload,
+            })
+            case_map[case_id] = {
+                "event_index": event_index,
+                "candidate_map": candidate_map,
+                "previous_method": str(event.get("history_match_method") or ""),
+            }
+
+            if len(cases) >= self.SEMANTIC_HISTORY_REVIEW_MAX_EVENTS:
+                break
+
+        # Все, що не потрапило в batch через limit/відсутність кандидатів,
+        # буде перевірене в наступному циклі. Позначаємо reviewed лише cases.
+        if not cases:
+            return result
+
+        payload = json.dumps(cases, ensure_ascii=False)
+        prompt = f"""
+Ти — вузький semantic-dedup суддя новинного дайджесту.
+
+Для кожного case порівняй CURRENT лише з його HISTORY_CANDIDATES.
+Треба визначити, чи це ТА САМА БАЗОВА ІСТОРІЯ, а не просто схожа тема.
+
+SAME_STORY=true, якщо це той самий:
+- інцидент / атака / аварія;
+- офіційний звіт або розслідування;
+- дослідження;
+- оголошення / рішення / угода;
+- операція;
+- конкретний бізнес/технологічний сюжет.
+
+НЕ Є НОВОЮ ПОДІЄЮ:
+- інший заголовок або інше джерело;
+- нове фото/відео;
+- інший кут подачі;
+- розширений список деталей, методів, можливостей або прикладів із того самого
+  первинного звіту/розслідування;
+- переказ того самого факту іншими словами.
+
+КРИТИЧНО ДЛЯ АТАК:
+Той самий нападник, тип зброї, область теми або близький час НЕ достатні.
+SAME_STORY=true лише якщо це та сама конкретна локація/ціль/хвиля атаки
+або інша чітка унікальна прив'язка. Звягель ≠ Луцьк. Рівненщина ≠ будь-яка
+інша атака на заході лише через схожі слова.
+
+MATERIAL_UPDATE=true лише коли ПІСЛЯ попередньої публікації з'явився факт,
+який реально змінює картину: нові значні жертви/наслідки, нове офіційне
+рішення або юридичний статус, підтверджений результат операції, новий великий
+об'єкт/результат, фактичний запуск/набуття чинності тощо.
+
+НЕ MATERIAL_UPDATE:
+- більше деталей із того самого звіту;
+- новий список способів застосування тієї самої технології;
+- інше формулювання;
+- нова цитата без рішення;
+- +1 дрібне уточнення, яке не змінює значення історії.
+
+Якщо SAME_STORY=false: material_update=false, update_strength=0.
+Якщо SAME_STORY=true і MATERIAL_UPDATE=false: update_strength від 0 до 79.
+Якщо SAME_STORY=true і MATERIAL_UPDATE=true: update_strength від 80 до 100.
+Обери максимум ОДИН history candidate на case — найкращий збіг.
+
+ВІДПОВІДЬ ТІЛЬКИ JSON:
+{{
+  "decisions": [
+    {{
+      "case_id": "C1",
+      "same_story": true,
+      "matched_candidate_id": "H1",
+      "material_update": false,
+      "update_strength": 20,
+      "reason": "Коротко, який саме базовий сюжет збігається або чому ні."
+    }}
+  ]
+}}
+
+CASES:
+{payload}
+"""
+
+        data = self._call_json_with_cascade(
+            prompt,
+            max_retries,
+            "HISTORY_REVIEW",
+            temperature=0.05,
+        )
+
+        decisions = (
+            data.get("decisions", [])
+            if data and isinstance(data.get("decisions"), list)
+            else []
+        )
+        decision_map = {
+            str(item.get("case_id") or ""): item
+            for item in decisions
+            if isinstance(item, dict) and item.get("case_id")
+        }
+
+        reviewed_count = 0
+        matched_count = 0
+        cleared_soft_count = 0
+
+        for case in cases:
+            case_id = case["case_id"]
+            meta = case_map[case_id]
+            event = result[meta["event_index"]]
+            event["history_semantic_reviewed"] = True
+            reviewed_count += 1
+
+            decision = decision_map.get(case_id)
+            if not decision:
+                continue
+
+            same_story = bool(decision.get("same_story", False))
+            candidate_id = str(decision.get("matched_candidate_id") or "")
+            matched_history = meta["candidate_map"].get(candidate_id)
+
+            if not same_story or matched_history is None:
+                # LLM може виправити лише SOFT deterministic match. Exact/hard
+                # lexical match не скасовуємо одним модельним рішенням.
+                if meta["previous_method"] in {
+                    "recent_attack_continuation",
+                    "semantic_anchor",
+                }:
+                    event["is_history_repeat"] = False
+                    event["history_hard_duplicate"] = False
+                    event["history_update_strength"] = 0
+                    event["history_material_update"] = None
+                    for key in [
+                        "history_match_method",
+                        "history_match_title",
+                        "history_match_summary",
+                        "history_match_published_at",
+                    ]:
+                        event.pop(key, None)
+                    cleared_soft_count += 1
+                continue
+
+            material_update = bool(decision.get("material_update", False))
+            update_strength = self._safe_score(decision.get("update_strength"))
+            if material_update:
+                update_strength = max(
+                    float(self.HISTORY_SIGNIFICANT_UPDATE_MIN),
+                    update_strength,
+                )
+            else:
+                update_strength = min(
+                    update_strength,
+                    float(self.HISTORY_SIGNIFICANT_UPDATE_MIN - 1),
+                )
+
+            event["is_history_repeat"] = True
+            # Hard flag зберігаємо лише якщо його вже дав сильний deterministic
+            # matcher. Semantic-review сам по собі не робить безумовний hard block.
+            event["history_hard_duplicate"] = bool(
+                event.get("history_hard_duplicate", False)
+            )
+            event["history_match_method"] = "semantic_llm_review"
+            event["history_match_title"] = matched_history.get("title", "")
+            event["history_match_summary"] = matched_history.get("summary", "")
+            event["history_match_published_at"] = matched_history.get(
+                "published_at",
+                "",
+            )
+            event["history_update_strength"] = update_strength
+            event["history_material_update"] = material_update
+            event["history_review_reason"] = str(
+                decision.get("reason") or ""
+            ).strip()[:300]
+            matched_count += 1
+
+            logger.info(
+                "Semantic history review: event_id=%s same_story=True "
+                "material_update=%s update=%.0f matched='%s'.",
+                event.get("event_id"),
+                material_update,
+                update_strength,
+                str(matched_history.get("title") or "")[:120],
+            )
+
+        logger.info(
+            "Semantic history review: cases=%s matched=%s cleared_soft=%s.",
+            reviewed_count,
+            matched_count,
+            cleared_soft_count,
+        )
 
         return result
 
