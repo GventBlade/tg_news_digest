@@ -68,6 +68,10 @@ class NewsSummarizer:
     # одразу вдруге. Це окрема жорстка страховка саме від сусідніх випусків.
     ADJACENT_DUPLICATE_LOCK_HOURS = 6.5
 
+    # Агреговане зведення Повітряних сил / ППО зі статистикою збитих
+    # ракет і БпЛА показуємо не частіше одного разу на добу.
+    DAILY_AIR_DEFENSE_SUMMARY_LOCK_HOURS = 24.0
+
     # Повтор старої історії повертаємо у дайджест лише при справді
     # великому розвитку. 60 виявилося занадто м'яким порогом: модель
     # могла вважати +1 пораненого або кілька локальних пошкоджень
@@ -1362,6 +1366,14 @@ TELEGRAM POSTS FOR DISCOVERY SEARCH:
 Для атак НЕ склеюй різні удари лише тому, що в них той самий нападник,
 тип зброї або загальна тема. Для однієї атаки мають збігатися конкретна
 локація/ціль/хвиля атаки або інша унікальна прив'язка події.
+
+ОКРЕМЕ ПРАВИЛО ДЛЯ ЗВЕДЕНЬ ППО / ПОВІТРЯНИХ СИЛ:
+агреговану статистику на кшталт "запущено N БпЛА/ракет, збито або подавлено M"
+показуй не частіше ОДНОГО РАЗУ НА 24 ГОДИНИ. Нова хвиля, інші цифри або
+оновлене вечірнє зведення самі по собі не виправдовують ще одну таку новину
+того ж дня. Це правило НЕ стосується окремої події з великими жертвами,
+ударом по критичному/стратегічному об'єкту, значним міжнародним контекстом
+або іншим самостійно важливим наслідком.
 
 Якщо подія вже є в архіві:
 - is_history_repeat=true;
@@ -2840,6 +2852,77 @@ MANUAL POSTS:
         return bool(self._strong_attack_signal_set(text))
 
     @staticmethod
+    def _looks_like_air_defense_summary_text(text: str) -> bool:
+        """Чи схожий текст саме на агреговане статистичне зведення ППО."""
+        t = NewsSummarizer._normalize_similarity_text(text)
+        if not t:
+            return False
+
+        defense_markers = (
+            "ппо", "повітряні сили", "протиповітрян",
+            "повітряних ціл", "повітряні цілі",
+        )
+        weapon_markers = (
+            "бпла", "дрон", "шахед", "ракет",
+            "засоб ураж", "повітрян ціл",
+        )
+        result_markers = (
+            "збито", "збили", "знищено", "подавлено",
+            "знешкоджено", "перехоплено", "відбила атаку",
+            "відбили атаку", "знищили", "подавили",
+        )
+
+        return (
+            any(marker in t for marker in defense_markers)
+            and any(marker in t for marker in weapon_markers)
+            and any(marker in t for marker in result_markers)
+            and bool(re.search(r"\b\d{1,4}\b", t))
+        )
+
+    def _is_air_defense_summary_event(
+        self,
+        ev: Dict[str, Any],
+        posts: List[Dict[str, Any]],
+    ) -> bool:
+        text = self._event_source_text_bundle(ev, posts)
+        if not self._looks_like_air_defense_summary_text(text):
+            return False
+
+        # Великий самостійний наслідок — уже окрема новина, а не просто зведення.
+        if self._has_strong_attack_consequence(text):
+            return False
+        if self._has_strategic_attack_context(ev, posts):
+            return False
+        return True
+
+    def _is_recent_air_defense_summary_duplicate(
+        self,
+        event: Dict[str, Any],
+        posts: List[Dict[str, Any]],
+        history: Dict[str, str],
+    ) -> bool:
+        """Добова редакційна квота: максимум одне агреговане зведення ППО."""
+        age_hours = self._history_age_hours(history)
+        if (
+            age_hours is None
+            or age_hours > self.DAILY_AIR_DEFENSE_SUMMARY_LOCK_HOURS
+        ):
+            return False
+
+        if not self._is_air_defense_summary_event(event, posts):
+            return False
+
+        history_text = " ".join(
+            value
+            for value in [
+                str(history.get("title") or ""),
+                str(history.get("summary") or ""),
+            ]
+            if value
+        )
+        return self._looks_like_air_defense_summary_text(history_text)
+
+    @staticmethod
     def _strategic_geopolitical_signal(text: str) -> bool:
         """
         Консервативний сигнал геополітичної ваги БЕЗ прив'язки до жертв.
@@ -3180,8 +3263,21 @@ MANUAL POSTS:
                 strategic_attack_context = (
                     self._has_strategic_attack_context(ev, posts)
                 )
+                daily_air_defense_locked = bool(
+                    ev.get("daily_air_defense_summary_locked", False)
+                )
 
                 if not is_priority:
+                    if daily_air_defense_locked:
+                        rejected["history_repeat"] += 1
+                        logger.info(
+                            "Daily air-defense summary blocked for 24h: "
+                            "event_id=%s matched='%s'.",
+                            ev.get("event_id"),
+                            str(ev.get("history_match_title") or "")[:120],
+                        )
+                        continue
+
                     if (
                         history_hard_duplicate
                         and not self._repeat_update_is_substantial(ev)
@@ -3729,7 +3825,10 @@ discovery-блок.
 1. Не повторюй одну реальну подію двічі.
 2. Якщо подія вже була в архіві, включай її знову лише коли кандидат
    містить реально значущий новий розвиток.
-3. Не додавай відверто слабку подію тільки для заповнення кількості.
+3. Агреговане зведення ППО / Повітряних сил зі статистикою збитих ракет
+   і БпЛА — максимум одне за 24 години. Інші цифри пізніше того ж дня
+   не роблять його новою окремою новиною.
+4. Не додавай відверто слабку подію тільки для заповнення кількості.
 4. Не вигадуй факти.
 5. Не використовуй чутки.
 6. Не оцінюй важливість за довжиною початкового Telegram-посту.
@@ -5918,8 +6017,20 @@ discovery-блок.
             matched_history: Optional[Dict[str, str]] = None
             hard_duplicate = False
             match_method = ""
+            daily_air_defense_locked = False
 
             for history in history_entries:
+                if self._is_recent_air_defense_summary_duplicate(
+                    event,
+                    posts,
+                    history,
+                ):
+                    matched_history = history
+                    hard_duplicate = True
+                    daily_air_defense_locked = True
+                    match_method = "daily_air_defense_summary_24h"
+                    break
+
                 if self._is_recent_hard_duplicate(event, history):
                     matched_history = history
                     hard_duplicate = True
@@ -5950,6 +6061,9 @@ discovery-блок.
                 )
                 event["is_history_repeat"] = True
                 event["history_hard_duplicate"] = hard_duplicate
+                event["daily_air_defense_summary_locked"] = (
+                    daily_air_defense_locked
+                )
                 event["history_match_method"] = match_method
                 event["history_match_title"] = matched_history.get(
                     "title",
@@ -6316,6 +6430,11 @@ CASES:
             matched_history = meta["candidate_map"].get(candidate_id)
 
             if not same_story or matched_history is None:
+                # Добова квота ППО — редакційне правило, а не semantic guess.
+                # HISTORY_REVIEW не має права її скасувати.
+                if event.get("daily_air_defense_summary_locked"):
+                    continue
+
                 # LLM може виправити лише SOFT deterministic match. Exact/hard
                 # lexical match не скасовуємо одним модельним рішенням.
                 if meta["previous_method"] in {
