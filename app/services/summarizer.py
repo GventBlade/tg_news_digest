@@ -99,6 +99,13 @@ class NewsSummarizer:
 
     MAX_EVENT_SOURCE_CHARS = 3000
 
+    # Геополітично чутливі інциденти без жертв не можна автоматично
+    # прирівнювати до "рутинного обстрілу". Наприклад, якщо під час атаки
+    # поруч перебуває міжнародна делегація / політики найвищого рівня,
+    # або інцидент створює прямий ризик ескалації біля кордону НАТО.
+    STRATEGIC_CONTEXT_ANALYZER_BONUS = 36.0
+    STRATEGIC_CONTEXT_RANK_BONUS = 14.0
+
     # Дозволяємо трохи більше контексту й 3-6 повних речень.
     MAX_NEWS_CHARS = 900
 
@@ -336,7 +343,7 @@ class NewsSummarizer:
         ):
             logger.info(
                 "RANK #%s: %.2f | %s | role=%s | priority=%s | "
-                "cur=%.0f | practical=%.0f | %s",
+                "strategic=%s | cur=%.0f | practical=%.0f | %s",
                 idx,
                 float(
                     event.get(
@@ -348,6 +355,7 @@ class NewsSummarizer:
                 event.get("event_type", "other"),
                 self._event_digest_role(event),
                 bool(event.get("is_priority")),
+                bool(event.get("strategic_attack_context")),
                 float(event.get("curiosity", 0) or 0),
                 float(event.get("practical_value", 0) or 0),
                 event.get(
@@ -592,6 +600,16 @@ class NewsSummarizer:
                 )
                 * tier_mult
             )
+
+            # Не даємо короткій, але геополітично чутливій новині загубитися
+            # ще ДО Analyzer через нижчі перегляди/менший source tier.
+            # Це лише бонус доступу до контексту, а не автоматична публікація.
+            if (
+                not is_priority
+                and self._looks_like_attack_text(text)
+                and self._strategic_geopolitical_signal(text)
+            ):
+                score += self.STRATEGIC_CONTEXT_ANALYZER_BONUS
 
             prepared.append({
                 "idx": idx,
@@ -1447,6 +1465,28 @@ eligible_for_digest=true став, якщо подія має хоча б оди
 - плітки про знаменитостей;
 - контент, єдина цінність якого — шок або емоція.
 
+КРИТИЧНИЙ ВИНЯТОК ДЛЯ АТАК БЕЗ ЖЕРТВ:
+
+"Немає загиблих/поранених/великих руйнувань" НЕ означає автоматично
+"рутинна й неважлива атака".
+
+Не відкидай подію як routine_attack, якщо сам контекст створює високу
+політичну, дипломатичну, військову або міжнародну значущість. Зокрема:
+- під час атаки у зоні прямого ризику перебували президенти, прем'єри,
+  канцлери, міністри, члени офіційних делегацій, радники керівників держав
+  або інші політики/посадовці світового рівня;
+- атака безпосередньо зачепила міжнародний потяг, делегацію, дипломатичний
+  маршрут чи інший об'єкт, пов'язаний із такими особами;
+- інцидент стався біля кордону НАТО/ЄС або містить реальний ризик
+  міжнародної ескалації;
+- незвичайне поєднання місця, цілі та присутніх осіб саме по собі робить
+  подію важливою для України та міжнародної аудиторії.
+
+У таких випадках оцінюй significance за КОНТЕКСТОМ, а не за кількістю жертв:
+importance, public_interest, national_relevance та urgency можуть бути високими.
+Такі події зазвичай мають digest_role="core". Не завищуй оцінки механічно,
+але й не карай їх за відсутність фізичних наслідків.
+
 Для атак допускай подію, якщо:
 - атака масована або комбінована;
 - є значна кількість жертв;
@@ -1456,6 +1496,11 @@ eligible_for_digest=true став, якщо подія має хоча б оди
 - пошкоджено важливий промисловий, логістичний або великий комерційний об'єкт
   і це має помітне ширше значення;
 - подія має винятковий характер;
+- у зоні прямого ризику перебували світові політики, офіційна міжнародна
+  делегація або інші високопосадовці, і цей факт має самостійну
+  геополітичну/дипломатичну вагу навіть без жертв;
+- інцидент біля кордону НАТО/ЄС або на міжнародному транспорті створює
+  реальний контекст можливої ескалації чи міжнародного резонансу;
 - з'явився суттєвий новий розвиток уже відомої великої атаки.
 
 ━━━━━━━━━━━━━━━━━━━━
@@ -2794,6 +2839,93 @@ MANUAL POSTS:
             return True
         return bool(self._strong_attack_signal_set(text))
 
+    @staticmethod
+    def _strategic_geopolitical_signal(text: str) -> bool:
+        """
+        Консервативний сигнал геополітичної ваги БЕЗ прив'язки до жертв.
+
+        Важливо не зробити винятком кожну згадку Польщі/НАТО. Тому для
+        звичайного випадку вимагаємо одночасно:
+        1) високопоставлену особу / офіційну делегацію;
+        2) міжнародний або прикордонний контекст;
+        3) ознаку прямої присутності/ризику під час інциденту.
+
+        Окремо пропускаємо явний факт порушення/ризику на території НАТО.
+        """
+        t = NewsSummarizer._normalize_similarity_text(text)
+        if not t:
+            return False
+
+        high_profile = (
+            "президент", "прем єр", "прем'єр", "премєр",
+            "канцлер", "глава уряду", "керівник держав",
+            "міністр", "радник канцлер", "радники канцлер",
+            "радник президент", "радники президент",
+            "офіційн делегац", "урядов делегац",
+            "дипломатичн делегац", "європейськ лідер",
+            "світов лідер", "високопосадов",
+        )
+        international_context = (
+            "нато", "єс", "євросоюз", "польщ", "румун",
+            "словач", "угорщ", "литв", "латві", "естон",
+            "кордон", "прикордон", "міжнародн потяг",
+            "міжнародн поїзд", "делегац", "дипломатичн маршрут",
+        )
+        direct_risk = (
+            "під час атак", "на момент атак", "у момент атак",
+            "під час удар", "на момент удар", "у момент удар",
+            "перебував", "перебували", "знаходився", "знаходилися",
+            "був у потяз", "були у потяз", "був у поїзд", "були у поїзд",
+            "біля кордон", "поблизу кордон", "поруч",
+            "у зоні ризик", "на борту",
+        )
+
+        has_high_profile = any(marker in t for marker in high_profile)
+        has_international = any(
+            marker in t for marker in international_context
+        )
+        has_direct_risk = any(marker in t for marker in direct_risk)
+
+        if has_high_profile and has_international and has_direct_risk:
+            return True
+
+        # Сильний окремий сигнал потенційної міждержавної ескалації.
+        nato_escalation = (
+            ("нато" in t or "польщ" in t or "румун" in t)
+            and any(
+                marker in t
+                for marker in (
+                    "перетнув кордон", "перетнули кордон",
+                    "повітрян простір", "залетів", "залетіли",
+                    "впав на територ", "влучив на територ",
+                    "удар по територ", "атака на територ",
+                )
+            )
+        )
+        return nato_escalation
+
+    def _event_source_text_bundle(
+        self,
+        ev: Dict[str, Any],
+        posts: List[Dict[str, Any]],
+    ) -> str:
+        chunks = [self._event_text_bundle(ev)]
+        for source_id in self._valid_source_ids(ev.get("source_ids"), posts)[:6]:
+            text = str(posts[source_id].get("text") or "").strip()
+            if text:
+                chunks.append(text[:1800])
+        return " ".join(chunk for chunk in chunks if chunk)
+
+    def _has_strategic_attack_context(
+        self,
+        ev: Dict[str, Any],
+        posts: List[Dict[str, Any]],
+    ) -> bool:
+        text = self._event_source_text_bundle(ev, posts)
+        if not self._looks_like_attack_text(text):
+            return False
+        return self._strategic_geopolitical_signal(text)
+
     def _is_low_value_attack_event(
         self,
         ev: Dict[str, Any],
@@ -2809,8 +2941,14 @@ MANUAL POSTS:
         if str(ev.get("category") or "") != "war":
             return False
 
-        text = self._event_text_bundle(ev)
+        text = self._event_source_text_bundle(ev, posts)
         if not self._looks_like_attack_text(text):
+            return False
+
+        # Геополітично чутлива атака не є "low-value" лише через 0 жертв.
+        # Напр., міжнародний потяг із політиками світового рівня біля
+        # польського кордону під час російської атаки.
+        if self._has_strategic_attack_context(ev, posts):
             return False
 
         if self._has_strong_attack_consequence(text):
@@ -3039,6 +3177,10 @@ MANUAL POSTS:
                     ev.get("history_update_strength")
                 )
 
+                strategic_attack_context = (
+                    self._has_strategic_attack_context(ev, posts)
+                )
+
                 if not is_priority:
                     if (
                         history_hard_duplicate
@@ -3052,9 +3194,25 @@ MANUAL POSTS:
                         )
                         continue
 
-                    if not eligible:
+                    if not eligible and not strategic_attack_context:
                         rejected["ineligible"] += 1
                         continue
+                    elif not eligible and strategic_attack_context:
+                        # Детермінована страховка: модель могла назвати атаку
+                        # "рутинною" лише через відсутність жертв. Якщо сирі
+                        # source-тексти містять сильний геополітичний контекст,
+                        # не втрачаємо подію до ранжування.
+                        eligible = True
+                        logger.info(
+                            "Strategic-context override: event_id=%s "
+                            "ineligible->eligible headline='%s'.",
+                            ev.get("event_id"),
+                            str(
+                                ev.get("headline_hint")
+                                or ev.get("summary")
+                                or ""
+                            )[:120],
+                        )
 
                     if event_type in HARD_REJECT_EVENT_TYPES:
                         rejected["hard_reject"] += 1
@@ -3115,6 +3273,9 @@ MANUAL POSTS:
                     pub,
                 )
 
+                if strategic_attack_context:
+                    digest_role = "core"
+
                 discovery_qualified = (
                     digest_role == "discovery"
                     and (
@@ -3147,7 +3308,8 @@ MANUAL POSTS:
                     and event_type in LOW_VALUE_EVENT_TYPES
                 ):
                     hot_exception = (
-                        imp >= 70
+                        strategic_attack_context
+                        or imp >= 70
                         or national >= 70
                         or cur >= 82
                         or practical >= 82
@@ -3207,8 +3369,15 @@ MANUAL POSTS:
 
                 score += min(len(src_ids) * 1.2, 6)
 
+                # Окремий редакційний бонус за геополітичний контекст.
+                # Він не робить подію "важливою" з повітря: спрацьовує лише
+                # за консервативним pattern із source-тексту.
+                if strategic_attack_context:
+                    score += self.STRATEGIC_CONTEXT_RANK_BONUS
+
                 meaningful_event = (
-                    imp >= 60
+                    strategic_attack_context
+                    or imp >= 60
                     or national >= 60
                     or pub >= 65
                     or urgency >= 75
@@ -3338,6 +3507,7 @@ MANUAL POSTS:
                     "media_quality": med,
                     "national_relevance": national,
                     "urgency": urgency,
+                    "strategic_attack_context": strategic_attack_context,
                     "editorial_score": editorial_score,
                     "raw_score": round(score, 2),
                 })
@@ -3573,6 +3743,10 @@ discovery-блок.
     навіть якщо її стратегічна IMPORTANCE нижча.
 12. Високий PRACTICAL_VALUE означає, що подія корисна людям
     і теж може виправдано потрапити у фінальний список.
+13. Для атак не оцінюй вагу лише за жертвами/руйнуваннями. Якщо у зоні
+    прямого ризику були світові політики, міжнародна делегація або інцидент
+    має чіткий контекст НАТО/ЄС/міжнародної ескалації, така подія може бути
+    сильнішою за звичайну science/discovery-новину навіть без постраждалих.
 
 ━━━━━━━━━━━━━━━━━━━━
 ВИМОГИ ДО ТЕКСТУ:
