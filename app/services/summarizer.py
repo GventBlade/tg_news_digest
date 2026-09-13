@@ -3555,6 +3555,7 @@ MANUAL POSTS:
                 media_source = self._select_media_source(
                     src_ids,
                     posts,
+                    ev,
                     ev.get("best_media_source_id"),
                 )
 
@@ -4836,8 +4837,19 @@ discovery-блок.
         self,
         source_ids: List[int],
         posts: List[Dict[str, Any]],
+        event: Dict[str, Any],
         preferred_id: Any = None,
     ) -> Optional[int]:
+        """
+        Обирає media-source лише серед текстово сумісних source-постів.
+
+        Це перша лінія захисту від чужого фото: якщо Analyzer випадково
+        об'єднав два близькі сюжети або запропонував медіа з поста, текст
+        якого слабко відповідає конкретній події, такий source не беремо.
+
+        ВАЖЛИВО: ця перевірка не бачить сам піксельний вміст картинки.
+        Остаточну перевірку зображення виконує NewsPublisher перед публікацією.
+        """
         media_ids = [
             s
             for s in source_ids
@@ -4850,18 +4862,73 @@ discovery-блок.
         if not media_ids:
             return None
 
-        if (
-            isinstance(preferred_id, int)
-            and preferred_id in media_ids
-        ):
-            return preferred_id
+        event_text = self._event_text_bundle(event)
 
-        return max(
-            media_ids,
-            key=lambda s: self._media_source_score(
-                posts[s]
-            ),
+        scored: List[tuple] = []
+        for source_id in media_ids:
+            post_text = str(posts[source_id].get("text") or "").strip()
+            relevance = self._media_text_relevance(event_text, post_text)
+            score = self._media_source_score(posts[source_id])
+
+            # Низька текстова релевантність означає ризик, що джерело
+            # стосується іншого сюжету. Не забороняємо дуже короткі пости,
+            # але даємо їм пройти лише якщо є хоча б мінімальний збіг.
+            if relevance < 0.10:
+                continue
+
+            score += relevance * 35.0
+
+            if source_id == preferred_id:
+                # LLM preference — лише бонус, а не безумовний override.
+                score += 8.0
+
+            scored.append((score, relevance, source_id))
+
+        if not scored:
+            logger.info(
+                "Media source rejected by text relevance: event_id=%s",
+                event.get("event_id"),
+            )
+            return None
+
+        scored.sort(reverse=True)
+        best_score, best_relevance, best_id = scored[0]
+
+        logger.info(
+            "Media source selected: event_id=%s source_id=%s relevance=%.2f score=%.2f",
+            event.get("event_id"),
+            best_id,
+            best_relevance,
+            best_score,
         )
+        return best_id
+
+    def _media_text_relevance(
+        self,
+        event_text: str,
+        post_text: str,
+    ) -> float:
+        """0..1: наскільки текст media-source відповідає event."""
+        a = self._normalize_similarity_text(event_text)
+        b = self._normalize_similarity_text(post_text)
+        if not a or not b:
+            return 0.0
+
+        stats = self._history_similarity_stats(a, b)
+        shared_entities = self._entity_signature(a) & self._entity_signature(b)
+        shared_story = self._story_signature(a) & self._story_signature(b)
+
+        entity_bonus = min(len(shared_entities), 3) * 0.08
+        story_bonus = min(len(shared_story), 8) * 0.025
+
+        score = (
+            stats["seq"] * 0.28
+            + stats["overlap"] * 0.30
+            + stats["jaccard"] * 0.22
+            + entity_bonus
+            + story_bonus
+        )
+        return max(0.0, min(1.0, score))
 
     def _factual_source_score(
         self,

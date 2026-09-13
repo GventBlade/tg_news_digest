@@ -1,5 +1,8 @@
 import asyncio
+import io
+import json
 import logging
+import mimetypes
 import re
 from pathlib import Path
 from urllib.parse import quote
@@ -10,6 +13,8 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.types import FSInputFile
 from PIL import Image, ImageOps
+from google import genai
+from google.genai import types
 
 from app.config import settings
 
@@ -32,6 +37,18 @@ class NewsPublisher:
             settings.MEDIA_BASE_URL or ""
         ).rstrip("/")
 
+        # Окрема vision-перевірка фактичного зображення перед публікацією.
+        # Це фінальна страховка від випадку, коли Telegram-пост має правильний
+        # текст, але прикріплену картинку від іншої новини.
+        self.media_validation_client = genai.Client(
+            api_key=settings.GEMINI_API_KEY
+        )
+        self.media_validation_models = [
+            "gemini-3.5-flash-lite",
+            "gemini-3.1-flash-lite",
+        ]
+        self.media_validation_fail_closed = True
+
     async def publish_telegram_post(
         self,
         text: str,
@@ -39,6 +56,40 @@ class NewsPublisher:
         media_type: str | None = None,
     ) -> bool:
         try:
+            # Фінальний media gate. Для фото аналізуємо САМЕ зображення,
+            # а не лише текст source-поста. Якщо на картинці є заголовок
+            # про іншу подію/місто/компанію — фото відкидаємо і публікуємо
+            # новину текстом. Краще без фото, ніж з оманливим фото.
+            if (
+                media_path
+                and media_type == "photo"
+                and Path(media_path).exists()
+            ):
+                verdict = await self._validate_photo_relevance(
+                    text=text,
+                    media_path=media_path,
+                )
+
+                if not verdict.get("is_relevant", False):
+                    logger.warning(
+                        "MEDIA REJECTED: path=%s confidence=%s prominent_text=%s "
+                        "conflicting_text=%s reason=%s",
+                        media_path,
+                        verdict.get("confidence"),
+                        verdict.get("has_prominent_text"),
+                        verdict.get("conflicting_text"),
+                        verdict.get("reason"),
+                    )
+                    media_path = None
+                    media_type = None
+                else:
+                    logger.info(
+                        "MEDIA OK: path=%s confidence=%s prominent_text=%s",
+                        media_path,
+                        verdict.get("confidence"),
+                        verdict.get("has_prominent_text"),
+                    )
+
             if media_path and Path(media_path).exists():
                 try:
                     if media_type == "photo":
@@ -86,6 +137,220 @@ class NewsPublisher:
                 exc_info=True,
             )
             return False
+
+    async def _validate_photo_relevance(
+        self,
+        text: str,
+        media_path: str,
+    ) -> dict:
+        """
+        Порівнює фінальний текст новини з фактичним фото через Gemini Vision.
+
+        Перевірка навмисно сувора до зображень із великим текстом:
+        якщо напис на картинці описує іншу подію, місце, компанію, людину
+        або інший сюжет — таке фото не публікується.
+        """
+        try:
+            return await asyncio.to_thread(
+                self._validate_photo_relevance_sync,
+                text,
+                media_path,
+            )
+        except Exception as e:
+            logger.error(
+                "Помилка media validation для %s: %s",
+                media_path,
+                e,
+                exc_info=True,
+            )
+            return {
+                "is_relevant": not self.media_validation_fail_closed,
+                "confidence": 0,
+                "has_prominent_text": False,
+                "conflicting_text": False,
+                "reason": f"validation_error: {e}",
+            }
+
+    def _validate_photo_relevance_sync(
+        self,
+        text: str,
+        media_path: str,
+    ) -> dict:
+        image_bytes, mime_type = self._prepare_image_for_validation(
+            media_path
+        )
+        clean_text = self._strip_html(text)
+
+        prompt = f"""
+Ти — суворий фоторедактор українського новинного Telegram-каналу.
+
+Порівняй ФАКТИЧНЕ ЗОБРАЖЕННЯ з текстом новини нижче.
+Треба вирішити, чи можна показувати це фото прямо над цією новиною.
+
+КРИТИЧНЕ ПРАВИЛО:
+якщо на зображенні є великий/помітний напис, заголовок, плашка або скриншот
+іншої новини, і цей текст стосується ІНШОЇ події, міста, країни, компанії,
+людини, об'єкта чи наслідку — is_relevant=false і conflicting_text=true.
+
+Приклад логіки: якщо новина про завод Cersanit на Житомирщині, а на фото
+великим текстом написано про Петербург, бензин і атаки на НПЗ — це НЕПРАВИЛЬНЕ
+фото, навіть якщо обидві теми побічно пов'язані з війною.
+
+МОЖНА дозволити:
+- реальне фото саме цієї події/людини/об'єкта;
+- архівне або ілюстративне фото, якщо воно очевидно про той самий об'єкт/тему
+  і НЕ вводить читача в оману;
+- логотип/будівлю/портрет, якщо вони прямо стосуються героя новини.
+
+ТРЕБА відхилити:
+- фото іншої новини;
+- картку/скриншот із заголовком про іншу подію;
+- інше місто/компанію/особу, якщо це не пояснюється текстом новини;
+- стару ілюстрацію, яка створює хибне враження про конкретний новий інцидент;
+- зображення, де помітний текст суперечить новині.
+
+Якщо не впевнений, але бачиш сильний текстовий конфлікт — ВІДХИЛЯЙ.
+Якщо фото просто нейтральне й релевантне без конфлікту — можна дозволити.
+
+НОВИНА:
+{clean_text[:1800]}
+
+Відповідь ТІЛЬКИ JSON:
+{{
+  "is_relevant": true,
+  "confidence": 0,
+  "has_prominent_text": false,
+  "conflicting_text": false,
+  "image_text_summary": "коротко, який текст видно на зображенні, якщо є",
+  "reason": "коротке пояснення рішення"
+}}
+"""
+
+        last_error = None
+        for model in self.media_validation_models:
+            try:
+                response = self.media_validation_client.models.generate_content(
+                    model=model,
+                    contents=[
+                        prompt,
+                        types.Part.from_bytes(
+                            data=image_bytes,
+                            mime_type=mime_type,
+                        ),
+                    ],
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        temperature=0.05,
+                    ),
+                )
+
+                raw = self._clean_json_response(
+                    (response.text or "").strip()
+                )
+                data = json.loads(raw)
+                if not isinstance(data, dict):
+                    raise ValueError("media validator returned non-object JSON")
+
+                is_relevant = bool(data.get("is_relevant", False))
+                conflicting_text = bool(data.get("conflicting_text", False))
+
+                # Жорстка локальна страховка: модель не може одночасно
+                # сказати "relevant" і "conflicting_text=true".
+                if conflicting_text:
+                    is_relevant = False
+
+                try:
+                    confidence = int(float(data.get("confidence", 0) or 0))
+                except (TypeError, ValueError):
+                    confidence = 0
+                confidence = max(0, min(100, confidence))
+
+                # Дуже невпевнене "так" не приймаємо для оманливих фото.
+                if is_relevant and confidence < 55:
+                    is_relevant = False
+                    data["reason"] = (
+                        str(data.get("reason") or "")
+                        + " | rejected: low confidence"
+                    ).strip()
+
+                return {
+                    "is_relevant": is_relevant,
+                    "confidence": confidence,
+                    "has_prominent_text": bool(
+                        data.get("has_prominent_text", False)
+                    ),
+                    "conflicting_text": conflicting_text,
+                    "image_text_summary": str(
+                        data.get("image_text_summary") or ""
+                    )[:300],
+                    "reason": str(data.get("reason") or "")[:500],
+                }
+
+            except Exception as e:
+                last_error = e
+                logger.warning(
+                    "Media validation failed via %s for %s: %s",
+                    model,
+                    media_path,
+                    e,
+                )
+
+        if self.media_validation_fail_closed:
+            return {
+                "is_relevant": False,
+                "confidence": 0,
+                "has_prominent_text": False,
+                "conflicting_text": False,
+                "reason": f"all_validation_models_failed: {last_error}",
+            }
+
+        return {
+            "is_relevant": True,
+            "confidence": 0,
+            "has_prominent_text": False,
+            "conflicting_text": False,
+            "reason": f"validation_skipped_after_error: {last_error}",
+        }
+
+    @staticmethod
+    def _prepare_image_for_validation(
+        media_path: str,
+    ) -> tuple[bytes, str]:
+        """
+        Нормалізує фото перед Vision: EXIF rotation, RGB, max 1600 px.
+        Це зменшує payload, але лишає достатню якість для читання написів.
+        """
+        path = Path(media_path)
+        with Image.open(path) as image:
+            image = ImageOps.exif_transpose(image).convert("RGB")
+            image.thumbnail((1600, 1600), Image.Resampling.LANCZOS)
+
+            buffer = io.BytesIO()
+            image.save(
+                buffer,
+                format="JPEG",
+                quality=88,
+                optimize=True,
+            )
+            return buffer.getvalue(), "image/jpeg"
+
+    @staticmethod
+    def _clean_json_response(text: str) -> str:
+        text = str(text or "").strip()
+        if text.startswith("```json"):
+            text = text[7:]
+        elif text.startswith("```"):
+            text = text[3:]
+        if text.endswith("```"):
+            text = text[:-3]
+        text = text.strip()
+
+        first = text.find("{")
+        last = text.rfind("}")
+        if first >= 0 and last > first:
+            text = text[first:last + 1]
+
+        return re.sub(r",\s*([}\]])", r"\1", text).strip()
 
     def create_public_media_url(
         self,

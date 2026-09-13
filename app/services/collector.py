@@ -38,7 +38,10 @@ class NewsCollector:
         - не відсіює короткі новини за довжиною;
         - відсіює лише повністю порожні текстові повідомлення;
         - пропускає повідомлення, які вже були опубліковані раніше;
-        - зберігає інформацію про фото/відео, engagement і час публікації.
+        - зберігає інформацію про фото/відео, engagement і час публікації;
+        - НЕ намагається оцінювати зміст картинки на етапі збору: це було б
+          дорого для сотень сирих постів. Фактична vision-перевірка фото
+          виконується у Publisher лише для вже відібраних фінальних новин.
         """
         if not self.client.is_connected():
             await self.client.start()
@@ -75,9 +78,6 @@ class NewsCollector:
                     if message.date < time_threshold:
                         break
 
-                    # Використовуємо фактичний username каналу, а не рядок
-                    # із .env. Це прибирає розбіжності після перейменувань
-                    # або різного регістру username.
                     if self.history.is_published(
                         channel_username,
                         message.id,
@@ -94,12 +94,6 @@ class NewsCollector:
                     has_photo = bool(message.photo)
                     has_media = has_photo or has_video
 
-                    # Довжина тексту не є критерієм якості новини.
-                    # Короткий пост може бути важливою гарячою новиною.
-                    #
-                    # Порожні медіапости без підпису поки не передаємо
-                    # Analyzer, оскільки він аналізує текст і метадані,
-                    # а не вміст самого зображення/відео.
                     if not text:
                         continue
 
@@ -131,6 +125,9 @@ class NewsCollector:
                         "media_size": self._get_media_size(message),
                         "date": message.date,
                         "is_priority": False,
+                        # Корисно для логів/майбутньої роботи з альбомами.
+                        # Поточний pipeline лишається повністю сумісним.
+                        "media_group_id": getattr(message, "grouped_id", None),
                     })
 
             except Exception as e:
