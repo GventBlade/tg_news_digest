@@ -556,11 +556,48 @@ async def process_and_publish_news_cycle():
                         f"для новини #{index}: {dl_err}"
                     )
 
+            # ЄДИНИЙ media-gate для ОБОХ платформ.
+            # Раніше publish_telegram_post() відхиляв неправильне фото
+            # тільки локально для Telegram, але main.py все одно додавав
+            # початковий media_path до Instagram-каруселі. Через це фото,
+            # яке Gemini правильно відхилив для Telegram, могло потрапити
+            # в Instagram. Тепер verdict отримуємо ДО публікації й, якщо
+            # медіа нерелевантне, прибираємо його для всього пайплайна.
+            if (
+                media_path
+                and media_type in {"photo", "video"}
+            ):
+                media_verdict = (
+                    await publisher.validate_media_for_news(
+                        text=item["text"],
+                        media_path=media_path,
+                        media_type=media_type,
+                    )
+                )
+
+                if not media_verdict.get(
+                    "is_relevant",
+                    False,
+                ):
+                    logger.warning(
+                        "MEDIA DROPPED FOR ALL PLATFORMS: "
+                        "news_index=%s path=%s type=%s reason=%s",
+                        index,
+                        media_path,
+                        media_type,
+                        media_verdict.get("reason", ""),
+                    )
+                    media_path = None
+                    media_type = None
+
             published = (
                 await publisher.publish_telegram_post(
                     text=item["text"],
                     media_path=media_path,
                     media_type=media_type,
+                    # Уже перевірили вище один раз і використовуємо
+                    # той самий verdict для Telegram та Instagram.
+                    validate_media=False,
                 )
             )
 

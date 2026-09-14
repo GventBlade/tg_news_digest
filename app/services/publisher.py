@@ -54,41 +54,23 @@ class NewsPublisher:
         text: str,
         media_path: str | None = None,
         media_type: str | None = None,
+        validate_media: bool = True,
     ) -> bool:
         try:
-            # Фінальний media gate. Для фото аналізуємо САМЕ зображення,
-            # а не лише текст source-поста. Якщо на картинці є заголовок
-            # про іншу подію/місто/компанію — фото відкидаємо і публікуємо
-            # новину текстом. Краще без фото, ніж з оманливим фото.
-            if (
-                media_path
-                and media_type == "photo"
-                and Path(media_path).exists()
-            ):
-                verdict = await self._validate_photo_relevance(
+            # За замовчуванням метод сам захищений media-gate.
+            # main.py може передати validate_media=False, якщо вже отримав
+            # verdict через validate_media_for_news() і використовує його
+            # одночасно для Telegram та Instagram.
+            if media_path and validate_media:
+                verdict = await self.validate_media_for_news(
                     text=text,
                     media_path=media_path,
+                    media_type=media_type,
                 )
 
                 if not verdict.get("is_relevant", False):
-                    logger.warning(
-                        "MEDIA REJECTED: path=%s confidence=%s prominent_text=%s "
-                        "conflicting_text=%s reason=%s",
-                        media_path,
-                        verdict.get("confidence"),
-                        verdict.get("has_prominent_text"),
-                        verdict.get("conflicting_text"),
-                        verdict.get("reason"),
-                    )
                     media_path = None
                     media_type = None
-                else:
-                    logger.info(
-                        "MEDIA OK: path=%s confidence=%s prominent_text=%s",
-                        media_path,
-                        verdict.get("confidence"),
-                        verdict.get("has_prominent_text"),
-                    )
 
             if media_path and Path(media_path).exists():
                 try:
@@ -137,6 +119,78 @@ class NewsPublisher:
                 exc_info=True,
             )
             return False
+
+    async def validate_media_for_news(
+        self,
+        text: str,
+        media_path: str | None,
+        media_type: str | None,
+    ) -> dict:
+        """
+        Єдина перевірка медіа перед публікацією на будь-якій платформі.
+
+        Фото проходять Gemini Vision-перевірку. Відео поки не аналізуємо
+        покадрово, тому зберігаємо попередню поведінку й дозволяємо їх,
+        якщо файл існує. Результат цього методу треба використовувати
+        одночасно для Telegram та Instagram.
+        """
+        if not media_path or not Path(media_path).exists():
+            return {
+                "is_relevant": False,
+                "confidence": 0,
+                "has_prominent_text": False,
+                "conflicting_text": False,
+                "reason": "media_file_missing",
+                "media_type": media_type,
+            }
+
+        if media_type == "photo":
+            verdict = await self._validate_photo_relevance(
+                text=text,
+                media_path=media_path,
+            )
+            verdict["media_type"] = "photo"
+
+            if not verdict.get("is_relevant", False):
+                logger.warning(
+                    "MEDIA REJECTED: path=%s confidence=%s prominent_text=%s "
+                    "conflicting_text=%s reason=%s",
+                    media_path,
+                    verdict.get("confidence"),
+                    verdict.get("has_prominent_text"),
+                    verdict.get("conflicting_text"),
+                    verdict.get("reason"),
+                )
+            else:
+                logger.info(
+                    "MEDIA OK: path=%s confidence=%s prominent_text=%s",
+                    media_path,
+                    verdict.get("confidence"),
+                    verdict.get("has_prominent_text"),
+                )
+
+            return verdict
+
+        if media_type == "video":
+            # Поточний Vision-gate створений для фото. Не змінюємо
+            # поведінку відео цим невеликим патчем.
+            return {
+                "is_relevant": True,
+                "confidence": 100,
+                "has_prominent_text": False,
+                "conflicting_text": False,
+                "reason": "video_validation_not_enabled",
+                "media_type": "video",
+            }
+
+        return {
+            "is_relevant": False,
+            "confidence": 0,
+            "has_prominent_text": False,
+            "conflicting_text": False,
+            "reason": f"unsupported_media_type: {media_type}",
+            "media_type": media_type,
+        }
 
     async def _validate_photo_relevance(
         self,
