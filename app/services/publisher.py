@@ -215,10 +215,13 @@ class NewsPublisher:
 НОВИНА:
 {clean_text[:1800]}
 
+confidence — ЦІЛЕ ЧИСЛО ВІД 0 ДО 100, де 100 = повна впевненість.
+Не використовуй шкалу 0-1.
+
 Відповідь ТІЛЬКИ JSON:
 {{
   "is_relevant": true,
-  "confidence": 0,
+  "confidence": 95,
   "has_prominent_text": false,
   "conflicting_text": false,
   "image_text_summary": "коротко, який текст видно на зображенні, якщо є",
@@ -259,13 +262,24 @@ class NewsPublisher:
                 if conflicting_text:
                     is_relevant = False
 
+                # Gemini іноді повертає confidence у шкалі 0-1, навіть
+                # коли ми просимо 0-100. Раніше int(0.95) перетворювався
+                # на 0, через що правильні фото помилково відкидалися.
                 try:
-                    confidence = int(float(data.get("confidence", 0) or 0))
+                    raw_confidence = float(
+                        data.get("confidence", 0) or 0
+                    )
                 except (TypeError, ValueError):
-                    confidence = 0
+                    raw_confidence = 0.0
+
+                if 0.0 <= raw_confidence <= 1.0:
+                    raw_confidence *= 100.0
+
+                confidence = int(round(raw_confidence))
                 confidence = max(0, min(100, confidence))
 
-                # Дуже невпевнене "так" не приймаємо для оманливих фото.
+                # Дуже невпевнене "так" все ще не приймаємо, але тепер
+                # confidence спочатку нормалізований до єдиної шкали 0-100.
                 if is_relevant and confidence < 55:
                     is_relevant = False
                     data["reason"] = (
