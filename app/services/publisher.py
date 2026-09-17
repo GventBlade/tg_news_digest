@@ -475,6 +475,19 @@ confidence — ЦІЛЕ ЧИСЛО ВІД 0 ДО 100, де 100 = повна вп
             timeout=timeout
         ) as session:
             try:
+                # Важливо: якщо медіа лише одне, НЕ створюємо для нього
+                # carousel-child. Раніше один відеофайл спочатку йшов як
+                # is_carousel_item=true + media_type=VIDEO, хоча фактично
+                # потім мав публікуватися як одиночний пост. У Graph API
+                # одиночне feed-відео тепер треба створювати як REELS.
+                if len(filtered_items) == 1:
+                    await self._publish_single_item(
+                        session,
+                        filtered_items[0],
+                        clean_caption,
+                    )
+                    return
+
                 valid_children = []
 
                 for item in filtered_items:
@@ -496,8 +509,9 @@ confidence — ЦІЛЕ ЧИСЛО ВІД 0 ДО 100, де 100 = повна вп
                     )
                     return
 
-                # Якщо після фільтрації лишився один валідний елемент,
-                # публікуємо його як звичайний пост, а не карусель.
+                # Якщо з початкової каруселі після помилок лишився один
+                # валідний елемент, публікуємо його окремо. Контейнер
+                # створюємо заново вже у правильному standalone-режимі.
                 if len(valid_children) == 1:
                     await self._publish_single_item(
                         session,
@@ -673,7 +687,15 @@ confidence — ЦІЛЕ ЧИСЛО ВІД 0 ДО 100, де 100 = повна вп
             params["is_carousel_item"] = "true"
 
         if media_type == "video":
-            params["media_type"] = "VIDEO"
+            # Для одиночного відео Graph API v26+ вимагає REELS.
+            # Для відео всередині каруселі залишаємо VIDEO, оскільки
+            # саме такий режим уже успішно працює в поточному пайплайні.
+            if is_carousel_item:
+                params["media_type"] = "VIDEO"
+            else:
+                params["media_type"] = "REELS"
+                params["share_to_feed"] = "true"
+
             params["video_url"] = media_url
         else:
             params["image_url"] = media_url
@@ -681,28 +703,97 @@ confidence — ЦІЛЕ ЧИСЛО ВІД 0 ДО 100, де 100 = повна вп
         if caption:
             params["caption"] = caption
 
-        async with session.post(
-            url,
-            data=params,
-        ) as response:
-            data = await response.json(
-                content_type=None
+        # Meta іноді повертає 9004/2207052 одразу після появи нового
+        # публічного файла на MEDIA_BASE_URL. Робимо короткий retry лише
+        # для помилок завантаження медіа; інші API-помилки не маскуємо.
+        max_attempts = 3
+
+        for attempt in range(1, max_attempts + 1):
+            async with session.post(
+                url,
+                data=params,
+            ) as response:
+                data = await response.json(
+                    content_type=None
+                )
+
+                if response.status < 400:
+                    return data.get("id")
+
+                retryable = self._is_retryable_instagram_media_error(
+                    data
+                )
+
+                logger.warning(
+                    "Instagram container error (%s), attempt %s/%s: %s",
+                    media_type,
+                    attempt,
+                    max_attempts,
+                    data,
+                )
+
+                if not retryable or attempt >= max_attempts:
+                    return None
+
+            await asyncio.sleep(
+                4 * attempt
             )
 
-            if response.status >= 400:
-                logger.warning(
-                    "Instagram container error "
-                    f"({media_type}): {data}"
-                )
-                return None
+        return None
 
-            return data.get("id")
+    @staticmethod
+    def _is_retryable_instagram_media_error(
+        data: dict,
+    ) -> bool:
+        """
+        Retry лише для ситуацій, коли Meta тимчасово не може
+        завантажити файл за нашим public URL.
+        """
+        if not isinstance(data, dict):
+            return False
+
+        error = data.get("error")
+        if not isinstance(error, dict):
+            return False
+
+        try:
+            code = int(error.get("code") or 0)
+        except (TypeError, ValueError):
+            code = 0
+
+        try:
+            subcode = int(error.get("error_subcode") or 0)
+        except (TypeError, ValueError):
+            subcode = 0
+
+        text = " ".join(
+            str(error.get(key) or "")
+            for key in (
+                "message",
+                "error_user_title",
+                "error_user_msg",
+            )
+        ).lower()
+
+        if code == 9004 or subcode in {2207052, 2207082}:
+            return True
+
+        retry_markers = (
+            "couldn't download",
+            "could not download",
+            "unable to fetch",
+            "failed to fetch",
+            "media upload has failed",
+            "не удалось извлечь медиафайл",
+            "не удалось скачать медиафайл",
+        )
+        return any(marker in text for marker in retry_markers)
 
     async def _wait_for_container(
         self,
         session: aiohttp.ClientSession,
         creation_id: str,
-        timeout: int = 120,
+        timeout: int = 180,
     ) -> bool:
         url = f"{self.graph_url}/{creation_id}"
         deadline = (

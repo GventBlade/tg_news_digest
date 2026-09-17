@@ -72,6 +72,14 @@ class NewsSummarizer:
     # ракет і БпЛА показуємо не частіше одного разу на добу.
     DAILY_AIR_DEFENSE_SUMMARY_LOCK_HOURS = 24.0
 
+    # Для законів, санкційних пакетів, угод і подібних одноразових рішень
+    # не повторюємо ту саму базову історію протягом доби лише через інший
+    # заголовок, повторне голосування в іншому формулюванні, "готовність
+    # підписати" або передачу документа на підпис. Виняток — реальний
+    # перехід юридичного статусу: пропозиція -> ухвалення, фактичний підпис,
+    # набуття чинності, фактичне запровадження/вето.
+    DAILY_DECISION_STORY_LOCK_HOURS = 24.0
+
     # Повтор старої історії повертаємо у дайджест лише при справді
     # великому розвитку. 60 виявилося занадто м'яким порогом: модель
     # могла вважати +1 пораненого або кілька локальних пошкоджень
@@ -1374,6 +1382,25 @@ TELEGRAM POSTS FOR DISCOVERY SEARCH:
 того ж дня. Це правило НЕ стосується окремої події з великими жертвами,
 ударом по критичному/стратегічному об'єкту, значним міжнародним контекстом
 або іншим самостійно важливим наслідком.
+
+ОКРЕМЕ ПРАВИЛО ДЛЯ ЗАКОНІВ / САНКЦІЙ / УГОД / РІШЕНЬ:
+ту саму базову policy-story не повертай у дайджест повторно протягом 24 годин
+лише через інший заголовок, повторний переказ голосування, нові цитати,
+"готовність президента підписати", "має підписати", "передадуть на підпис",
+"очікує підпису" або інше формулювання тієї самої стадії.
+
+ЦЕ НЕ новий юридичний статус:
+- "ухвалили" -> "остаточно ухвалили/схвалили";
+- "Палата підтримала" -> ще один переказ того самого вже відомого ухвалення;
+- "передадуть на підпис" -> "президент готовий/планує підписати";
+- нові деталі пакета без зміни його фактичного статусу.
+
+Справжній material update для такої історії:
+- пропозицію/проєкт ФАКТИЧНО ухвалили;
+- документ ФАКТИЧНО підписано, а не лише обіцяно підписати;
+- він ФАКТИЧНО набув чинності;
+- санкції/мита ФАКТИЧНО запровадили;
+- документ ветували/відхилили або стався інший реальний юридичний результат.
 
 Якщо подія вже є в архіві:
 - is_history_repeat=true;
@@ -3071,24 +3098,454 @@ MANUAL POSTS:
         return set(re.findall(r"\b\d+(?:[.,]\d+)?\b", normalized))
 
     @staticmethod
+    def _looks_like_decision_story_text(text: str) -> bool:
+        """
+        Чи схожий текст на одноразову policy/legislative історію:
+        закон, санкційний пакет, угоду, мита/податки, постанову тощо.
+
+        Це лише класифікатор для 24h dedup-lock, не оцінка важливості.
+        """
+        t = NewsSummarizer._normalize_similarity_text(text)
+        if not t:
+            return False
+
+        markers = (
+            "законопро", "закон ", " закон", "санкц", "угод", "догов",
+            "постан", "ратифік", "ухвал", "схвал", "проголос", "затверд",
+            "підпис", "набув чинності", "набула чинності", "вступив у силу",
+            "мит ", " мито", "тариф", "подат", "акциз", "ветув", "вето",
+        )
+        return any(marker in f" {t} " for marker in markers)
+
+    @staticmethod
+    def _decision_family_signature(text: str) -> set:
+        """
+        Тематичні сім'ї рішень. Вони потрібні, щоб "закон про шахрайські
+        кол-центри" не став hard-duplicate для "санкційного пакета США".
+        """
+        t = NewsSummarizer._normalize_similarity_text(text)
+        padded = f" {t} "
+
+        families = {
+            "sanctions": (
+                "санкц", "заморожен актив", "тіньов флот",
+            ),
+            "tariffs": (
+                " мито", "мит ", "тариф",
+            ),
+            "taxes": (
+                "подат", "пдв", "акциз",
+            ),
+            "agreement": (
+                "угод", "догов", "меморанд", "ратифік",
+            ),
+            "aid_finance": (
+                "допомог", "грант", "кредит", "фінансув",
+            ),
+            "visa_migration": (
+                "віз", "міграц", "біжен", "перетин кордон",
+            ),
+            "regulation": (
+                "законопро", " закон ", "постан", "регулюв", "правил",
+            ),
+        }
+
+        found = set()
+        for family, needles in families.items():
+            if any(needle in padded for needle in needles):
+                found.add(family)
+        return found
+
+    @staticmethod
+    def _decision_geo_signature(text: str) -> set:
+        """
+        Канонічні геополітичні/інституційні якорі для policy-story.
+
+        Тут, на відміну від загального entity matcher, США/РФ тощо корисні:
+        санкції США проти РФ та український закон — не одна історія.
+        """
+        t = NewsSummarizer._normalize_similarity_text(text)
+        padded = f" {t} "
+
+        aliases = {
+            "usa": (
+                " сша ", "америк", "конгрес", "палата представників",
+                "сенат", "білий дім", "трамп",
+            ),
+            "russia": (
+                " росі", " рф ", "москв",
+            ),
+            "iran": (
+                "іран",
+            ),
+            "ukraine": (
+                " украї", "верховна рада", "верховної ради",
+                "кабмін", "зеленськ",
+            ),
+            "eu": (
+                " єс ", "євросоюз", "європейськ союз",
+            ),
+            "uk": (
+                "британ", "лондон",
+            ),
+            "china": (
+                "китай", "пекін",
+            ),
+            "poland": (
+                "польщ", "варшав",
+            ),
+        }
+
+        found = set()
+        for name, needles in aliases.items():
+            if any(needle in padded for needle in needles):
+                found.add(name)
+        return found
+
+    def _same_decision_story(
+        self,
+        current_text: str,
+        history_text: str,
+    ) -> bool:
+        """
+        Консервативний matcher саме для законів/санкцій/угод.
+
+        Навмисно суворіший за загальний semantic_anchor: hard-lock на 24h
+        не повинен склеїти два різні закони лише через слова "ухвалив закон".
+        """
+        if not (
+            self._looks_like_decision_story_text(current_text)
+            and self._looks_like_decision_story_text(history_text)
+        ):
+            return False
+
+        current_families = self._decision_family_signature(current_text)
+        history_families = self._decision_family_signature(history_text)
+        shared_families = current_families & history_families
+        if not shared_families:
+            return False
+
+        stats = self._history_similarity_stats(current_text, history_text)
+        shared_geo = (
+            self._decision_geo_signature(current_text)
+            & self._decision_geo_signature(history_text)
+        )
+        shared_entities = (
+            self._entity_signature(current_text)
+            & self._entity_signature(history_text)
+        )
+        shared_story = (
+            self._story_signature(current_text)
+            & self._story_signature(history_text)
+        )
+
+        # Для санкцій/мит/податків конкретна policy-family + той самий
+        # геополітичний контекст — сильний якір навіть при переписаному тексті.
+        strong_policy_families = {
+            "sanctions",
+            "tariffs",
+            "taxes",
+            "agreement",
+            "visa_migration",
+        }
+        if shared_families & strong_policy_families:
+            if (
+                len(shared_geo) >= 1
+                and stats["common"] >= 3
+                and (
+                    stats["overlap"] >= 0.18
+                    or stats["jaccard"] >= 0.10
+                    or stats["seq"] >= 0.32
+                    or len(shared_story) >= 3
+                )
+            ):
+                return True
+
+            if (
+                stats["common"] >= 7
+                and (
+                    stats["overlap"] >= 0.34
+                    or stats["jaccard"] >= 0.20
+                    or stats["seq"] >= 0.58
+                )
+            ):
+                return True
+
+        # Для загального "закон/постанова/регулювання" вимоги вищі,
+        # щоб не змішувати різні рішення одного парламенту/уряду.
+        if (
+            len(shared_entities) >= 1
+            and stats["common"] >= 6
+            and (
+                stats["overlap"] >= 0.34
+                or stats["jaccard"] >= 0.20
+                or stats["seq"] >= 0.58
+            )
+        ):
+            return True
+
+        if (
+            len(shared_geo) >= 1
+            and len(shared_story) >= 5
+            and stats["common"] >= 6
+            and (
+                stats["overlap"] >= 0.38
+                or stats["jaccard"] >= 0.22
+                or stats["seq"] >= 0.62
+            )
+        ):
+            return True
+
+        if (
+            stats["seq"] >= 0.76
+            and stats["common"] >= 6
+            and stats["overlap"] >= 0.55
+        ):
+            return True
+
+        return False
+
+    @staticmethod
+    def _decision_status_signature(text: str) -> set:
+        """
+        Юридичний/процедурний статус без хибного "signed".
+
+        Критично: "готовий підписати", "передадуть на підпис",
+        "очікує підпису", "підпише" та "готують підписання" НЕ означають,
+        що документ уже підписаний.
+        """
+        t = NewsSummarizer._normalize_similarity_text(text)
+        if not t:
+            return set()
+
+        found = set()
+
+        if any(
+            marker in t
+            for marker in (
+                "запропон", "зареєстр", "внесли законопро",
+                "внесено законопро", "представив законопро",
+                "представили законопро", "підготували законопро",
+            )
+        ):
+            found.add("proposed")
+
+        if any(
+            marker in t
+            for marker in (
+                "ухвал", "схвал", "проголос", "затверд", "ратифік",
+            )
+        ):
+            found.add("approved")
+
+        if any(
+            marker in t
+            for marker in (
+                "на підпис", "готовий підписати", "готова підписати",
+                "готові підписати", "має підписати", "має намір підпис",
+                "планує підпис", "підпише", "очікує підпис",
+                "чекає підпис", "готують підписання", "передадуть на підпис",
+                "передали на підпис", "скерували на підпис",
+                "направили на підпис",
+            )
+        ):
+            found.add("awaiting_signature")
+
+        actual_signed_patterns = (
+            r"\bпідписав\b",
+            r"\bпідписала\b",
+            r"\bпідписали\b",
+            r"\bпідписано\b",
+            r"\bпідписаний\b",
+            r"\bпідписана\b",
+            r"\bвідбулося підписання\b",
+            r"\bуклали угоду\b",
+            r"\bугоду укладено\b",
+            r"\bдоговір підписано\b",
+        )
+        if any(re.search(pattern, t) for pattern in actual_signed_patterns):
+            found.add("signed")
+
+        if any(
+            marker in t
+            for marker in (
+                "набув чинності", "набула чинності", "набуло чинності",
+                "вступив у силу", "вступила у силу", "вступило у силу",
+                "почав діяти", "почала діяти", "почало діяти",
+            )
+        ):
+            found.add("effective")
+
+        # Фактичне введення санкцій/мит/обмежень — це вже інший статус,
+        # на відміну від "закон дозволяє запровадити" або "може ввести".
+        implementation_patterns = (
+            r"\bзапровадили санкц",
+            r"\bзапровадив санкц",
+            r"\bзапровадила санкц",
+            r"\bввели санкц",
+            r"\bввів санкц",
+            r"\bввела санкц",
+            r"\bзастосували санкц",
+            r"\bсанкції набули чинності\b",
+            r"\bмита набули чинності\b",
+            r"\bпочали стягувати мито\b",
+        )
+        if any(re.search(pattern, t) for pattern in implementation_patterns):
+            found.add("implemented")
+
+        if any(
+            marker in t
+            for marker in (
+                "ветував", "ветувала", "наклав вето", "відхилив",
+                "відхилила", "не підтримав законопро", "провалив голосування",
+            )
+        ):
+            found.add("blocked")
+
+        return found
+
+    def _decision_has_meaningful_status_progression(
+        self,
+        current_text: str,
+        previous_text: str,
+    ) -> bool:
+        """
+        Що дозволяє повтор decision-story протягом 24 годин.
+
+        Дозволяємо лише реальну зміну статусу, а не новий заголовок:
+        proposal -> approved; approved -> ACTUALLY signed;
+        signed -> effective; фактичне введення санкцій/вето.
+        """
+        current = self._decision_status_signature(current_text)
+        previous = self._decision_status_signature(previous_text)
+
+        if "blocked" in current and "blocked" not in previous:
+            return True
+
+        if "effective" in current and "effective" not in previous:
+            return True
+
+        if "implemented" in current and "implemented" not in previous:
+            return True
+
+        if "signed" in current and "signed" not in previous:
+            return True
+
+        previous_finalish = {
+            "approved",
+            "signed",
+            "effective",
+            "implemented",
+            "blocked",
+        }
+        if (
+            "approved" in current
+            and "approved" not in previous
+            and not (previous & previous_finalish)
+        ):
+            return True
+
+        # awaiting_signature — НЕ матеріальний апдейт. Так само додаткове
+        # голосування/формулювання після вже зафіксованого approved.
+        return False
+
+    def _is_recent_decision_story_duplicate(
+        self,
+        event: Dict[str, Any],
+        posts: List[Dict[str, Any]],
+        history: Dict[str, str],
+    ) -> bool:
+        """
+        Добовий hard-lock для тієї самої policy-story.
+
+        Приклад: "Конгрес ухвалив пакет санкцій" і через 8 годин
+        "Білий дім готовий підписати той самий пакет" — одна історія.
+        Повтор дозволяється лише при фактичному новому юридичному статусі.
+        """
+        age_hours = self._history_age_hours(history)
+        if (
+            age_hours is None
+            or age_hours > self.DAILY_DECISION_STORY_LOCK_HOURS
+        ):
+            return False
+
+        current_text = self._event_source_text_bundle(event, posts)
+        history_text = " ".join(
+            value
+            for value in [
+                str(history.get("title") or ""),
+                str(history.get("summary") or ""),
+            ]
+            if value
+        )
+
+        if not self._same_decision_story(current_text, history_text):
+            return False
+
+        if self._decision_has_meaningful_status_progression(
+            current_text,
+            history_text,
+        ):
+            return False
+
+        return True
+
+    @staticmethod
     def _status_transition_signature(text: str) -> set:
-        """Матеріальні переходи стану, а не просто нові подробиці."""
+        """
+        Матеріальні переходи стану, а не просто нові подробиці.
+
+        Для "signed" використовуємо точні форми фактичного підписання.
+        "Готовий підписати"/"передадуть на підпис" не є новим статусом.
+        """
         t = NewsSummarizer._normalize_similarity_text(text)
         groups = {
             "approved": ("ухвал", "затверд", "проголос", "ратифік"),
-            "signed": ("підпис", "укладено угоду", "уклали угоду", "контракт уклад"),
-            "effective": ("набув чинності", "набула чинності", "вступив у силу", "почало діяти"),
-            "launched": ("запуст", "відкрив", "почав роботу", "розпочав виробниц"),
-            "completed": ("заверш", "закінч", "досягнуто домовлен"),
-            "confirmed": ("офіційно підтверд", "підтвердив результат", "підтверджено результат"),
-            "sanctioned": ("запровадили санкц", "ввели санкц", "зняли санкц"),
-            "legal_result": ("вирок", "засуд", "арешт", "затрим", "оголосили підозр"),
-            "operational_result": ("знищено", "уражено", "виведено з ладу", "зупинено роботу"),
+            "effective": (
+                "набув чинності", "набула чинності",
+                "вступив у силу", "почало діяти",
+            ),
+            "launched": (
+                "запуст", "відкрив", "почав роботу", "розпочав виробниц",
+            ),
+            "completed": (
+                "заверш", "закінч", "досягнуто домовлен",
+            ),
+            "confirmed": (
+                "офіційно підтверд", "підтвердив результат",
+                "підтверджено результат",
+            ),
+            "sanctioned": (
+                "запровадили санкц", "ввели санкц", "зняли санкц",
+            ),
+            "legal_result": (
+                "вирок", "засуд", "арешт", "затрим", "оголосили підозр",
+            ),
+            "operational_result": (
+                "знищено", "уражено", "виведено з ладу", "зупинено роботу",
+            ),
         }
+
         found = set()
         for name, needles in groups.items():
             if any(needle in t for needle in needles):
                 found.add(name)
+
+        actual_signed_patterns = (
+            r"\bпідписав\b",
+            r"\bпідписала\b",
+            r"\bпідписали\b",
+            r"\bпідписано\b",
+            r"\bпідписаний\b",
+            r"\bпідписана\b",
+            r"\bвідбулося підписання\b",
+            r"\bуклали угоду\b",
+            r"\bугоду укладено\b",
+            r"\bконтракт укладено\b",
+        )
+        if any(re.search(pattern, t) for pattern in actual_signed_patterns):
+            found.add("signed")
+
         return found
 
     def _non_attack_material_update(
@@ -3148,6 +3605,29 @@ MANUAL POSTS:
             ]
             if value
         )
+
+        # Для законів/санкцій/угод у межах 24 годин reviewer не може
+        # самостійно "намалювати" material update. Потрібен фактичний
+        # перехід статусу: proposal->approved, actual signed/effective тощо.
+        matched_at = str(ev.get("history_match_published_at") or "").strip()
+        decision_age_hours: Optional[float] = None
+        if matched_at:
+            decision_age_hours = self._history_age_hours({
+                "published_at": matched_at,
+            })
+
+        if (
+            decision_age_hours is not None
+            and decision_age_hours <= self.DAILY_DECISION_STORY_LOCK_HOURS
+            and self._looks_like_decision_story_text(current_text)
+            and self._looks_like_decision_story_text(previous_text)
+            and self._same_decision_story(current_text, previous_text)
+            and not self._decision_has_meaningful_status_progression(
+                current_text,
+                previous_text,
+            )
+        ):
+            return False
 
         # Якщо semantic-review прямо сказав, що це лише інший кут/деталі,
         # жодні високі LLM-оцінки з попереднього Analyzer не повинні оживити дубль.
@@ -3266,12 +3746,25 @@ MANUAL POSTS:
                 daily_air_defense_locked = bool(
                     ev.get("daily_air_defense_summary_locked", False)
                 )
+                daily_decision_story_locked = bool(
+                    ev.get("daily_decision_story_locked", False)
+                )
 
                 if not is_priority:
                     if daily_air_defense_locked:
                         rejected["history_repeat"] += 1
                         logger.info(
                             "Daily air-defense summary blocked for 24h: "
+                            "event_id=%s matched='%s'.",
+                            ev.get("event_id"),
+                            str(ev.get("history_match_title") or "")[:120],
+                        )
+                        continue
+
+                    if daily_decision_story_locked:
+                        rejected["history_repeat"] += 1
+                        logger.info(
+                            "Decision story blocked for 24h: "
                             "event_id=%s matched='%s'.",
                             ev.get("event_id"),
                             str(ev.get("history_match_title") or "")[:120],
@@ -3829,21 +4322,25 @@ discovery-блок.
 3. Агреговане зведення ППО / Повітряних сил зі статистикою збитих ракет
    і БпЛА — максимум одне за 24 години. Інші цифри пізніше того ж дня
    не роблять його новою окремою новиною.
-4. Не додавай відверто слабку подію тільки для заповнення кількості.
-4. Не вигадуй факти.
-5. Не використовуй чутки.
-6. Не оцінюй важливість за довжиною початкового Telegram-посту.
-7. Коротка гаряча новина може бути однією з головних новин дайджесту.
-8. Відео або фото саме по собі не робить слабку подію важливою.
-9. Якщо значуща подія має реальне фото чи відео з місця — це плюс.
-10. При близьких оцінках віддавай перевагу події,
+4. Той самий закон/санкційний пакет/угоду протягом 24 годин не повторюй
+   через інший заголовок, повторне голосування тієї самої стадії або
+   "готовність/намір підписати". Новий етап — лише фактичне ухвалення після
+   стадії проєкту, фактичний підпис, набуття чинності, введення або вето.
+5. Не додавай відверто слабку подію тільки для заповнення кількості.
+6. Не вигадуй факти.
+7. Не використовуй чутки.
+8. Не оцінюй важливість за довжиною початкового Telegram-посту.
+9. Коротка гаряча новина може бути однією з головних новин дайджесту.
+10. Відео або фото саме по собі не робить слабку подію важливою.
+11. Якщо значуща подія має реальне фото чи відео з місця — це плюс.
+12. При близьких оцінках віддавай перевагу події,
     яка додає нову тему, корисність або цікавість,
     а не четвертій однотипній новині про вже представлену тему.
-11. Високий CURIOSITY означає, що подія може зайняти 7-10 місце,
+13. Високий CURIOSITY означає, що подія може зайняти 7-10 місце,
     навіть якщо її стратегічна IMPORTANCE нижча.
-12. Високий PRACTICAL_VALUE означає, що подія корисна людям
+14. Високий PRACTICAL_VALUE означає, що подія корисна людям
     і теж може виправдано потрапити у фінальний список.
-13. Для атак не оцінюй вагу лише за жертвами/руйнуваннями. Якщо у зоні
+15. Для атак не оцінюй вагу лише за жертвами/руйнуваннями. Якщо у зоні
     прямого ризику були світові політики, міжнародна делегація або інцидент
     має чіткий контекст НАТО/ЄС/міжнародної ескалації, така подія може бути
     сильнішою за звичайну science/discovery-новину навіть без постраждалих.
@@ -6085,6 +6582,7 @@ discovery-блок.
             hard_duplicate = False
             match_method = ""
             daily_air_defense_locked = False
+            daily_decision_story_locked = False
 
             for history in history_entries:
                 if self._is_recent_air_defense_summary_duplicate(
@@ -6096,6 +6594,17 @@ discovery-блок.
                     hard_duplicate = True
                     daily_air_defense_locked = True
                     match_method = "daily_air_defense_summary_24h"
+                    break
+
+                if self._is_recent_decision_story_duplicate(
+                    event,
+                    posts,
+                    history,
+                ):
+                    matched_history = history
+                    hard_duplicate = True
+                    daily_decision_story_locked = True
+                    match_method = "decision_story_24h"
                     break
 
                 if self._is_recent_hard_duplicate(event, history):
@@ -6130,6 +6639,9 @@ discovery-блок.
                 event["history_hard_duplicate"] = hard_duplicate
                 event["daily_air_defense_summary_locked"] = (
                     daily_air_defense_locked
+                )
+                event["daily_decision_story_locked"] = (
+                    daily_decision_story_locked
                 )
                 event["history_match_method"] = match_method
                 event["history_match_title"] = matched_history.get(
@@ -6429,6 +6941,16 @@ MATERIAL_UPDATE=true лише коли ПІСЛЯ попередньої пуб�
 рішення або юридичний статус, підтверджений результат операції, новий великий
 об'єкт/результат, фактичний запуск/набуття чинності тощо.
 
+КРИТИЧНО ДЛЯ ЗАКОНІВ / САНКЦІЙ / УГОД:
+- "ухвалили" і "остаточно схвалили/проголосували" — та сама стадія approved;
+- "передадуть на підпис", "готовий підписати", "планує підписати",
+  "підпише" або "очікує підпису" НЕ означають signed;
+- signed=true як material update лише якщо документ ФАКТИЧНО підписано;
+- наступний material update після signed — фактичне набуття чинності/
+  фактичне запровадження санкцій, мит чи інших правил;
+- повторний переказ того самого пакета з новою цитатою або деталями
+  протягом доби — НЕ material update.
+
 НЕ MATERIAL_UPDATE:
 - більше деталей із того самого звіту;
 - новий список способів застосування тієї самої технології;
@@ -6497,9 +7019,12 @@ CASES:
             matched_history = meta["candidate_map"].get(candidate_id)
 
             if not same_story or matched_history is None:
-                # Добова квота ППО — редакційне правило, а не semantic guess.
-                # HISTORY_REVIEW не має права її скасувати.
-                if event.get("daily_air_defense_summary_locked"):
+                # Добові hard-lock правила — редакційні правила, а не
+                # semantic guess. HISTORY_REVIEW не має права їх скасувати.
+                if (
+                    event.get("daily_air_defense_summary_locked")
+                    or event.get("daily_decision_story_locked")
+                ):
                     continue
 
                 # LLM може виправити лише SOFT deterministic match. Exact/hard
