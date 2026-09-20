@@ -6,6 +6,7 @@ import time
 from difflib import SequenceMatcher
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Union
+from urllib.parse import urlparse
 
 from google import genai
 from google.genai import types
@@ -24,6 +25,7 @@ SOURCE_TIERS = {
     "bbcukrainian": 1.2,
     "radiosvoboda": 1.2,
     "forbesukraines": 1.2,
+    "forbesukraine": 1.2,
 
     "DeepStateUA": 1.1,
     "DIUkraine": 1.1,
@@ -92,10 +94,21 @@ class NewsSummarizer:
     # історій, де заголовок повністю переписано (Claude/Anthropic, звіти,
     # дослідження, дипломатія тощо).
     SEMANTIC_HISTORY_REVIEW_ENABLED = True
-    SEMANTIC_HISTORY_CANDIDATES_PER_EVENT = 3
-    SEMANTIC_HISTORY_REVIEW_MAX_EVENTS = 18
-    SEMANTIC_HISTORY_MIN_CANDIDATE_SCORE = 20.0
+    SEMANTIC_HISTORY_CANDIDATES_PER_EVENT = 4
+    SEMANTIC_HISTORY_REVIEW_MAX_EVENTS = 20
+    SEMANTIC_HISTORY_MIN_CANDIDATE_SCORE = 16.0
     SEMANTIC_HISTORY_LOOKBACK_HOURS = 48.0
+
+    # Один додатковий batch-check уже ПІСЛЯ Editor. Він не відбирає новини
+    # заново, а лише прибирає/переформульовує твердження, які ширші за
+    # надані source-факти (наприклад, одна бригада -> "усе військо"),
+    # плутають план із фактом або повторюють один факт двома реченнями.
+    FINAL_FACT_CHECK_ENABLED = True
+
+    # Для українського дайджесту не використовуємо внутрішній російський
+    # lifestyle/trivia/туризм як discovery-заповнювач. Важливі військові,
+    # економічні, санкційні чи міжнародні події про РФ це правило НЕ блокує.
+    FILTER_LOW_VALUE_RUSSIA_DISCOVERY = True
 
     MAX_INPUT_CHARS = 55000
     PRIORITY_RECOVERY_MAX_CHARS = 30000
@@ -408,6 +421,15 @@ class NewsSummarizer:
             posts,
             past_events,
             effective_count,
+            max_retries_per_model,
+        )
+
+        # Окремий низькотемпературний factual pass: не міняє склад випуску,
+        # а тільки звіряє формулювання Editor із фактичними source-текстами.
+        final_news = self._fact_check_final_news(
+            final_news,
+            ranked_events,
+            posts,
             max_retries_per_model,
         )
 
@@ -1224,7 +1246,12 @@ class NewsSummarizer:
 - чергова політична заява без рішення;
 - дрібний кримінал, ДТП, локальна пожежа;
 - шок-контент, плітки, клікбейт;
-- просто важка воєнна новина, якщо її єдина цінність — стратегічна важливість.
+- просто важка воєнна новина, якщо її єдина цінність — стратегічна важливість;
+- внутрішній російський lifestyle/trivia: побутові "цікаві факти" про РФ,
+  туризм, регіональні курйози, домашніх тварин, локальні рекорди та інший
+  soft-news без прямого значення для України або помітного міжнародного впливу.
+  Водночас НЕ відкидай через це санкції, війну, військову промисловість РФ,
+  НПЗ/енергетику, економічні зміни, дипломатію чи рішення, важливі для України.
 
 QUALITY GATE:
 Поверни лише події, які реально не соромно поставити в КІНЕЦЬ короткого
@@ -1502,7 +1529,11 @@ eligible_for_digest=true став, якщо подія має хоча б оди
 - чутки;
 - клікбейтні курйози без інформаційної цінності;
 - плітки про знаменитостей;
-- контент, єдина цінність якого — шок або емоція.
+- контент, єдина цінність якого — шок або емоція;
+- внутрішній російський lifestyle/trivia/туризм та побутові "цікаві факти"
+  про РФ без прямої користі/наслідків для України або помітного міжнародного
+  значення. Це НЕ стосується війни, санкцій, економіки РФ, військової
+  промисловості, енергетики, дипломатії та інших подій, що впливають на Україну.
 
 КРИТИЧНИЙ ВИНЯТОК ДЛЯ АТАК БЕЗ ЖЕРТВ:
 
@@ -3686,6 +3717,64 @@ MANUAL POSTS:
             )
         )
 
+    def _is_low_value_russia_discovery_event(
+        self,
+        ev: Dict[str, Any],
+        posts: List[Dict[str, Any]],
+        digest_role: str,
+        importance: float,
+        national_relevance: float,
+        practical_value: float,
+    ) -> bool:
+        """
+        Редакційний фільтр саме для soft/discovery-контенту про РФ.
+
+        Не блокуємо важливі події, пов'язані з війною, санкціями,
+        військовою промисловістю, економікою, енергетикою чи дипломатією.
+        Мета — не заповнювати український дайджест побутовими trivia на кшталт
+        "найбільше котів у домівках" або локальних туристичних фактів.
+        """
+        if not self.FILTER_LOW_VALUE_RUSSIA_DISCOVERY:
+            return False
+        if digest_role != "discovery":
+            return False
+        if ev.get("is_priority"):
+            return False
+
+        text = self._normalize_similarity_text(
+            self._event_source_text_bundle(ev, posts)
+        )
+        if not text:
+            return False
+
+        russia_markers = (
+            "росія", "росії", "російськ", "росіян", " рф ",
+            "москва", "московськ", "петербург", "санкт петербург",
+            "сибір", "урал", "краснояр", "новосибір",
+            "екатеринбург", "казань",
+        )
+        padded = f" {text} "
+        if not any(marker in padded for marker in russia_markers):
+            return False
+
+        hard_relevance_markers = (
+            "україн", "зсу", "сбу", "гур", "окуп", "фронт",
+            "військ", "збро", "дрон", "бпла", "ракет", "нпз",
+            "нафтоперероб", "нафтобаз", "енергет", "газ", "нафт",
+            "санкц", "експорт", "імпорт", "рубл", "бюджет",
+            "мобіліз", "оборон", "кремл", "путін", "переговор",
+            "дипломат", "нато", "євросоюз", " єс ", "сша",
+            "спецслужб", "кібер", "полон", "депорт", "кордон",
+            "вибух", "атак", "удар",
+        )
+        if any(marker in padded for marker in hard_relevance_markers):
+            return False
+
+        if importance >= 78 or national_relevance >= 65 or practical_value >= 80:
+            return False
+
+        return True
+
     def _rank_events(
         self,
         events: List[Dict[str, Any]],
@@ -3864,6 +3953,20 @@ MANUAL POSTS:
 
                 if strategic_attack_context:
                     digest_role = "core"
+
+                if (
+                    not is_priority
+                    and self._is_low_value_russia_discovery_event(
+                        ev, posts, digest_role, imp, national, practical
+                    )
+                ):
+                    rejected["low_value"] += 1
+                    logger.info(
+                        "Russia soft-discovery rejected: event_id=%s headline='%s'.",
+                        ev.get("event_id"),
+                        str(ev.get("headline_hint") or ev.get("summary") or "")[:120],
+                    )
+                    continue
 
                 discovery_qualified = (
                     digest_role == "discovery"
@@ -4178,6 +4281,147 @@ MANUAL POSTS:
 
         return ranked
 
+    def _fact_check_final_news(
+        self,
+        news: List[Dict[str, Any]],
+        ranked_events: List[Dict[str, Any]],
+        posts: List[Dict[str, Any]],
+        max_retries: int,
+    ) -> List[Dict[str, Any]]:
+        """Фінальний factual/editorial pass одним batch-запитом."""
+        if not self.FINAL_FACT_CHECK_ENABLED or not news:
+            return news
+
+        event_map = {
+            str(ev.get("event_id") or ""): ev
+            for ev in ranked_events
+            if isinstance(ev, dict) and ev.get("event_id")
+        }
+        cases = []
+        for item in news:
+            if not isinstance(item, dict):
+                continue
+            event_id = str(item.get("event_id") or "")
+            text = str(item.get("text") or "").strip()
+            ev = event_map.get(event_id)
+            if not event_id or not text or not ev:
+                continue
+
+            source_ids = self._valid_source_ids(ev.get("source_ids"), posts)
+            preferred = ev.get("best_factual_source_id")
+            ordered_ids = []
+            if isinstance(preferred, int) and preferred in source_ids:
+                ordered_ids.append(preferred)
+            ordered_ids.extend(sid for sid in source_ids if sid not in ordered_ids)
+
+            source_payload = []
+            for source_id in ordered_ids[:3]:
+                source_text = str(posts[source_id].get("text") or "").strip()
+                if not source_text:
+                    continue
+                source_payload.append({
+                    "source_id": source_id,
+                    "channel": str(
+                        posts[source_id].get("channel_title")
+                        or posts[source_id].get("channel_username")
+                        or ""
+                    ),
+                    "text": source_text[:1400],
+                })
+
+            cases.append({
+                "event_id": event_id,
+                "draft_text": text,
+                "event_summary": str(ev.get("summary") or "")[:900],
+                "key_facts": ev.get("key_facts", [])[:8]
+                if isinstance(ev.get("key_facts"), list)
+                else [],
+                "sources": source_payload,
+            })
+
+        if not cases:
+            return news
+
+        payload = json.dumps(cases, ensure_ascii=False)
+        prompt = f"""
+Ти — фінальний фактчекер українського Telegram-дайджесту.
+
+Для кожного case звір DRAFT_TEXT ТІЛЬКИ з EVENT_SUMMARY, KEY_FACTS і SOURCES.
+Не використовуй зовнішні знання і не додавай нового факту. Склад новин,
+event_id і порядок уже затверджені.
+
+Перевір:
+1. Не розширюй вибірку/масштаб: одна бригада, компанія, місто, лікарня,
+   опитування чи група людей не означає все військо, країну або галузь.
+2. "планує/готовий/може/має підписати" != "підписав";
+   "розглядають/пропонують" != "ухвалили"; "очікується" != "сталося".
+3. Оцінка, заява, прогноз або припущення не є встановленим фактом.
+4. Цифри, одиниці, назви та географію переносити точно.
+5. Не додавай причинно-наслідкових висновків, яких немає в SOURCES.
+6. Для посадових титулів не додавай зайві статусні прикметники
+   "обраний/колишній/чинний", якщо вони не потрібні для суті. Якщо титул
+   неоднозначний, безпечніше залишити ім'я без такого означення.
+7. Прибери сусідні речення, які повторюють один і той самий факт.
+8. Заголовок не може бути ширшим/категоричнішим за джерела.
+9. Якщо DRAFT_TEXT уже точний — не переписуй його заради стилю.
+
+corrected_text: один емодзі + <b>Заголовок</b>\n\n2-6 завершених речень,
+максимум {self.MAX_NEWS_CHARS} символів. Посилань не додавай.
+
+ВІДПОВІДЬ ТІЛЬКИ JSON:
+{{"checks":[{{"event_id":"E1","changed":false,"corrected_text":"...","reason":"exact або коротка причина"}}]}}
+
+CASES:
+{payload}
+"""
+        data = self._call_json_with_cascade(
+            prompt,
+            max_retries,
+            "FINAL_FACT_CHECK",
+            temperature=0.05,
+        )
+        checks = (
+            data.get("checks", [])
+            if data and isinstance(data.get("checks"), list)
+            else []
+        )
+        check_map = {
+            str(check.get("event_id") or ""): check
+            for check in checks
+            if isinstance(check, dict) and check.get("event_id")
+        }
+
+        result = []
+        changed_count = 0
+        for item in news:
+            if not isinstance(item, dict):
+                continue
+            item_copy = dict(item)
+            event_id = str(item_copy.get("event_id") or "")
+            check = check_map.get(event_id)
+            if check:
+                corrected = str(check.get("corrected_text") or "").strip()
+                if corrected:
+                    cleaned = self._clean_generated_news_text(corrected)
+                    if cleaned:
+                        old_text = str(item_copy.get("text") or "").strip()
+                        item_copy["text"] = cleaned
+                        if cleaned != old_text:
+                            changed_count += 1
+                            logger.info(
+                                "Final fact-check corrected event_id=%s reason='%s'.",
+                                event_id,
+                                str(check.get("reason") or "")[:220],
+                            )
+            result.append(item_copy)
+
+        logger.info(
+            "Final fact-check: checked=%s corrected=%s.",
+            len(cases),
+            changed_count,
+        )
+        return result
+
     def _generate_final_digest(
         self,
         events: List[Dict[str, Any]],
@@ -4484,6 +4728,12 @@ discovery-блок.
 - ніколи не обривай останнє речення;
 - ніколи не завершуй новину на півслові;
 - не додавай фактів, яких немає у кандидатові;
+- не розширюй масштаб твердження: дані однієї бригади/компанії/міста/
+  вибірки не перетворюй на твердження про все військо, країну чи галузь;
+- точно зберігай модальність і статус: "планує/готовий/може" не означає
+  "зробив/підписав/ухвалив"; оцінка або прогноз не є встановленим фактом;
+- якщо статусний титул особи не потрібен для суті, не додавай зайвих
+  прикметників на кшталт "обраний/колишній/чинний" без потреби;
 - не роби власних прогнозів;
 - не приписуй причин, яких джерело не підтверджує;
 - якщо текст виходить задовгим, скороти другорядні деталі;
@@ -4604,6 +4854,163 @@ discovery-блок.
 
         return final_list
 
+    @staticmethod
+    def _post_external_links(post: Dict[str, Any]) -> List[Dict[str, str]]:
+        raw = post.get("external_links")
+        if not isinstance(raw, list):
+            return []
+        result: List[Dict[str, str]] = []
+        seen = set()
+        for item in raw:
+            if isinstance(item, str):
+                url = item.strip()
+                label = ""
+            elif isinstance(item, dict):
+                url = str(item.get("url") or "").strip()
+                label = str(item.get("label") or "").strip()
+            else:
+                continue
+            if not url or url in seen:
+                continue
+            try:
+                parsed = urlparse(url)
+            except Exception:
+                continue
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                continue
+            seen.add(url)
+            result.append({"url": url, "label": label})
+        return result
+
+    @staticmethod
+    def _reference_kind(text: str) -> Optional[str]:
+        t = NewsSummarizer._normalize_similarity_text(text)
+        if not t:
+            return None
+        if any(marker in t for marker in (
+            "законопро", " закон ", "постан", "указ", "документ",
+            "регламент", "директив", "рішення суд", "ратифік",
+        )):
+            return "Документ"
+        if any(marker in t for marker in (
+            "дослідж", "study", "research", "науков статт",
+            "науковій статт", "журнал", "paper", "опитуван",
+        )):
+            return "Дослідження"
+        if any(marker in t for marker in (
+            "звіт", "доповід", "report", "індекс", "рейтинг",
+            "аналітичн звіт", "розслідуван",
+        )):
+            return "Звіт"
+        if any(marker in t for marker in (
+            "статт", "публікац", "матеріал видан", "колонк",
+            "інтерв ю", "інтерв'ю",
+        )):
+            return "Стаття"
+        return None
+
+    @staticmethod
+    def _reference_domain_score(url: str, kind: str) -> float:
+        try:
+            host = (urlparse(url).hostname or "").lower()
+        except Exception:
+            return -1000.0
+        blocked_hosts = {
+            "t.me", "telegram.me", "telegram.org", "instagram.com",
+            "www.instagram.com", "facebook.com", "www.facebook.com",
+            "x.com", "twitter.com", "www.twitter.com", "youtube.com",
+            "www.youtube.com", "youtu.be", "tiktok.com", "www.tiktok.com",
+            "vk.com", "ok.ru",
+        }
+        if host in blocked_hosts or any(host.endswith("." + h) for h in blocked_hosts):
+            return -1000.0
+        score = 0.0
+        official_fragments = (
+            "gov.ua", "rada.gov.ua", "president.gov.ua", "kmu.gov.ua",
+            "europa.eu", "ec.europa.eu", "consilium.europa.eu", "nato.int",
+            "un.org", "who.int", "worldbank.org", "imf.org", "oecd.org",
+            ".gov", "parliament", "senate", "congress",
+        )
+        research_fragments = (
+            "nature.com", "science.org", "sciencedirect.com", "springer.com",
+            "wiley.com", "thelancet.com", "nejm.org", "bmj.com",
+            "arxiv.org", "doi.org", "pubmed.ncbi.nlm.nih.gov",
+        )
+        if any(fragment in host for fragment in official_fragments):
+            score += 45.0 if kind == "Документ" else 28.0
+        if any(fragment in host for fragment in research_fragments):
+            score += 45.0 if kind == "Дослідження" else 24.0
+        return score
+
+    def _select_reference_link(
+        self,
+        ev: Dict[str, Any],
+        posts: List[Dict[str, Any]],
+    ) -> tuple[Optional[str], Optional[str]]:
+        event_text = self._event_source_text_bundle(ev, posts)
+        kind = self._reference_kind(event_text)
+        if not kind:
+            return None, None
+
+        source_ids = self._valid_source_ids(ev.get("source_ids"), posts)
+        preferred = ev.get("best_factual_source_id")
+        ordered_ids: List[int] = []
+        if isinstance(preferred, int) and preferred in source_ids:
+            ordered_ids.append(preferred)
+        ordered_ids.extend(sid for sid in source_ids if sid not in ordered_ids)
+
+        candidates = []
+        reference_words = (
+            "джерел", "дослідж", "study", "research", "звіт", "report",
+            "закон", "документ", "постан", "статт", "article", "читати",
+            "повний текст", "оригінал", "публікац",
+        )
+        for order, source_id in enumerate(ordered_ids):
+            for link in self._post_external_links(posts[source_id]):
+                url = link["url"]
+                label = self._normalize_similarity_text(link.get("label", ""))
+                domain_score = self._reference_domain_score(url, kind)
+                if domain_score <= -900:
+                    continue
+                label_signal = any(word in label for word in reference_words)
+                label_relevance = False
+                if label:
+                    label_stats = self._history_similarity_stats(
+                        event_text,
+                        label,
+                    )
+                    label_relevance = (
+                        label_stats["common"] >= 3
+                        or label_stats["seq"] >= 0.38
+                        or bool(
+                            self._entity_signature(event_text)
+                            & self._entity_signature(label)
+                        )
+                    )
+
+                if not label_signal and not label_relevance and domain_score <= 0:
+                    continue
+
+                score = domain_score
+                if source_id == preferred:
+                    score += 20.0
+                score += max(0.0, 8.0 - order * 1.5)
+                if label_signal:
+                    score += 22.0
+                if label_relevance:
+                    score += 12.0
+                if label and len(label) <= 80:
+                    score += 2.0
+                candidates.append((score, url))
+
+        if not candidates:
+            return None, None
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        best_score, best_url = candidates[0]
+        if best_score < 12.0:
+            return None, None
+        return best_url, kind
+
     def _validate_final_news(
         self,
         news: List[Dict[str, Any]],
@@ -4645,6 +5052,9 @@ discovery-блок.
                 continue
 
             ev = event_map[event_id]
+            reference_url, reference_label = self._select_reference_link(
+                ev, posts
+            )
 
             validated.append({
                 "event_id": event_id,
@@ -4664,6 +5074,8 @@ discovery-блок.
                     ev.get("is_discovery_candidate")
                 ),
                 "is_priority": bool(ev.get("is_priority")),
+                "reference_url": reference_url,
+                "reference_label": reference_label,
             })
 
             used_event_ids.add(event_id)
@@ -4886,6 +5298,10 @@ discovery-блок.
         if not text:
             return None
 
+        reference_url, reference_label = self._select_reference_link(
+            ev, posts
+        )
+
         return {
             "event_id": str(ev.get("event_id") or ""),
             "source_id": source_id,
@@ -4898,6 +5314,8 @@ discovery-блок.
                 ev.get("is_discovery_candidate")
             ),
             "is_priority": bool(ev.get("is_priority")),
+            "reference_url": reference_url,
+            "reference_label": reference_label,
         }
 
     def _enforce_digest_mix(
@@ -7312,3 +7730,4 @@ CASES:
         )
 
         return text.strip()
+

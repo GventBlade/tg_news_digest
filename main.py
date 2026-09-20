@@ -1,4 +1,5 @@
 import asyncio
+import html
 import logging
 import os
 import time
@@ -128,6 +129,29 @@ def build_instagram_carousel_caption(
     ])
 
     return "\n".join(lines)
+
+
+def append_reference_link(
+    text: str,
+    reference_url: str | None,
+    reference_label: str | None = None,
+) -> str:
+    """
+    Додає коротке клікабельне першоджерело лише коли Summarizer знайшов
+    реальний зовнішній URL у початкових Telegram-постах.
+    """
+    base = str(text or "").strip()
+    url = str(reference_url or "").strip()
+    if not url:
+        return base
+
+    label = str(reference_label or "Першоджерело").strip() or "Першоджерело"
+    safe_url = html.escape(url, quote=True)
+    safe_label = html.escape(label)
+    return (
+        f"{base}\n\n"
+        f"🔗 <a href=\"{safe_url}\">{safe_label}</a>"
+    )
 
 
 def cleanup_old_downloads(
@@ -590,9 +614,17 @@ async def process_and_publish_news_cycle():
                     media_path = None
                     media_type = None
 
+            # Посилання додаємо ПІСЛЯ Vision-перевірки, щоб службовий
+            # рядок "Документ/Дослідження/Стаття" не впливав на media-gate.
+            publication_text = append_reference_link(
+                item["text"],
+                item.get("reference_url"),
+                item.get("reference_label"),
+            )
+
             published = (
                 await publisher.publish_telegram_post(
-                    text=item["text"],
+                    text=publication_text,
                     media_path=media_path,
                     media_type=media_type,
                     # Уже перевірили вище один раз і використовуємо
@@ -608,8 +640,10 @@ async def process_and_publish_news_cycle():
                 await asyncio.sleep(3)
                 continue
 
+            published_item = dict(item)
+            published_item["text"] = publication_text
             published_news.append(
-                item
+                published_item
             )
 
             if (
@@ -629,7 +663,7 @@ async def process_and_publish_news_cycle():
                 )
 
             first_line = (
-                item["text"]
+                publication_text
                 .strip()
                 .split("\n")[0]
             )
@@ -709,9 +743,12 @@ async def process_and_publish_news_cycle():
                     channel_name=history_channel,
                     message_id=history_message_id,
                     title=first_line,
+                    # Зберігаємо саме опублікований редакторський текст
+                    # (без доданого URL). Він багатший за короткий Analyzer
+                    # summary і дає наступним циклам сильніший semantic dedup.
                     summary=item.get(
-                        "summary",
-                        "",
+                        "text",
+                        item.get("summary", ""),
                     ),
                     category=item.get(
                         "category",
@@ -875,3 +912,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

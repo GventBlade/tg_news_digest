@@ -1,8 +1,10 @@
 import logging
 import os
+import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 from telethon import TelegramClient
 
@@ -39,9 +41,11 @@ class NewsCollector:
         - відсіює лише повністю порожні текстові повідомлення;
         - пропускає повідомлення, які вже були опубліковані раніше;
         - зберігає інформацію про фото/відео, engagement і час публікації;
-        - НЕ намагається оцінювати зміст картинки на етапі збору: це було б
-          дорого для сотень сирих постів. Фактична vision-перевірка фото
-          виконується у Publisher лише для вже відібраних фінальних новин.
+        - зберігає зовнішні URL із тексту/inline-link/web-preview, щоб
+          фінальний редактор міг додати реальне посилання на закон,
+          дослідження, звіт або статтю без вигадування URL;
+        - НЕ намагається оцінювати зміст картинки на етапі збору: фактична
+          vision-перевірка фото виконується у Publisher лише для фіналу.
         """
         if not self.client.is_connected():
             await self.client.start()
@@ -109,6 +113,17 @@ class NewsCollector:
                         else 0
                     )
 
+                    external_links = self._extract_external_links(
+                        message,
+                        text,
+                    )
+
+                    source_post_url = None
+                    if channel_username:
+                        source_post_url = (
+                            f"https://t.me/{channel_username}/{message.id}"
+                        )
+
                     collected.append({
                         "channel_name": channel_username,
                         "channel_username": channel_username,
@@ -125,6 +140,11 @@ class NewsCollector:
                         "media_size": self._get_media_size(message),
                         "date": message.date,
                         "is_priority": False,
+                        # Зовнішні посилання НЕ є Telegram source URL.
+                        # Вони використовуються лише як можливе першоджерело
+                        # документа/дослідження/статті у фінальному пості.
+                        "external_links": external_links,
+                        "source_post_url": source_post_url,
                         # Корисно для логів/майбутньої роботи з альбомами.
                         # Поточний pipeline лишається повністю сумісним.
                         "media_group_id": getattr(message, "grouped_id", None),
@@ -141,6 +161,123 @@ class NewsCollector:
         )
 
         return collected
+
+    @classmethod
+    def _extract_external_links(
+        cls,
+        message,
+        text: str,
+    ) -> List[Dict[str, str]]:
+        """
+        Витягує реальні зовнішні URL із Telegram-поста.
+
+        Підтримує:
+        - inline TextUrl;
+        - звичайні http(s) URL у тексті;
+        - web-preview;
+        - URL-кнопки.
+
+        Telegram-посилання t.me сюди не додаємо: потрібні лінки саме на
+        статті/закони/звіти, а не на ще один Telegram-пост.
+        """
+        result: List[Dict[str, str]] = []
+        seen = set()
+
+        def add(url: Any, label: Any = ""):
+            normalized = cls._normalize_external_url(url)
+            if not normalized or normalized in seen:
+                return
+            seen.add(normalized)
+            result.append({
+                "url": normalized,
+                "label": str(label or "").strip()[:180],
+            })
+
+        # Найнадійніший спосіб отримати TextUrl без ручного UTF-16 slicing.
+        try:
+            getter = getattr(message, "get_entities_text", None)
+            if callable(getter):
+                for pair in getter() or []:
+                    if not isinstance(pair, (tuple, list)) or len(pair) < 2:
+                        continue
+                    entity, entity_text = pair[0], pair[1]
+                    hidden_url = getattr(entity, "url", None)
+                    if hidden_url:
+                        add(hidden_url, entity_text)
+                    elif isinstance(entity_text, str):
+                        if re.match(r"^https?://", entity_text.strip(), re.I):
+                            add(entity_text, entity_text)
+        except Exception:
+            pass
+
+        # Видимі URL у plain text — fallback і доповнення.
+        for match in re.findall(r"https?://[^\s<>\]\[(){}]+", text or ""):
+            add(match, match)
+
+        # Web-preview інколи містить URL навіть коли у тексті видно лише anchor.
+        preview_candidates = [
+            getattr(message, "web_preview", None),
+            getattr(message, "webpage", None),
+        ]
+        media = getattr(message, "media", None)
+        if media is not None:
+            preview_candidates.append(getattr(media, "webpage", None))
+
+        for preview in preview_candidates:
+            if preview is None:
+                continue
+            try:
+                add(
+                    getattr(preview, "url", None),
+                    getattr(preview, "title", None) or "",
+                )
+            except Exception:
+                continue
+
+        # URL-кнопки під постом.
+        try:
+            buttons = getattr(message, "buttons", None) or []
+            for row in buttons:
+                row_items = row if isinstance(row, (list, tuple)) else [row]
+                for button in row_items:
+                    add(
+                        getattr(button, "url", None),
+                        getattr(button, "text", None) or "",
+                    )
+        except Exception:
+            pass
+
+        # Не передаємо в summarizer безмежну кількість рекламних/службових URL.
+        return result[:8]
+
+    @staticmethod
+    def _normalize_external_url(url: Any) -> Optional[str]:
+        value = str(url or "").strip()
+        if not value:
+            return None
+
+        value = value.rstrip(".,;:!?)]}>'\"")
+        try:
+            parsed = urlparse(value)
+        except Exception:
+            return None
+
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return None
+
+        host = (parsed.hostname or "").lower()
+        telegram_hosts = {
+            "t.me",
+            "telegram.me",
+            "telegram.org",
+        }
+        if host in telegram_hosts or any(
+            host.endswith("." + blocked)
+            for blocked in telegram_hosts
+        ):
+            return None
+
+        return value
 
     async def download_post_media(
         self,
