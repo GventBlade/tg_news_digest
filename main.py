@@ -139,15 +139,28 @@ def append_reference_link(
     """
     Додає коротке клікабельне першоджерело лише коли Summarizer знайшов
     реальний зовнішній URL у початкових Telegram-постах.
+
+    Для читача назва завжди проста й універсальна — "Посилання".
+    Внутрішня класифікація Summarizer
+    (документ / дослідження / звіт / стаття)
+    використовується тільки для вибору правильного URL.
     """
     base = str(text or "").strip()
     url = str(reference_url or "").strip()
+
     if not url:
         return base
 
-    label = str(reference_label or "Першоджерело").strip() or "Першоджерело"
-    safe_url = html.escape(url, quote=True)
-    safe_label = html.escape(label)
+    label = "Посилання"
+
+    safe_url = html.escape(
+        url,
+        quote=True,
+    )
+    safe_label = html.escape(
+        label
+    )
+
     return (
         f"{base}\n\n"
         f"🔗 <a href=\"{safe_url}\">{safe_label}</a>"
@@ -581,12 +594,7 @@ async def process_and_publish_news_cycle():
                     )
 
             # ЄДИНИЙ media-gate для ОБОХ платформ.
-            # Раніше publish_telegram_post() відхиляв неправильне фото
-            # тільки локально для Telegram, але main.py все одно додавав
-            # початковий media_path до Instagram-каруселі. Через це фото,
-            # яке Gemini правильно відхилив для Telegram, могло потрапити
-            # в Instagram. Тепер verdict отримуємо ДО публікації й, якщо
-            # медіа нерелевантне, прибираємо його для всього пайплайна.
+            # Verdict отримуємо ДО публікації.
             if (
                 media_path
                 and media_type in {"photo", "video"}
@@ -611,11 +619,12 @@ async def process_and_publish_news_cycle():
                         media_type,
                         media_verdict.get("reason", ""),
                     )
+
                     media_path = None
                     media_type = None
 
-            # Посилання додаємо ПІСЛЯ Vision-перевірки, щоб службовий
-            # рядок "Документ/Дослідження/Стаття" не впливав на media-gate.
+            # Посилання додаємо ПІСЛЯ Vision-перевірки,
+            # щоб службовий рядок не впливав на media-gate.
             publication_text = append_reference_link(
                 item["text"],
                 item.get("reference_url"),
@@ -627,8 +636,8 @@ async def process_and_publish_news_cycle():
                     text=publication_text,
                     media_path=media_path,
                     media_type=media_type,
-                    # Уже перевірили вище один раз і використовуємо
-                    # той самий verdict для Telegram та Instagram.
+
+                    # Уже перевірили вище один раз.
                     validate_media=False,
                 )
             )
@@ -641,7 +650,10 @@ async def process_and_publish_news_cycle():
                 continue
 
             published_item = dict(item)
-            published_item["text"] = publication_text
+            published_item["text"] = (
+                publication_text
+            )
+
             published_news.append(
                 published_item
             )
@@ -668,9 +680,8 @@ async def process_and_publish_news_cycle():
                 .split("\n")[0]
             )
 
-            # Ключова зміна проти дублів:
-            # зберігаємо в історію ВСІ source_ids події,
-            # а не тільки той пост, з якого взяли медіа.
+            # Зберігаємо в історію ВСІ source_ids події,
+            # а не тільки пост, з якого взяли медіа.
             source_ids = item.get(
                 "source_ids"
             )
@@ -743,13 +754,18 @@ async def process_and_publish_news_cycle():
                     channel_name=history_channel,
                     message_id=history_message_id,
                     title=first_line,
-                    # Зберігаємо саме опублікований редакторський текст
-                    # (без доданого URL). Він багатший за короткий Analyzer
-                    # summary і дає наступним циклам сильніший semantic dedup.
+
+                    # Зберігаємо повний редакторський текст
+                    # без URL, щоб наступні цикли мали
+                    # сильніший semantic history context.
                     summary=item.get(
                         "text",
-                        item.get("summary", ""),
+                        item.get(
+                            "summary",
+                            "",
+                        ),
                     ),
+
                     category=item.get(
                         "category",
                         "",
@@ -772,8 +788,8 @@ async def process_and_publish_news_cycle():
 
             await asyncio.sleep(3)
 
-        # 6. Ручні новини позначаємо processed тільки якщо
-        # відповідна подія справді була опублікована.
+        # 6. Ручні новини позначаємо processed
+        # лише якщо відповідна подія справді опублікована.
         if published_manual_ids:
             history.mark_manual_posts_processed(
                 sorted(
@@ -845,8 +861,9 @@ async def on_startup(
 ):
     """
     Запускається всередині активного event loop.
-    Scheduler зберігаємо в bot_data, щоб він гарантовано
-    жив разом із Application.
+
+    Scheduler зберігаємо в bot_data,
+    щоб він гарантовано жив разом із Application.
     """
     scheduler = AsyncIOScheduler(
         timezone="Europe/Kyiv"
@@ -912,4 +929,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

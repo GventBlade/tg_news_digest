@@ -424,15 +424,9 @@ class NewsSummarizer:
             max_retries_per_model,
         )
 
-        # Окремий низькотемпературний factual pass: не міняє склад випуску,
-        # а тільки звіряє формулювання Editor із фактичними source-текстами.
-        final_news = self._fact_check_final_news(
-            final_news,
-            ranked_events,
-            posts,
-            max_retries_per_model,
-        )
-
+        # Спочатку валідовуємо Editor-відповідь. Фінальний factual pass
+        # запускаємо ПІСЛЯ fallback + digest mix, щоб він охоплював буквально
+        # кожну новину, яка реально піде в публікацію.
         validated = self._validate_final_news(
             final_news,
             ranked_events,
@@ -489,6 +483,15 @@ class NewsSummarizer:
             ranked_events,
             posts,
             effective_count,
+        )
+
+        # Фінальний factual pass після всіх fallback/priority/mix.
+        # Тепер перевіряються всі фактичні 7-10 постів.
+        validated = self._fact_check_final_news(
+            validated,
+            ranked_events,
+            posts,
+            max_retries_per_model,
         )
 
         logger.info(
@@ -3254,6 +3257,14 @@ MANUAL POSTS:
         history_families = self._decision_family_signature(history_text)
         shared_families = current_families & history_families
         if not shared_families:
+            return False
+
+        # 24h hard-lock лише для справді процедурної policy-story.
+        # Самих слів "податок/тариф/санкції/закон" недостатньо:
+        # на обох сторонах має бути визначуваний юридичний/процедурний статус.
+        current_status = self._decision_status_signature(current_text)
+        history_status = self._decision_status_signature(history_text)
+        if not current_status or not history_status:
             return False
 
         stats = self._history_similarity_stats(current_text, history_text)
@@ -7136,6 +7147,18 @@ discovery-блок.
             & self._topic_family_signature(history_text)
         )
 
+        current_attack = self._event_is_physical_attack(event)
+        history_attack = self._looks_like_attack_text(history_text)
+        if current_attack:
+            if (
+                not history_attack
+                or not self._attack_same_story_anchor_match(
+                    current_text,
+                    history_text,
+                )
+            ):
+                return 0.0
+
         score = (
             stats["seq"] * 18.0
             + stats["overlap"] * 18.0
@@ -7155,17 +7178,24 @@ discovery-блок.
             elif age_hours > self.SEMANTIC_HISTORY_LOOKBACK_HOURS:
                 score -= 8.0
 
-        current_attack = self._event_is_physical_attack(event)
-        history_attack = self._looks_like_attack_text(history_text)
-        if current_attack:
-            if not history_attack:
-                score -= 25.0
-            elif not self._attack_same_story_anchor_match(
-                current_text,
-                history_text,
-            ):
-                # Різні удари мають майже не потрапляти в semantic-review.
-                score *= 0.30
+        # Один спільний політик/бренд без спільної теми — не одна історія.
+        if (
+            len(shared_entities) <= 1
+            and not shared_topics
+            and len(shared_story) < 4
+            and stats["common"] < 6
+            and stats["seq"] < 0.58
+        ):
+            score *= 0.30
+
+        # Широка тема без конкретної сутності теж не повинна домінувати.
+        if (
+            not shared_entities
+            and len(shared_story) < 5
+            and stats["common"] < 7
+            and stats["seq"] < 0.60
+        ):
+            score *= 0.45
 
         if (
             shared_entities
@@ -7175,6 +7205,85 @@ discovery-блок.
             score += 10.0
 
         return round(max(0.0, score), 2)
+
+    def _semantic_same_story_plausible(
+        self,
+        event: Dict[str, Any],
+        history: Dict[str, str],
+    ) -> bool:
+        """Sanity-check після HISTORY_REVIEW проти тематичних false-positive."""
+        current_text = self._event_text_bundle(event)
+        history_text = " ".join(
+            value
+            for value in [
+                str(history.get("title") or ""),
+                str(history.get("summary") or ""),
+            ]
+            if value
+        )
+        if not current_text or not history_text:
+            return False
+
+        if self._event_is_physical_attack(event):
+            return (
+                self._looks_like_attack_text(history_text)
+                and self._attack_same_story_anchor_match(
+                    current_text,
+                    history_text,
+                )
+            )
+
+        if (
+            self._looks_like_decision_story_text(current_text)
+            and self._looks_like_decision_story_text(history_text)
+        ):
+            return self._same_decision_story(
+                current_text,
+                history_text,
+            )
+
+        stats = self._history_similarity_stats(current_text, history_text)
+        shared_entities = (
+            self._entity_signature(current_text)
+            & self._entity_signature(history_text)
+        )
+        shared_story = (
+            self._story_signature(current_text)
+            & self._story_signature(history_text)
+        )
+        shared_topics = (
+            self._topic_family_signature(current_text)
+            & self._topic_family_signature(history_text)
+        )
+
+        if (
+            not shared_entities
+            and len(shared_story) < 5
+            and stats["common"] < 7
+            and stats["seq"] < 0.60
+        ):
+            return False
+
+        if (
+            len(shared_entities) <= 1
+            and not shared_topics
+            and len(shared_story) < 4
+            and stats["common"] < 6
+            and stats["seq"] < 0.58
+        ):
+            return False
+
+        event_type = str(event.get("event_type") or "").strip().lower()
+        if event_type == "science_tech":
+            if (
+                not shared_entities
+                and len(shared_story) < 6
+                and stats["common"] < 8
+                and stats["seq"] < 0.65
+            ):
+                return False
+
+        return True
 
     def _semantic_review_source_excerpt(
         self,
@@ -7354,6 +7463,15 @@ SAME_STORY=true лише якщо це та сама конкретна лока
 або інша чітка унікальна прив'язка. Звягель ≠ Луцьк. Рівненщина ≠ будь-яка
 інша атака на заході лише через схожі слова.
 
+КРИТИЧНО ДЛЯ ПОЛІТИКИ / МІЖНАРОДНИХ / ТЕХНОЛОГІЙ:
+- одна й та сама людина НЕ означає ту саму історію:
+  "Трамп про НПЗ РФ" ≠ "Зеленський зустрінеться з Трампом";
+- одна країна або організація НЕ означає ту саму історію;
+- одна широка тема НЕ означає ту саму історію:
+  "український дрон-перехоплювач" ≠ "в'єтнамський сіткомет проти дронів";
+- для SAME_STORY має збігатися конкретний предмет: той самий документ,
+  продукт/проєкт, операція, звіт, дослідження, домовленість або інцидент.
+
 MATERIAL_UPDATE=true лише коли ПІСЛЯ попередньої публікації з'явився факт,
 який реально змінює картину: нові значні жертви/наслідки, нове офіційне
 рішення або юридичний статус, підтверджений результат операції, новий великий
@@ -7435,6 +7553,23 @@ CASES:
             same_story = bool(decision.get("same_story", False))
             candidate_id = str(decision.get("matched_candidate_id") or "")
             matched_history = meta["candidate_map"].get(candidate_id)
+
+            if (
+                same_story
+                and matched_history is not None
+                and not self._semantic_same_story_plausible(
+                    event,
+                    matched_history,
+                )
+            ):
+                logger.info(
+                    "Semantic history review sanity-rejected: "
+                    "event_id=%s candidate='%s'.",
+                    event.get("event_id"),
+                    str(matched_history.get("title") or "")[:120],
+                )
+                same_story = False
+                matched_history = None
 
             if not same_story or matched_history is None:
                 # Добові hard-lock правила — редакційні правила, а не
@@ -7730,4 +7865,3 @@ CASES:
         )
 
         return text.strip()
-
