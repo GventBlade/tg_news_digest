@@ -155,6 +155,12 @@ class NewsSummarizer:
             "gemini-3.1-flash-lite",
         ]
 
+        # Telemetry для post-publication quality audit.
+        # Це лише службова статистика останнього FINAL_FACT_CHECK:
+        # audit читає її після публікації, але вона не впливає
+        # на ranking, dedup або сам текст новин.
+        self.last_fact_check_stats: Dict[str, Any] = {}
+
     def select_top_distinct_news(
         self,
         posts: List[Dict[str, Any]],
@@ -167,6 +173,11 @@ class NewsSummarizer:
         count: int = DEFAULT_COUNT,
         max_retries_per_model: int = 2,
     ) -> List[Dict[str, Any]]:
+        # Кожен новий цикл починається з чистої telemetry.
+        # Це важливо, щоб audit ніколи не використав статистику
+        # попереднього випуску, якщо поточний цикл завершився раніше.
+        self.last_fact_check_stats = {}
+
         if not posts:
             return []
 
@@ -4300,7 +4311,18 @@ MANUAL POSTS:
         max_retries: int,
     ) -> List[Dict[str, Any]]:
         """Фінальний factual/editorial pass одним batch-запитом."""
+        stats = {
+            "enabled": bool(self.FINAL_FACT_CHECK_ENABLED),
+            "expected": len(news or []),
+            "eligible_cases": 0,
+            "checked": 0,
+            "corrected": 0,
+            "completed": False,
+        }
+
         if not self.FINAL_FACT_CHECK_ENABLED or not news:
+            stats["completed"] = True
+            self.last_fact_check_stats = stats
             return news
 
         event_map = {
@@ -4350,7 +4372,11 @@ MANUAL POSTS:
                 "sources": source_payload,
             })
 
+        stats["eligible_cases"] = len(cases)
+
         if not cases:
+            stats["completed"] = True
+            self.last_fact_check_stats = stats
             return news
 
         payload = json.dumps(cases, ensure_ascii=False)
@@ -4402,6 +4428,17 @@ CASES:
             if isinstance(check, dict) and check.get("event_id")
         }
 
+        valid_case_ids = {
+            str(case.get("event_id") or "")
+            for case in cases
+            if isinstance(case, dict) and case.get("event_id")
+        }
+        checked_count = sum(
+            1
+            for event_id in valid_case_ids
+            if event_id in check_map
+        )
+
         result = []
         changed_count = 0
         for item in news:
@@ -4426,10 +4463,20 @@ CASES:
                             )
             result.append(item_copy)
 
+        stats.update({
+            "checked": checked_count,
+            "corrected": changed_count,
+            "completed": data is not None,
+        })
+        self.last_fact_check_stats = stats
+
         logger.info(
-            "Final fact-check: checked=%s corrected=%s.",
-            len(cases),
-            changed_count,
+            "Final fact-check: expected=%s eligible=%s checked=%s corrected=%s completed=%s.",
+            stats["expected"],
+            stats["eligible_cases"],
+            stats["checked"],
+            stats["corrected"],
+            stats["completed"],
         )
         return result
 

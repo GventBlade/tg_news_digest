@@ -22,6 +22,16 @@ from app.services.history import NewsHistory
 from app.services.publisher import NewsPublisher
 from app.services.summarizer import NewsSummarizer
 
+# Quality audit навмисно імпортуємо fail-safe:
+# якщо новий модуль випадково відсутній або має помилку імпорту,
+# основний Telegram/Instagram pipeline все одно запускається.
+try:
+    from app.services.quality_audit import QualityAuditor
+    _QUALITY_AUDIT_IMPORT_ERROR = None
+except Exception as exc:
+    QualityAuditor = None
+    _QUALITY_AUDIT_IMPORT_ERROR = exc
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -362,6 +372,12 @@ async def handle_admin_forwarded_message(
 
 
 async def process_and_publish_news_cycle():
+    cycle_started_at = datetime.now(
+        timezone.utc
+    ).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+
     logger.info(
         "🚀 Початок новинного циклу 4/24..."
     )
@@ -383,6 +399,14 @@ async def process_and_publish_news_cycle():
         pending_manual = (
             history.get_pending_manual_posts()
         )
+
+        expected_manual_ids = [
+            int(manual["id"])
+            for manual in pending_manual
+            if str(
+                manual.get("id", "")
+            ).isdigit()
+        ]
 
         manual_posts_formatted = []
 
@@ -593,6 +617,14 @@ async def process_and_publish_news_cycle():
                         f"для новини #{index}: {dl_err}"
                     )
 
+            # Зберігаємо початковий media-state для read-only audit.
+            # Audit не запускає Vision вдруге; він лише перевірить,
+            # що відхилене медіа не залишилось у фінальному pipeline.
+            original_media_path = media_path
+            original_media_type = media_type
+            media_rejected = False
+            media_reject_reason = ""
+
             # ЄДИНИЙ media-gate для ОБОХ платформ.
             # Verdict отримуємо ДО публікації.
             if (
@@ -611,6 +643,15 @@ async def process_and_publish_news_cycle():
                     "is_relevant",
                     False,
                 ):
+                    media_rejected = True
+                    media_reject_reason = str(
+                        media_verdict.get(
+                            "reason",
+                            "",
+                        )
+                        or ""
+                    )
+
                     logger.warning(
                         "MEDIA DROPPED FOR ALL PLATFORMS: "
                         "news_index=%s path=%s type=%s reason=%s",
@@ -653,6 +694,18 @@ async def process_and_publish_news_cycle():
             published_item["text"] = (
                 publication_text
             )
+
+            # Runtime telemetry лише для post-publication audit.
+            # Ці службові поля не публікуються в Telegram і не
+            # записуються у semantic history.
+            published_item["_audit_media"] = {
+                "original_path": original_media_path,
+                "original_type": original_media_type,
+                "rejected": media_rejected,
+                "reject_reason": media_reject_reason,
+                "final_path": media_path,
+                "final_type": media_type,
+            }
 
             published_news.append(
                 published_item
@@ -830,6 +883,87 @@ async def process_and_publish_news_cycle():
                 "Instagram: валідні медіа "
                 "відсутні або новини не були "
                 "успішно опубліковані."
+            )
+
+        # 8. POST-PUBLICATION QUALITY AUDIT.
+        #
+        # ВАЖЛИВО:
+        # - запускається лише ПІСЛЯ основної публікації;
+        # - нічого не видаляє, не редагує і не перепубліковує;
+        # - працює в окремому thread, щоб Gemini audit не блокував
+        #   Telegram polling / event loop;
+        # - будь-яка помилка audit НЕ ламає новинний цикл.
+        fact_check_stats = getattr(
+            summarizer,
+            "last_fact_check_stats",
+            None,
+        )
+
+        if QualityAuditor is None:
+            logger.warning(
+                "QUALITY AUDIT skipped: модуль quality_audit "
+                "не завантажився: %s",
+                _QUALITY_AUDIT_IMPORT_ERROR,
+            )
+
+        elif (
+            not isinstance(
+                fact_check_stats,
+                dict,
+            )
+            or not fact_check_stats
+        ):
+            # Не підробляємо checked=N. Поки Summarizer не віддав
+            # реальну telemetry FINAL_FACT_CHECK, audit краще пропустити,
+            # ніж записати неправдиве QUALITY AUDIT: OK.
+            logger.warning(
+                "QUALITY AUDIT skipped: Summarizer ще не віддав "
+                "last_fact_check_stats. Потрібен telemetry-патч "
+                "summarizer.py."
+            )
+
+        elif published_news:
+            try:
+                auditor = QualityAuditor()
+
+                audit_result = await asyncio.to_thread(
+                    auditor.run,
+                    published_news=published_news,
+                    prior_events=past_events,
+                    fact_check_stats=fact_check_stats,
+                    expected_manual_ids=expected_manual_ids,
+                    published_manual_ids=sorted(
+                        published_manual_ids
+                    ),
+                    cycle_started_at=cycle_started_at,
+                )
+
+                audit_id = (
+                    history.save_quality_audit(
+                        audit_result
+                    )
+                )
+
+                logger.info(
+                    "QUALITY AUDIT saved: id=%s status=%s.",
+                    audit_id,
+                    audit_result.get(
+                        "status",
+                        "UNKNOWN",
+                    ),
+                )
+
+            except Exception as audit_exc:
+                logger.warning(
+                    "QUALITY AUDIT failed safely: %s",
+                    audit_exc,
+                    exc_info=True,
+                )
+
+        else:
+            logger.warning(
+                "QUALITY AUDIT skipped: у цьому циклі "
+                "немає успішно опублікованих новин."
             )
 
         history.cleanup_old_records(
