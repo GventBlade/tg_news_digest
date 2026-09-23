@@ -295,6 +295,15 @@ class NewsSummarizer:
                 desired_discovery_slots,
             )
 
+            # Зберігаємо останній уже валідний ranked pool ДО discovery.
+            # Discovery — це recovery для цікавих додаткових подій і він не має
+            # права обнулити вже готовий випуск через повторний history-pass.
+            pre_discovery_ranked_events = [
+                dict(ev)
+                for ev in ranked_events
+                if isinstance(ev, dict)
+            ]
+
             analyzed_events = self._ensure_discovery_events(
                 analyzed_events,
                 posts,
@@ -330,10 +339,22 @@ class NewsSummarizer:
             )
 
             if not ranked_events:
-                logger.warning(
-                    "Після discovery-recovery ranking не залишив подій."
-                )
-                return []
+                # Fail-safe: discovery-pass не є причиною втрачати вже валідні
+                # core/discovery події, які пройшли перший history review.
+                # Якщо recovery через будь-який повторний matcher обнулив пул,
+                # повертаємось до останнього валідного pre-discovery ranking.
+                if pre_discovery_ranked_events:
+                    logger.warning(
+                        "Discovery history fail-safe: повторний pass обнулив "
+                        "ranking. Відновлюємо %s валідних pre-discovery подій.",
+                        len(pre_discovery_ranked_events),
+                    )
+                    ranked_events = pre_discovery_ranked_events
+                else:
+                    logger.warning(
+                        "Після discovery-recovery ranking не залишив подій."
+                    )
+                    return []
 
         priority_ranked = [
             ev
@@ -7111,6 +7132,17 @@ discovery-блок.
                 already_repeat = bool(
                     event.get("is_history_repeat", False)
                 )
+
+                # КРИТИЧНО ДЛЯ DISCOVERY-RECHECK:
+                # deterministic guard може знову поставити soft history-match
+                # уже після того, як перший HISTORY_REVIEW його правильно зняв.
+                # У такому разі старий history_semantic_reviewed=True більше не
+                # валідний: новий/повторно встановлений match ОБОВ'ЯЗКОВО має
+                # ще раз пройти semantic adjudication, інакше ranking відкине
+                # нормальну нову подію як repeat. Саме це обнулило ранковий
+                # випуск 23.09 після discovery-pass.
+                event["history_semantic_reviewed"] = False
+
                 event["is_history_repeat"] = True
                 event["history_hard_duplicate"] = hard_duplicate
                 event["daily_air_defense_summary_locked"] = (
