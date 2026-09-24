@@ -113,6 +113,14 @@ class NewsSummarizer:
     MAX_INPUT_CHARS = 55000
     PRIORITY_RECOVERY_MAX_CHARS = 30000
 
+    # Аварійний Analyzer використовується ТІЛЬКИ коли основний cascade
+    # технічно не дав валідної JSON-відповіді (503/429/timeout/битий JSON).
+    # Менший контекст + менша кількість подій різко знижують шанс повторного
+    # malformed JSON і не дозволяють технічному збою перетворитися на "0 новин".
+    EMERGENCY_ANALYZER_MAX_CHARS = 26000
+    EMERGENCY_ANALYZER_MAX_EVENTS = 6
+    EMERGENCY_SYNTHETIC_MAX_EVENTS = 3
+
     # Окремий контекст для пошуку "цікавинок". Він коротший на один пост,
     # зате навмисно більш різноманітний за джерелами і темами, щоб великі
     # воєнно-політичні пости не витісняли технології, науку, бізнес і
@@ -202,6 +210,20 @@ class NewsSummarizer:
             past_events,
             max_retries_per_model,
         )
+
+        # ВАЖЛИВО: None означає технічний провал cascade, а [] — валідну
+        # відповідь Analyzer "подій немає". Раніше обидва випадки зливалися
+        # в один і технічний 503/битий JSON помилково давав порожній випуск.
+        if analyzed_events is None:
+            logger.error(
+                "ANALYZER TECHNICAL FAILURE: усі моделі/спроби не дали "
+                "валідної JSON-відповіді. Запускаємо emergency recovery."
+            )
+            analyzed_events = self._recover_after_analyzer_failure(
+                posts,
+                past_events,
+                max_retries_per_model,
+            )
 
         if not analyzed_events:
             logger.warning(
@@ -1844,14 +1866,288 @@ TELEGRAM POSTS:
             temperature=0.15,
         )
 
-        return (
-            data.get("events", [])
-            if (
-                data
-                and isinstance(data.get("events"), list)
-            )
-            else []
+        # None = технічний failure cascade. Порожній list = валідна
+        # JSON-відповідь, у якій Analyzer свідомо не знайшов подій.
+        if data is None:
+            return None
+
+        events = data.get("events")
+        return events if isinstance(events, list) else []
+
+    def _recover_after_analyzer_failure(
+        self,
+        posts: List[Dict[str, Any]],
+        past_events: Optional[
+            Union[
+                List[str],
+                List[Dict[str, str]],
+            ]
+        ],
+        max_retries: int,
+    ) -> List[Dict[str, Any]]:
+        """
+        Аварійний recovery лише після ТЕХНІЧНОГО провалу основного Analyzer.
+
+        1) повторюємо аналіз на значно меншому контексті й просимо максимум
+           кілька подій — це лікує і high-demand, і malformed JSON;
+        2) якщо API знову повністю недоступне, створюємо 1-3 консервативні
+           synthetic candidates із найсильніших сирих постів;
+        3) synthetic candidates НЕ обходять dedup/history/ranking/editorial
+           gates — нижче вони проходять той самий pipeline, що й звичайні.
+        """
+        emergency_context = self._build_posts_context(
+            posts,
+            max_chars=self.EMERGENCY_ANALYZER_MAX_CHARS,
         )
+
+        if emergency_context:
+            logger.warning(
+                "EMERGENCY ANALYZER: запускаємо компактний recovery-контекст "
+                "(ліміт=%s символів, max_events=%s).",
+                self.EMERGENCY_ANALYZER_MAX_CHARS,
+                self.EMERGENCY_ANALYZER_MAX_EVENTS,
+            )
+
+            recovered = self._analyze_emergency_events(
+                emergency_context,
+                past_events,
+                max_retries,
+            )
+
+            if recovered is not None:
+                if recovered:
+                    logger.warning(
+                        "EMERGENCY ANALYZER recovered %s подій після "
+                        "технічного збою основного Analyzer.",
+                        len(recovered),
+                    )
+                    return recovered
+
+                # Валідний emergency JSON із events=[] — це вже змістовний
+                # результат, а не технічна помилка. Не вигадуємо новини.
+                logger.warning(
+                    "EMERGENCY ANALYZER успішно відповів, але не знайшов "
+                    "придатних подій."
+                )
+                return []
+
+        synthetic = self._build_emergency_synthetic_events(posts)
+        if synthetic:
+            logger.error(
+                "EMERGENCY PYTHON FALLBACK: Gemini недоступний і для recovery. "
+                "Створено %s synthetic candidate(s); вони ще пройдуть "
+                "звичайні history/ranking gates.",
+                len(synthetic),
+            )
+        else:
+            logger.error(
+                "EMERGENCY PYTHON FALLBACK: не вдалося сформувати жодного "
+                "безпечного synthetic candidate."
+            )
+
+        return synthetic
+
+    def _analyze_emergency_events(
+        self,
+        posts_context: str,
+        past_events: Optional[
+            Union[
+                List[str],
+                List[Dict[str, str]],
+            ]
+        ],
+        max_retries: int,
+    ) -> Optional[List[Dict[str, Any]]]:
+        history_block = self._build_history_block(past_events)
+
+        prompt = f"""
+Ти — аварійний редактор українського Telegram-дайджесту.
+
+Основний Analyzer технічно не зміг повернути валідний JSON. Зараз у тебе
+КОРОТШИЙ контекст. Знайди максимум {self.EMERGENCY_ANALYZER_MAX_EVENTS}
+найсильніших САМОСТІЙНИХ подій останніх 4 годин.
+
+Правила:
+- не вигадуй фактів;
+- одна реальна подія = один event;
+- об'єднуй дублікати різних каналів;
+- не бери тривоги, рух БпЛА, чутки, дрібний кримінал і побутовий шум;
+- сильна атака, важливе рішення, велика аварія/злочин, значуща економічна,
+  міжнародна, технологічна або практично корисна подія може бути eligible;
+- для атак не склеюй різні удари без спільної конкретної локації/цілі/хвилі;
+- якщо та сама подія вже є в архіві, став is_history_repeat=true;
+- повтор без справді значущого розвитку став eligible_for_digest=false;
+- поверни КРАЩЕ 1-3 сильні події, ніж слабкі заповнювачі;
+- response має бути одним компактним JSON object без Markdown.
+
+АРХІВ:
+{history_block}
+
+ВІДПОВІДЬ ТІЛЬКИ JSON:
+{{
+  "events": [
+    {{
+      "event_id": "ER1",
+      "source_ids": [12],
+      "best_factual_source_id": 12,
+      "best_media_source_id": 12,
+      "eligible_for_digest": true,
+      "rejection_reason": "",
+      "digest_role": "core",
+      "is_discovery_candidate": false,
+      "event_type": "other",
+      "category": "other",
+      "importance": 75,
+      "scale": 65,
+      "reliability": 80,
+      "public_interest": 75,
+      "novelty": 80,
+      "curiosity": 65,
+      "practical_value": 40,
+      "media_quality": 70,
+      "national_relevance": 70,
+      "urgency": 80,
+      "is_history_repeat": false,
+      "history_update_strength": 0,
+      "headline_hint": "Короткий конкретний заголовок",
+      "key_facts": ["Факт 1", "Факт 2"],
+      "why_it_matters": "Коротко.",
+      "summary": "Стислий фактологічний опис."
+    }}
+  ]
+}}
+
+TELEGRAM POSTS:
+{posts_context}
+"""
+
+        data = self._call_json_with_cascade(
+            prompt,
+            max_retries,
+            "EMERGENCY_ANALYZER",
+            temperature=0.08,
+        )
+
+        if data is None:
+            return None
+
+        events = data.get("events")
+        return events if isinstance(events, list) else []
+
+    def _build_emergency_synthetic_events(
+        self,
+        posts: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """
+        Остання страховка без LLM.
+
+        Вона не публікує сирі пости напряму: лише створює до трьох candidate
+        events. Далі їх обов'язково перевіряють current dedup, history guard,
+        semantic review (якщо API ожив), ranking та Editor/fallback.
+        """
+        now_utc = datetime.now(timezone.utc)
+        candidates: List[tuple] = []
+
+        for source_id, post in enumerate(posts):
+            text = str(post.get("text") or "").strip()
+            if not text or post.get("is_priority"):
+                # Manual має власну абсолютну priority-recovery.
+                continue
+
+            normalized = self._normalize_similarity_text(text)
+            if len(normalized) < 35:
+                continue
+
+            # Не підтягуємо очевидний оперативний шум у аварійний випуск.
+            noise_markers = (
+                "повітряна тривога",
+                "відбій тривоги",
+                "рух бпла",
+                "рух шахед",
+                "загроза баліст",
+                "загроза застосування",
+            )
+            if any(marker in normalized for marker in noise_markers):
+                continue
+
+            views = int(post.get("views") or 0)
+            forwards = int(post.get("forwards") or 0)
+            replies = int(post.get("replies") or 0)
+            username = (
+                str(post.get("channel_username") or "")
+                .replace("@", "")
+                .strip()
+            )
+
+            score = (
+                min(math.log10(max(views, 1)) * 4.0, 26.0)
+                + min(math.log10(max(forwards, 1)) * 3.0, 12.0)
+                + min(math.log10(max(replies, 1)) * 2.0, 8.0)
+            ) * self._get_source_multiplier(username)
+
+            if post.get("has_video"):
+                score += 5.0
+            elif post.get("has_media"):
+                score += 2.5
+
+            post_date = post.get("date")
+            if isinstance(post_date, datetime):
+                if post_date.tzinfo is None:
+                    post_date = post_date.replace(tzinfo=timezone.utc)
+                age_minutes = max(
+                    0.0,
+                    (now_utc - post_date.astimezone(timezone.utc)).total_seconds()
+                    / 60.0,
+                )
+                score += max(0.0, 8.0 * (1.0 - min(age_minutes, 240.0) / 240.0))
+
+            # Сильні factual-маркери піднімають кандидата, але не гарантують
+            # публікацію: справжній quality gate іде пізніше.
+            strong_markers = (
+                "загин", "поран", "зруйн", "знищ", "влуч", "масован",
+                "ухвал", "схвал", "підпис", "санкц", "млрд", "мільярд",
+                "евакуац", "затрим", "підозр", "вирок", "контракт",
+                "запуст", "відкрив", "вперше", "рекорд",
+            )
+            score += min(
+                sum(1 for marker in strong_markers if marker in normalized) * 3.0,
+                15.0,
+            )
+
+            candidates.append((score, source_id, text))
+
+        candidates.sort(key=lambda item: item[0], reverse=True)
+
+        selected_ids: List[int] = []
+        for _, source_id, text in candidates:
+            if any(
+                self._texts_same_event(
+                    text,
+                    str(posts[other_id].get("text") or ""),
+                )
+                for other_id in selected_ids
+            ):
+                continue
+
+            selected_ids.append(source_id)
+            if len(selected_ids) >= self.EMERGENCY_SYNTHETIC_MAX_EVENTS:
+                break
+
+        result: List[Dict[str, Any]] = []
+        for sequence, source_id in enumerate(selected_ids, start=1):
+            event = self._build_synthetic_priority_event(
+                [source_id],
+                posts,
+                sequence,
+            )
+            event["event_id"] = f"ER_SYNTH_{sequence}"
+            event["eligible_for_digest"] = True
+            event["rejection_reason"] = ""
+            # Не маскуємо fallback під manual.
+            event["emergency_synthetic"] = True
+            result.append(event)
+
+        return result
 
     def _get_priority_post_ids(
         self,
@@ -6088,7 +6384,7 @@ discovery-блок.
                         )
 
                         if attempt < max_retries:
-                            time.sleep(min(2 * attempt, 4))
+                            time.sleep(min(4 * attempt, 8))
                             continue
 
                         # Після вичерпання спроб цього model переходимо
@@ -6142,7 +6438,7 @@ discovery-блок.
                             e,
                         )
                         if attempt < max_retries:
-                            time.sleep(3 * attempt)
+                            time.sleep(min(5 * attempt, 10))
                             continue
                         break
 
