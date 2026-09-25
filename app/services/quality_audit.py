@@ -218,6 +218,7 @@ class QualityAuditor:
             self._check_priority(
                 expected_manual_ids or [],
                 published_manual_ids or [],
+                news,
             )
         )
 
@@ -1192,47 +1193,86 @@ CASES:
 
     @staticmethod
     def _check_priority(
-        expected_manual_ids: List[
-            int
-        ],
-        published_manual_ids: List[
-            int
-        ],
-    ) -> List[
-        Dict[str, Any]
-    ]:
-        expected = {
-            int(value)
-            for value
-            in expected_manual_ids
-        }
+        expected_manual_ids: List[int],
+        published_manual_ids: List[int],
+        news: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        expected = {int(value) for value in expected_manual_ids}
+        published = {int(value) for value in published_manual_ids}
+        issues: List[Dict[str, Any]] = []
 
-        published = {
-            int(value)
-            for value
-            in published_manual_ids
-        }
+        missing = sorted(expected - published)
+        if missing:
+            issues.append({
+                "type": "priority_missing",
+                "event_id": "",
+                "confidence": 100,
+                "reason": (
+                    "Manual queue IDs не були успішно опубліковані: "
+                    f"{missing}"
+                ),
+            })
 
-        missing = sorted(
-            expected
-            - published
+        seen_counts: Dict[int, int] = {}
+        for item in news or []:
+            if not isinstance(item, dict):
+                continue
+
+            all_ids = [
+                int(value)
+                for value in (item.get("_audit_manual_all_ids") or [])
+                if isinstance(value, int)
+            ]
+            safe_ids = [
+                int(value)
+                for value in (item.get("_audit_manual_ids") or [])
+                if isinstance(value, int)
+            ]
+            verified = bool(item.get("_audit_manual_merge_verified", True))
+
+            if len(all_ids) > 1 and not verified:
+                issues.append({
+                    "type": "priority_unverified_merge",
+                    "event_id": str(item.get("event_id") or ""),
+                    "confidence": 100,
+                    "reason": (
+                        "Один фінальний пост містить кілька manual queue IDs без "
+                        f"підтвердженого same-event merge: {all_ids}."
+                    ),
+                })
+
+            for queue_id in safe_ids:
+                seen_counts[queue_id] = seen_counts.get(queue_id, 0) + 1
+
+            if item.get("_audit_main_manual_fallback"):
+                issues.append({
+                    "type": "priority_main_fallback_used",
+                    "event_id": str(item.get("event_id") or ""),
+                    "confidence": 100,
+                    "reason": (
+                        "Спрацював останній main-level manual fallback. Manual "
+                        "опубліковано, але треба перевірити, чому Summarizer guard "
+                        "не зберіг його до FINAL_FACT_CHECK."
+                    ),
+                })
+
+        duplicated = sorted(
+            queue_id
+            for queue_id, count in seen_counts.items()
+            if count > 1
         )
+        if duplicated:
+            issues.append({
+                "type": "priority_duplicate_publication",
+                "event_id": "",
+                "confidence": 100,
+                "reason": (
+                    "Ті самі manual queue IDs представлені більш ніж в одному "
+                    f"опублікованому пості: {duplicated}."
+                ),
+            })
 
-        if not missing:
-            return []
-
-        return [{
-            "type": (
-                "priority_missing"
-            ),
-            "event_id": "",
-            "confidence": 100,
-            "reason": (
-                "Manual queue IDs не були "
-                "успішно опубліковані: "
-                f"{missing}"
-            ),
-        }]
+        return issues
 
     def _memory_observations(
         self,

@@ -360,8 +360,8 @@ async def handle_admin_forwarded_message(
 
     await message.reply_text(
         "✅ Новину збережено до черги. "
-        "Вона матиме найвищий пріоритет "
-        "у найближчому слоті."
+        "Вона гарантовано піде в найближчий слот; "
+        "короткий опис із медіа теж допускається."
     )
 
     logger.info(
@@ -369,6 +369,154 @@ async def handle_admin_forwarded_message(
         f"(queue_id={queue_id}, "
         f"telegram_message_id={message.message_id})."
     )
+
+
+def _manual_queue_ids_for_item(
+    item: dict,
+    posts: list,
+) -> tuple[list[int], list[int]]:
+    """
+    Повертає (all_manual_ids, safe_manual_ids) для конкретного final item.
+
+    Якщо один item раптом містить кілька manual IDs без підтвердженого merge,
+    вважаємо покритим лише primary manual. Це не дає помилково позначити всі
+    ручні новини processed через один змерджений пост.
+    """
+    source_ids = item.get("source_ids")
+    if not isinstance(source_ids, list):
+        source_ids = [item.get("source_id")]
+
+    all_ids = []
+    source_to_queue = {}
+    for source_idx in source_ids:
+        if not isinstance(source_idx, int) or not (0 <= source_idx < len(posts)):
+            continue
+        queue_id = posts[source_idx].get("manual_queue_id")
+        if isinstance(queue_id, int):
+            all_ids.append(queue_id)
+            source_to_queue[source_idx] = queue_id
+
+    all_ids = list(dict.fromkeys(all_ids))
+    if len(all_ids) <= 1 or bool(item.get("manual_merge_verified", True)):
+        return all_ids, all_ids
+
+    primary_source = item.get("source_id")
+    primary_queue = source_to_queue.get(primary_source)
+    safe = [primary_queue] if isinstance(primary_queue, int) else all_ids[:1]
+    return all_ids, safe
+
+
+def _build_manual_publication_fallback(
+    post: dict,
+    source_idx: int,
+) -> dict | None:
+    """Остання main-level страховка, якщо Summarizer все ж загубив manual."""
+    raw = str(post.get("text") or "").strip()
+    if not raw:
+        return None
+
+    normalized = " ".join(raw.split())
+    first_line = normalized.split("\n", 1)[0].strip()
+    headline = first_line
+    if len(headline) > 150:
+        headline = headline[:147].rstrip() + "…"
+
+    attack_markers = (
+        "удар", "влуч", "приліт", "прильот", "обстріл", "атака",
+        "ракета", "дрон", "бпла", "шахед", "вибух", "пожеж",
+    )
+    is_attack = any(marker in normalized.lower() for marker in attack_markers)
+    emoji = "💥" if is_attack else "📰"
+
+    safe_headline = html.escape(headline)
+    safe_body = html.escape(normalized)
+    if normalized == headline:
+        text = f"{emoji} <b>{safe_headline}</b>"
+    else:
+        text = f"{emoji} <b>{safe_headline}</b>\n\n{safe_body}"
+
+    return {
+        "event_id": f"MAIN_MANUAL_FALLBACK_{post.get('manual_queue_id', source_idx)}",
+        "source_id": source_idx,
+        "source_ids": [source_idx],
+        "text": text,
+        "summary": normalized[:900],
+        "category": "war" if is_attack else "other",
+        "digest_role": "core",
+        "is_discovery_candidate": False,
+        "is_priority": True,
+        "priority_source_ids": [source_idx],
+        "manual_merge_verified": True,
+        "reference_url": None,
+        "reference_label": None,
+        "_main_manual_fallback": True,
+    }
+
+
+def _ensure_manual_items_before_publish(
+    top_news: list,
+    posts: list,
+    expected_manual_ids: list[int],
+) -> list:
+    """
+    Незалежна end-to-end страховка перед header/publish.
+
+    Нормально вона нічого не змінює: Summarizer уже гарантує manual до
+    FINAL_FACT_CHECK. Якщо ж конкретний queue_id відсутній або захований у
+    непідтвердженому multi-manual merge, додаємо raw-safe fallback і НЕ
+    видаляємо manual через ліміт 10.
+    """
+    if not expected_manual_ids:
+        return top_news
+
+    result = [dict(item) for item in top_news if isinstance(item, dict)]
+    covered = set()
+    for item in result:
+        _, safe_ids = _manual_queue_ids_for_item(item, posts)
+        covered.update(safe_ids)
+
+    missing = [queue_id for queue_id in expected_manual_ids if queue_id not in covered]
+    if not missing:
+        logger.info(
+            "PRE-PUBLISH MANUAL GUARANTEE: усі %s queue_id присутні у фіналі.",
+            len(expected_manual_ids),
+        )
+        return result
+
+    logger.error(
+        "CRITICAL PRE-PUBLISH MANUAL GUARANTEE: відсутні queue_id=%s. "
+        "Додаємо main-level safe fallback.",
+        missing,
+    )
+
+    queue_to_source = {}
+    for source_idx, post in enumerate(posts):
+        queue_id = post.get("manual_queue_id")
+        if isinstance(queue_id, int):
+            queue_to_source[queue_id] = source_idx
+
+    for queue_id in missing:
+        source_idx = queue_to_source.get(queue_id)
+        if source_idx is None:
+            logger.error("Manual queue_id=%s не має source_idx у posts.", queue_id)
+            continue
+        fallback = _build_manual_publication_fallback(posts[source_idx], source_idx)
+        if not fallback:
+            logger.error("Не вдалося побудувати main fallback для queue_id=%s.", queue_id)
+            continue
+
+        insert_at = next(
+            (
+                idx
+                for idx, item in enumerate(result)
+                if item.get("digest_role") == "discovery"
+            ),
+            len(result),
+        )
+        result.insert(insert_at, fallback)
+        covered.add(queue_id)
+
+    return result
 
 
 async def process_and_publish_news_cycle():
@@ -511,6 +659,14 @@ async def process_and_publish_news_cycle():
                 past_events=past_events,
                 count=10,
             )
+        )
+
+        # Незалежна end-to-end manual страховка. У нормі нічого не додає;
+        # спрацьовує лише якщо Summarizer все ж загубив конкретний queue_id.
+        top_news = _ensure_manual_items_before_publish(
+            top_news,
+            posts,
+            expected_manual_ids,
         )
 
         logger.info(
@@ -695,6 +851,49 @@ async def process_and_publish_news_cycle():
                 publication_text
             )
 
+            all_manual_ids, safe_manual_ids = _manual_queue_ids_for_item(
+                item,
+                posts,
+            )
+            published_item["_audit_manual_all_ids"] = all_manual_ids
+            published_item["_audit_manual_ids"] = safe_manual_ids
+            published_item["_audit_manual_merge_verified"] = bool(
+                item.get("manual_merge_verified", True)
+            )
+            published_item["_audit_main_manual_fallback"] = bool(
+                item.get("_main_manual_fallback", False)
+            )
+
+            if len(all_manual_ids) > 1 and all_manual_ids != safe_manual_ids:
+                logger.error(
+                    "UNVERIFIED MANUAL MERGE published: all=%s safe=%s event_id=%s",
+                    all_manual_ids,
+                    safe_manual_ids,
+                    item.get("event_id"),
+                )
+
+            # Manual queue_id стає processed ОДРАЗУ після успішної Telegram-
+            # публікації конкретного item. Instagram/history помилка пізніше в
+            # циклі вже не повинна змусити цю ручну новину вийти вдруге.
+            if safe_manual_ids:
+                try:
+                    history.mark_manual_posts_processed(
+                        sorted(set(safe_manual_ids))
+                    )
+                    published_manual_ids.update(safe_manual_ids)
+                    logger.info(
+                        "Manual post(s) confirmed published+processed: %s",
+                        sorted(set(safe_manual_ids)),
+                    )
+                except Exception as manual_state_exc:
+                    logger.error(
+                        "Не вдалося позначити manual processed після успішної "
+                        "Telegram-публікації: ids=%s error=%s",
+                        safe_manual_ids,
+                        manual_state_exc,
+                        exc_info=True,
+                    )
+
             # Runtime telemetry лише для post-publication audit.
             # Ці службові поля не публікуються в Telegram і не
             # записуються у semantic history.
@@ -825,35 +1024,19 @@ async def process_and_publish_news_cycle():
                     ),
                 )
 
-                manual_queue_id = (
-                    event_post.get(
-                        "manual_queue_id"
-                    )
-                )
-
-                if isinstance(
-                    manual_queue_id,
-                    int,
-                ):
-                    published_manual_ids.add(
-                        manual_queue_id
-                    )
+                # processed-state оновлюємо нижче з safe_manual_ids конкретного
+                # УСПІШНО опублікованого item. Не позначаємо всі source_ids
+                # автоматично: це й було причиною хибного "3 processed" після
+                # одного невдалого multi-manual merge.
 
             await asyncio.sleep(3)
 
-        # 6. Ручні новини позначаємо processed
-        # лише якщо відповідна подія справді опублікована.
+        # 6. Manual уже позначаються processed поштучно одразу після
+        # успішної Telegram-публікації. Тут лише підсумкова telemetry.
         if published_manual_ids:
-            history.mark_manual_posts_processed(
-                sorted(
-                    published_manual_ids
-                )
-            )
-
             logger.info(
-                "Позначено обробленими "
-                f"{len(published_manual_ids)} "
-                "ручних новин."
+                "Успішно опубліковано й позначено processed "
+                f"{len(published_manual_ids)} ручних новин."
             )
 
         # 7. Instagram.
