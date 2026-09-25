@@ -110,22 +110,27 @@ class NewsSummarizer:
     # економічні, санкційні чи міжнародні події про РФ це правило НЕ блокує.
     FILTER_LOW_VALUE_RUSSIA_DISCOVERY = True
 
-    MAX_INPUT_CHARS = 55000
+    # Основний Analyzer трохи зменшуємо: 55k уже давав malformed JSON,
+    # тоді як контексти біля 50k у логах працювали стабільніше.
+    MAX_INPUT_CHARS = 50000
     PRIORITY_RECOVERY_MAX_CHARS = 30000
 
-    # Аварійний Analyzer використовується ТІЛЬКИ коли основний cascade
-    # технічно не дав валідної JSON-відповіді (503/429/timeout/битий JSON).
-    # Менший контекст + менша кількість подій різко знижують шанс повторного
-    # malformed JSON і не дозволяють технічному збою перетворитися на "0 новин".
+    # Після ТЕХНІЧНОГО failure 50k НЕ стрибаємо одразу в emergency.
+    # Спочатку двічі повторюємо ТОЙ САМИЙ повний Analyzer на компактнішому
+    # контексті. Це зберігає широкий пошук 10-16 кандидатів і повноцінність
+    # випуску, але поступово зменшує ризик malformed JSON.
+    FULL_ANALYZER_RECOVERY_CHAR_LIMITS = (40000, 30000)
+    FULL_ANALYZER_RECOVERY_RETRIES_PER_MODEL = 1
+
+    # Emergency лишається останньою LLM-страховкою після 50k -> 40k -> 30k.
     EMERGENCY_ANALYZER_MAX_CHARS = 26000
     EMERGENCY_ANALYZER_MAX_EVENTS = 6
     EMERGENCY_SYNTHETIC_MAX_EVENTS = 3
 
-    # Окремий контекст для пошуку "цікавинок". Він коротший на один пост,
-    # зате навмисно більш різноманітний за джерелами і темами, щоб великі
-    # воєнно-політичні пости не витісняли технології, науку, бізнес і
-    # практично корисні зміни ще ДО Analyzer.
-    DISCOVERY_RECOVERY_MAX_CHARS = 50000
+    # Discovery теж трохи розвантажуємо, але не урізаємо агресивно: його
+    # завдання вузьке, а останній ~49k pass успішно відпрацював. Основну
+    # проблему discovery вирішуємо quality gate, а не лише розміром контексту.
+    DISCOVERY_RECOVERY_MAX_CHARS = 45000
     DISCOVERY_MAX_POST_CHARS = 750
     MAX_DISCOVERY_PER_DIGEST = 3
     DISCOVERY_RECOVERY_CANDIDATES = 8
@@ -225,8 +230,9 @@ class NewsSummarizer:
         # в один і технічний 503/битий JSON помилково давав порожній випуск.
         if analyzed_events is None:
             logger.error(
-                "ANALYZER TECHNICAL FAILURE: усі моделі/спроби не дали "
-                "валідної JSON-відповіді. Запускаємо emergency recovery."
+                "ANALYZER TECHNICAL FAILURE: 50k cascade не дав валідної "
+                "JSON-відповіді. Запускаємо full recovery 40k -> 30k; "
+                "emergency буде лише останньою страховкою."
             )
             analyzed_events = self._recover_after_analyzer_failure(
                 posts,
@@ -1144,23 +1150,48 @@ class NewsSummarizer:
         public_interest: float,
         category: str,
     ) -> bool:
-        if reliability < 50 or novelty < 50:
+        """
+        Quality gate для "цікавинок".
+
+        Високий curiosity сам по собі більше НЕ достатній. Це прибирає
+        lifestyle/вірусні історії, які легко отримують 90+ за цікавість, але
+        майже нічого не дають читачеві короткого 4-годинного дайджесту.
+        """
+        if reliability < 55 or novelty < 55:
             return False
 
-        if curiosity >= 76 and public_interest >= 50:
+        # Практично корисна зміна може пройти навіть без "вау"-ефекту.
+        if practical_value >= 78 and public_interest >= 55:
             return True
 
-        if practical_value >= 80 and public_interest >= 55:
-            return True
-
+        # Наука/технології мають природно вищу пізнавальну цінність, але все
+        # одно вимагаємо новизни та хоча б помірного суспільного інтересу.
         if (
-            category in {"technology", "science", "culture"}
-            and curiosity >= 66
-            and novelty >= 60
+            category in {"technology", "science"}
+            and curiosity >= 68
+            and novelty >= 62
+            and public_interest >= 45
         ):
             return True
 
-        if curiosity >= 70 and novelty >= 72:
+        # Культура може бути якісною discovery, але планка трохи вища, щоб
+        # не тягнути селебріті/лайфстайл лише через високий curiosity.
+        if (
+            category == "culture"
+            and curiosity >= 76
+            and novelty >= 68
+            and public_interest >= 58
+        ):
+            return True
+
+        # Для society/economy/international/other потрібна комбінація
+        # сильної цікавості + новизни + реального інтересу аудиторії.
+        if (
+            curiosity >= 84
+            and novelty >= 74
+            and public_interest >= 64
+            and reliability >= 60
+        ):
             return True
 
         return False
@@ -1368,8 +1399,23 @@ class NewsSummarizer:
 QUALITY GATE:
 Поверни лише події, які реально не соромно поставити в КІНЕЦЬ короткого
 дайджесту після 5-9 серйозних новин. Краще 1 сильний кандидат, ніж 5 слабких.
-Зазвичай сильна discovery-подія має novelty >= 60 і хоча б один фактор:
-curiosity >= 70 або practical_value >= 75. Не підганяй оцінки штучно.
+
+КРИТИЧНО: високий curiosity САМ ПО СОБІ не робить подію якісною discovery.
+У кандидата має бути ще хоча б одна змістовна опора: реальна практична користь,
+наукова/технологічна новизна, помітне досягнення, сильний бізнес/виробничий факт,
+важливе дослідження, суспільна зміна або незвичайний міжнародний факт із
+самостійним значенням.
+
+Не бери як заповнювач:
+- історію одного побачення/знайомства або іншу приватну lifestyle-анекдоту;
+- селебріті/блогерські дрібниці, меми, вірусні курйози;
+- дрібну функцію застосунку чи соцмережі без широкого впливу;
+- "дивовижну історію однієї людини", якщо за нею немає дослідження, рішення,
+  системної зміни, значного досягнення або іншої самостійної новинної цінності.
+
+Водночас не відкидай тему лише через бренд/платформу: витік даних, масштабний
+збій, регуляторне рішення, велика угода, дослідження чи інший реальний вплив
+можуть бути сильною новиною. Не підганяй оцінки штучно.
 
 АРХІВ ВЖЕ ОПУБЛІКОВАНИХ ПОДІЙ:
 {history_block}
@@ -1954,15 +2000,69 @@ TELEGRAM POSTS:
         max_retries: int,
     ) -> List[Dict[str, Any]]:
         """
-        Аварійний recovery лише після ТЕХНІЧНОГО провалу основного Analyzer.
+        Recovery після ТЕХНІЧНОГО провалу основного 50k Analyzer.
 
-        1) повторюємо аналіз на значно меншому контексті й просимо максимум
-           кілька подій — це лікує і high-demand, і malformed JSON;
-        2) якщо API знову повністю недоступне, створюємо 1-3 консервативні
-           synthetic candidates із найсильніших сирих постів;
-        3) synthetic candidates НЕ обходять dedup/history/ranking/editorial
-           gates — нижче вони проходять той самий pipeline, що й звичайні.
+        Градація навмисно м'яка:
+        1) повний Analyzer на 40k;
+        2) повний Analyzer на 30k;
+        3) лише потім emergency 26k / max 6 events;
+        4) Python synthetic fallback — тільки якщо Gemini недоступний і там.
+
+        40k/30k використовують ТОЙ САМИЙ широкий prompt, тому це не аварійний
+        скорочений випуск, а спроба зберегти нормальні 10-16 кандидатів.
         """
+        compact_retries = max(
+            1,
+            min(
+                int(max_retries or 1),
+                self.FULL_ANALYZER_RECOVERY_RETRIES_PER_MODEL,
+            ),
+        )
+
+        for char_limit in self.FULL_ANALYZER_RECOVERY_CHAR_LIMITS:
+            compact_context = self._build_posts_context(
+                posts,
+                max_chars=char_limit,
+            )
+            if not compact_context:
+                continue
+
+            logger.warning(
+                "FULL ANALYZER RECOVERY: повторюємо повний Analyzer "
+                "на контексті до %s символів (retries/model=%s).",
+                char_limit,
+                compact_retries,
+            )
+
+            recovered = self._analyze_events(
+                compact_context,
+                past_events,
+                compact_retries,
+            )
+
+            if recovered:
+                logger.warning(
+                    "FULL ANALYZER RECOVERY %sk recovered %s подій; "
+                    "emergency не потрібен.",
+                    int(char_limit / 1000),
+                    len(recovered),
+                )
+                return recovered
+
+            if recovered is None:
+                logger.warning(
+                    "FULL ANALYZER RECOVERY %sk теж технічно не дав "
+                    "валідної JSON-відповіді. Переходимо до меншого контексту.",
+                    int(char_limit / 1000),
+                )
+            else:
+                logger.warning(
+                    "FULL ANALYZER RECOVERY %sk повернув events=[]. "
+                    "Після технічного failure основного pass перевіряємо "
+                    "ще наступний компактніший рівень.",
+                    int(char_limit / 1000),
+                )
+
         emergency_context = self._build_posts_context(
             posts,
             max_chars=self.EMERGENCY_ANALYZER_MAX_CHARS,
@@ -1970,8 +2070,8 @@ TELEGRAM POSTS:
 
         if emergency_context:
             logger.warning(
-                "EMERGENCY ANALYZER: запускаємо компактний recovery-контекст "
-                "(ліміт=%s символів, max_events=%s).",
+                "EMERGENCY ANALYZER: 50k -> 40k -> 30k не дали подій. "
+                "Запускаємо останній компактний recovery (ліміт=%s, max_events=%s).",
                 self.EMERGENCY_ANALYZER_MAX_CHARS,
                 self.EMERGENCY_ANALYZER_MAX_EVENTS,
             )
@@ -1986,13 +2086,11 @@ TELEGRAM POSTS:
                 if recovered:
                     logger.warning(
                         "EMERGENCY ANALYZER recovered %s подій після "
-                        "технічного збою основного Analyzer.",
+                        "невдалого full cascade 50k -> 40k -> 30k.",
                         len(recovered),
                     )
                     return recovered
 
-                # Валідний emergency JSON із events=[] — це вже змістовний
-                # результат, а не технічна помилка. Не вигадуємо новини.
                 logger.warning(
                     "EMERGENCY ANALYZER успішно відповів, але не знайшов "
                     "придатних подій."
@@ -4605,6 +4703,76 @@ MANUAL POSTS:
 
         return True
 
+    def _is_low_value_soft_discovery_event(
+        self,
+        ev: Dict[str, Any],
+        posts: List[Dict[str, Any]],
+        digest_role: str,
+        category: str,
+        importance: float,
+        national_relevance: float,
+        practical_value: float,
+    ) -> bool:
+        """
+        Відсікає очевидний lifestyle/viral filler, не забороняючи саму тему.
+
+        Наприклад, Tinder/Bumble можуть бути нормальною новиною при витоку
+        даних, регуляторному рішенні, великій угоді чи дослідженні. Але приватна
+        історія побачення або вірусний курйоз без ширшої цінності не повинні
+        займати один із 1-3 discovery-слотів.
+        """
+        if digest_role != "discovery" or ev.get("is_priority"):
+            return False
+
+        # Сильна змістовна вага сама по собі є достатнім запобіжником.
+        if (
+            importance >= 74
+            or national_relevance >= 68
+            or practical_value >= 76
+        ):
+            return False
+
+        text = self._normalize_similarity_text(
+            self._event_source_text_bundle(ev, posts)
+        )
+        if not text:
+            return False
+
+        padded = f" {text} "
+
+        soft_markers = (
+            "tinder", "bumble", "badoo", "дейтин", "побаченн",
+            "знайомств", "стосунк", "романтичн", "весілл", "кохан",
+            "селебріті", "знаменит", "інфлюенсер", "блогер", "тіктокер",
+            "tiktok", "тікток", "мем ", "вірусн", "курйоз",
+            "гороскоп", "астролог", "лайфхак",
+        )
+
+        if not any(marker in padded for marker in soft_markers):
+            return False
+
+        substantive_markers = (
+            # Наука / перевірюване дослідження.
+            "дослідж", "вчен", "науков", "університет", "клінічн",
+            "випробуван", "метааналіз", "науковий журнал",
+            # Правила / безпека / великий вплив платформи.
+            "закон", "регулятор", "регуляц", "заборон", "штраф", "суд ",
+            "витік дан", "персональн дан", "кібератак", "кібербезпек",
+            "масштабн збій", "мільйон користувач", "млн користувач",
+            # Бізнес / виробництво / досягнення.
+            "угода", "контракт", "інвест", "придбал", "ринок",
+            "виробництв", "винахід", "відкрит", "патент", "рекорд",
+            "нагород", "премі", "вперше",
+        )
+
+        if any(marker in padded for marker in substantive_markers):
+            return False
+
+        # Для lifestyle-маркерів без змістовної опори curiosity не рятує.
+        return category in {
+            "society", "culture", "technology", "other", "international"
+        }
+
     def _rank_events(
         self,
         events: List[Dict[str, Any]],
@@ -4818,6 +4986,26 @@ MANUAL POSTS:
                     rejected["low_value"] += 1
                     logger.info(
                         "Russia soft-discovery rejected: event_id=%s headline='%s'.",
+                        ev.get("event_id"),
+                        str(ev.get("headline_hint") or ev.get("summary") or "")[:120],
+                    )
+                    continue
+
+                if (
+                    not is_priority
+                    and self._is_low_value_soft_discovery_event(
+                        ev,
+                        posts,
+                        digest_role,
+                        category,
+                        imp,
+                        national,
+                        practical,
+                    )
+                ):
+                    rejected["low_value"] += 1
+                    logger.info(
+                        "Soft discovery filler rejected: event_id=%s headline='%s'.",
                         ev.get("event_id"),
                         str(ev.get("headline_hint") or ev.get("summary") or "")[:120],
                     )
