@@ -1470,3 +1470,4 @@ confidence — ЦІЛЕ ЧИСЛО ВІД 0 ДО 100, де 100 = повна вп
 
     async def close(self):
         await self.bot.session.close()
+

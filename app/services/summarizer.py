@@ -5549,11 +5549,16 @@ MANUAL POSTS:
                     ev.get("best_factual_source_id"),
                 )
 
-                media_source = self._select_media_source(
+                media_candidate_source_ids = self._rank_media_sources(
                     src_ids,
                     posts,
                     ev,
                     ev.get("best_media_source_id"),
+                )
+                media_source = (
+                    media_candidate_source_ids[0]
+                    if media_candidate_source_ids
+                    else None
                 )
 
                 visual_media_required = bool(
@@ -5614,6 +5619,10 @@ MANUAL POSTS:
                     "source_ids": src_ids,
                     "best_factual_source_id": factual_source,
                     "best_media_source_id": media_source,
+                    # Ordered deterministic-safe fallback list. Main will try the
+                    # next candidate only if the previous media is rejected by
+                    # Publisher Vision, cannot be downloaded, or hits reuse-lock.
+                    "media_candidate_source_ids": media_candidate_source_ids,
                     "best_source_id": publishing_source,
                     "manual_media_locked": manual_media_locked,
                     "manual_media_source_id": media_source if manual_media_locked else None,
@@ -6322,6 +6331,11 @@ discovery-блок.
                 "source_ids": list(
                     ev.get("source_ids", [])
                 ),
+                "media_candidate_source_ids": list(
+                    ev.get("media_candidate_source_ids", []) or []
+                ),
+                "best_media_source_id": ev.get("best_media_source_id"),
+                "best_factual_source_id": ev.get("best_factual_source_id"),
                 "summary": ev.get("summary", ""),
                 "category": ev.get("category", "other"),
                 "digest_role": self._event_digest_role(ev),
@@ -6550,6 +6564,11 @@ discovery-блок.
                 "event_id": event_id,
                 "source_id": source_id,
                 "source_ids": list(ev.get("source_ids", [])),
+                "media_candidate_source_ids": list(
+                    ev.get("media_candidate_source_ids", []) or []
+                ),
+                "best_media_source_id": ev.get("best_media_source_id"),
+                "best_factual_source_id": ev.get("best_factual_source_id"),
                 "text": text,
                 "summary": item.get(
                     "summary",
@@ -6933,6 +6952,11 @@ discovery-блок.
             "event_id": str(ev.get("event_id") or ""),
             "source_id": source_id,
             "source_ids": list(ev.get("source_ids", [])),
+            "media_candidate_source_ids": list(
+                ev.get("media_candidate_source_ids", []) or []
+            ),
+            "best_media_source_id": ev.get("best_media_source_id"),
+            "best_factual_source_id": ev.get("best_factual_source_id"),
             "text": text,
             "summary": summary,
             "category": category,
@@ -7664,16 +7688,21 @@ discovery-блок.
             and len(shared_story) < 2
         )
 
-    def _select_media_source(
+    def _rank_media_sources(
         self,
         source_ids: List[int],
         posts: List[Dict[str, Any]],
         event: Dict[str, Any],
         preferred_id: Any = None,
-    ) -> Optional[int]:
+    ) -> List[int]:
         """
-        Manual media is locked. For automatic events, choose media only among
-        source-posts that are semantically consistent with the concrete event.
+        Return publishable media sources in best-first order.
+
+        The list is deliberately restricted to source posts that already passed
+        the deterministic event-consistency gate. Publisher still performs the
+        final photo/video Vision check. Keeping the remaining candidates lets
+        Main recover from one wrong attachment instead of immediately falling
+        back to a text-only post.
         """
         locked_manual = self._manual_locked_media_source(
             source_ids,
@@ -7687,14 +7716,14 @@ discovery-блок.
                 locked_manual,
                 posts[locked_manual].get("manual_media_type"),
             )
-            return locked_manual
+            return [locked_manual]
 
-        media_ids = []
-        for s in source_ids:
-            if not self._auto_media_is_publishable(posts[s]):
-                if posts[s].get("has_video"):
+        media_ids: List[int] = []
+        for source_id in source_ids:
+            if not self._auto_media_is_publishable(posts[source_id]):
+                if posts[source_id].get("has_video"):
                     try:
-                        size_mb = float(posts[s].get("media_size") or 0) / 1024 / 1024
+                        size_mb = float(posts[source_id].get("media_size") or 0) / 1024 / 1024
                     except (TypeError, ValueError):
                         size_mb = 0.0
                     if size_mb > 0:
@@ -7702,18 +7731,18 @@ discovery-блок.
                             "Auto media candidate skipped before ranking: "
                             "event_id=%s source_id=%s video_size=%.1fMB limit=35MB",
                             event.get("event_id"),
-                            s,
+                            source_id,
                             size_mb,
                         )
                 continue
-            media_ids.append(s)
+            media_ids.append(source_id)
 
         if not media_ids:
-            return None
+            return []
 
         event_text = self._event_text_bundle(event)
-
         scored: List[tuple] = []
+
         for source_id in media_ids:
             post_text = str(posts[source_id].get("text") or "").strip()
             relevance = self._media_text_relevance(event_text, post_text)
@@ -7748,10 +7777,11 @@ discovery-блок.
                 "Media source rejected by event-consistency gate: event_id=%s",
                 event.get("event_id"),
             )
-            return None
+            return []
 
         scored.sort(reverse=True)
         best_score, best_relevance, best_id = scored[0]
+        ranked_ids = [source_id for _, _, source_id in scored]
 
         logger.info(
             "Media source selected: event_id=%s source_id=%s relevance=%.2f score=%.2f",
@@ -7760,7 +7790,30 @@ discovery-блок.
             best_relevance,
             best_score,
         )
-        return best_id
+        if len(ranked_ids) > 1:
+            logger.info(
+                "Media fallback candidates: event_id=%s source_ids=%s",
+                event.get("event_id"),
+                ranked_ids[:8],
+            )
+
+        return ranked_ids
+
+    def _select_media_source(
+        self,
+        source_ids: List[int],
+        posts: List[Dict[str, Any]],
+        event: Dict[str, Any],
+        preferred_id: Any = None,
+    ) -> Optional[int]:
+        """Backward-compatible best-media helper."""
+        ranked_ids = self._rank_media_sources(
+            source_ids,
+            posts,
+            event,
+            preferred_id,
+        )
+        return ranked_ids[0] if ranked_ids else None
 
     def _media_text_relevance(
         self,
@@ -9822,5 +9875,3 @@ CASES:
         )
 
         return text.strip()
-
-

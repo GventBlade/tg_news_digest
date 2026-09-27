@@ -621,6 +621,257 @@ def _locked_manual_media_source_for_item(
     return None
 
 
+AUTO_MEDIA_FALLBACK_MAX_CANDIDATES = 8
+
+
+def _auto_media_candidate_source_ids(
+    item: dict,
+    posts: list,
+) -> list[int]:
+    """
+    Ordered AUTO-media candidates for one final event.
+
+    Summarizer now supplies `media_candidate_source_ids`, already filtered by
+    its deterministic event-consistency gate. For backward compatibility with
+    an older summarizer we append the selected source and the event source_ids.
+    We never search unrelated posts here: fallback stays inside the same event.
+    """
+    ordered = []
+
+    raw_ranked = item.get("media_candidate_source_ids")
+    if isinstance(raw_ranked, list):
+        ordered.extend(raw_ranked)
+
+    preferred = item.get("source_id")
+    if isinstance(preferred, int):
+        ordered.append(preferred)
+
+    raw_sources = item.get("source_ids")
+    if isinstance(raw_sources, list):
+        ordered.extend(raw_sources)
+
+    result = []
+    seen = set()
+    for source_idx in ordered:
+        if (
+            not isinstance(source_idx, int)
+            or source_idx in seen
+            or not (0 <= source_idx < len(posts))
+        ):
+            continue
+        seen.add(source_idx)
+
+        post = posts[source_idx]
+        if post.get("is_priority"):
+            # Manual media has a separate immutable lock path.
+            continue
+        if not (post.get("has_video") or post.get("has_photo") or post.get("has_media")):
+            continue
+        if not post.get("message_obj"):
+            continue
+
+        # Keep in sync with collector.MAX_VIDEO_SIZE. Oversized video cannot be
+        # downloaded by the AUTO collector, so do not waste a fallback attempt.
+        if post.get("has_video"):
+            try:
+                media_size = int(post.get("media_size") or 0)
+            except (TypeError, ValueError):
+                media_size = 0
+            if media_size > 35 * 1024 * 1024:
+                continue
+
+        result.append(source_idx)
+        if len(result) >= AUTO_MEDIA_FALLBACK_MAX_CANDIDATES:
+            break
+
+    return result
+
+
+async def _resolve_auto_media_for_item(
+    *,
+    item: dict,
+    posts: list,
+    collector,
+    publisher,
+    history,
+    used_media_fingerprints: set,
+    news_index: int,
+) -> dict:
+    """
+    Try event media one-by-one until one really survives publication gates.
+
+    Sequence for every candidate:
+    download -> Vision/video check -> 24h reuse-lock.
+    If a candidate fails, try the next media source from THE SAME event. Text-only
+    is used only after the safe candidate list is exhausted.
+    """
+    candidate_ids = _auto_media_candidate_source_ids(item, posts)
+    preferred_source = item.get("source_id")
+
+    result = {
+        "source_idx": preferred_source if isinstance(preferred_source, int) else None,
+        "media_path": None,
+        "media_type": None,
+        "media_file_id": None,
+        "media_verdict": {},
+        "media_fingerprint": None,
+        "media_rejected": False,
+        "media_reject_reason": "",
+        "media_reuse_suppressed": False,
+        "original_media_path": None,
+        "original_media_type": None,
+        "attempted_source_ids": [],
+    }
+
+    if not candidate_ids:
+        logger.info(
+            "MEDIA FALLBACK: news_index=%s event_id=%s has no AUTO candidates.",
+            news_index,
+            item.get("event_id"),
+        )
+        return result
+
+    reject_reasons = []
+
+    for attempt_no, source_idx in enumerate(candidate_ids, start=1):
+        post = posts[source_idx]
+        result["attempted_source_ids"].append(source_idx)
+
+        try:
+            media_path, media_type = await collector.download_post_media(
+                post["message_obj"]
+            )
+        except Exception as dl_err:
+            logger.warning(
+                "MEDIA FALLBACK download failed: news_index=%s event_id=%s "
+                "attempt=%s source_id=%s error=%s",
+                news_index,
+                item.get("event_id"),
+                attempt_no,
+                source_idx,
+                dl_err,
+            )
+            continue
+
+        if not media_path or media_type not in {"photo", "video"}:
+            logger.info(
+                "MEDIA FALLBACK candidate unavailable: news_index=%s event_id=%s "
+                "attempt=%s source_id=%s",
+                news_index,
+                item.get("event_id"),
+                attempt_no,
+                source_idx,
+            )
+            continue
+
+        if result["original_media_path"] is None:
+            result["original_media_path"] = media_path
+            result["original_media_type"] = media_type
+
+        # Backup videos are always Vision-checked. This prevents a second random
+        # clip from slipping through merely because the first one was rejected.
+        force_video_validation = bool(
+            item.get("video_validation_needed", False)
+            or (
+                media_type == "video"
+                and source_idx != preferred_source
+            )
+        )
+
+        verdict = await publisher.validate_media_for_news(
+            text=item["text"],
+            media_path=media_path,
+            media_type=media_type,
+            video_validation_needed=force_video_validation,
+        )
+        result["media_verdict"] = verdict
+
+        if not verdict.get("is_relevant", False):
+            result["media_rejected"] = True
+            reason = str(verdict.get("reason") or "")
+            if reason:
+                reject_reasons.append(
+                    f"source_id={source_idx}: {reason}"
+                )
+            logger.warning(
+                "MEDIA CANDIDATE REJECTED: news_index=%s event_id=%s "
+                "attempt=%s/%s source_id=%s type=%s reason=%s",
+                news_index,
+                item.get("event_id"),
+                attempt_no,
+                len(candidate_ids),
+                source_idx,
+                media_type,
+                reason,
+            )
+            continue
+
+        media_fingerprint = publisher.build_media_fingerprint(
+            media_path,
+            media_type,
+        )
+        fingerprint_key = (
+            media_type,
+            media_fingerprint,
+        )
+
+        if (
+            media_fingerprint
+            and (
+                fingerprint_key in used_media_fingerprints
+                or history.was_media_recently_used(
+                    media_fingerprint,
+                    media_type,
+                    hours=24,
+                )
+            )
+        ):
+            result["media_reuse_suppressed"] = True
+            logger.info(
+                "MEDIA CANDIDATE REUSE-SKIP: news_index=%s event_id=%s "
+                "attempt=%s/%s source_id=%s type=%s fingerprint=%s",
+                news_index,
+                item.get("event_id"),
+                attempt_no,
+                len(candidate_ids),
+                source_idx,
+                media_type,
+                media_fingerprint[:24],
+            )
+            continue
+
+        result.update({
+            "source_idx": source_idx,
+            "media_path": media_path,
+            "media_type": media_type,
+            "media_fingerprint": media_fingerprint,
+        })
+        result["media_reject_reason"] = " | ".join(reject_reasons)[:1500]
+
+        if attempt_no > 1 or source_idx != preferred_source:
+            logger.info(
+                "MEDIA FALLBACK SELECTED: news_index=%s event_id=%s "
+                "attempt=%s/%s source_id=%s type=%s",
+                news_index,
+                item.get("event_id"),
+                attempt_no,
+                len(candidate_ids),
+                source_idx,
+                media_type,
+            )
+        return result
+
+    result["media_reject_reason"] = " | ".join(reject_reasons)[:1500]
+    logger.warning(
+        "MEDIA FALLBACK EXHAUSTED: news_index=%s event_id=%s candidates=%s. "
+        "Публікуємо text-only, бо жодне медіа цієї події не пройшло gates.",
+        news_index,
+        item.get("event_id"),
+        candidate_ids,
+    )
+    return result
+
+
 async def process_and_publish_news_cycle():
     cycle_started_at = datetime.now(
         timezone.utc
@@ -878,6 +1129,15 @@ async def process_and_publish_news_cycle():
             media_path = None
             media_type = None
             media_file_id = None
+            media_verdict = {}
+            media_rejected = False
+            media_reject_reason = ""
+            media_reuse_suppressed = False
+            media_fingerprint = None
+            original_media_path = None
+            original_media_file_id = None
+            original_media_type = None
+            attempted_media_source_ids = []
 
             if manual_media_locked:
                 media_type = str(
@@ -895,146 +1155,71 @@ async def process_and_publish_news_cycle():
                     or ""
                 ).strip() or None
 
-            elif target_post.get(
-                "message_obj"
-            ):
-                try:
-                    (
+                # Manual media має дві рівноправні форми: локальний файл або
+                # Telegram file_id. Якщо немає обох — НЕ публікуємо текстом і
+                # НЕ позначаємо queue processed.
+                if (
+                    media_type not in {"photo", "video"}
+                    or not (media_path or media_file_id)
+                ):
+                    logger.error(
+                        "MANUAL MEDIA LOCK FAILED: news_index=%s event_id=%s "
+                        "source_id=%s path=%s file_id=%s type=%s. "
+                        "Queue лишається pending.",
+                        index,
+                        item.get("event_id"),
+                        source_idx,
                         media_path,
+                        bool(media_file_id),
                         media_type,
-                    ) = (
-                        await collector.download_post_media(
-                            target_post[
-                                "message_obj"
-                            ]
-                        )
                     )
+                    continue
 
-                except Exception as dl_err:
-                    logger.warning(
-                        "Помилка завантаження медіа "
-                        f"для новини #{index}: {dl_err}"
-                    )
-
-            # Manual media має дві рівноправні форми: локальний файл або
-            # Telegram file_id. Якщо немає обох — НЕ публікуємо текстом і
-            # НЕ позначаємо queue processed.
-            if manual_media_locked and (
-                media_type not in {"photo", "video"}
-                or not (media_path or media_file_id)
-            ):
-                logger.error(
-                    "MANUAL MEDIA LOCK FAILED: news_index=%s event_id=%s "
-                    "source_id=%s path=%s file_id=%s type=%s. "
-                    "Queue лишається pending.",
-                    index,
-                    item.get("event_id"),
-                    source_idx,
-                    media_path,
-                    bool(media_file_id),
-                    media_type,
-                )
-                continue
-
-            # Зберігаємо початковий media-state для read-only audit.
-            # Audit не запускає Vision вдруге; він лише перевірить,
-            # що відхилене медіа не залишилось у фінальному pipeline.
-            original_media_path = media_path
-            original_media_file_id = media_file_id
-            original_media_type = media_type
-            media_rejected = False
-            media_reject_reason = ""
-            media_reuse_suppressed = False
-            media_fingerprint = None
-
-            # Manual media — без Vision узагалі. Це явний вибір адміна.
-            # AUTO photo лишається суворішим; AUTO video — лише м'який
-            # obvious-conflict gate у Publisher.
-            media_verdict = {}
-            if manual_media_locked:
+                original_media_path = media_path
+                original_media_file_id = media_file_id
+                original_media_type = media_type
                 media_verdict = {
                     "is_relevant": True,
                     "confidence": 100,
                     "reason": "manual_media_locked_no_validation",
                     "media_type": media_type,
                 }
-            elif (
-                media_path
-                and media_type in {"photo", "video"}
-            ):
-                media_verdict = (
-                    await publisher.validate_media_for_news(
-                        text=item["text"],
-                        media_path=media_path,
-                        media_type=media_type,
-                        video_validation_needed=bool(
-                            item.get("video_validation_needed", False)
-                        ),
-                    )
+            else:
+                # AUTO media is now resilient: if the first attachment is wrong,
+                # missing or recently reused, try the next safe media source from
+                # the SAME event before giving up and publishing text-only.
+                auto_media = await _resolve_auto_media_for_item(
+                    item=item,
+                    posts=posts,
+                    collector=collector,
+                    publisher=publisher,
+                    history=history,
+                    used_media_fingerprints=used_media_fingerprints,
+                    news_index=index,
                 )
 
-                if not media_verdict.get(
-                    "is_relevant",
-                    False,
-                ):
-                    media_rejected = True
-                    media_reject_reason = str(
-                        media_verdict.get(
-                            "reason",
-                            "",
-                        )
-                        or ""
-                    )
+                selected_source_idx = auto_media.get("source_idx")
+                if isinstance(selected_source_idx, int):
+                    source_idx = selected_source_idx
+                    target_post = posts[source_idx]
 
-                    logger.warning(
-                        "MEDIA DROPPED FOR ALL PLATFORMS: "
-                        "news_index=%s path=%s type=%s reason=%s",
-                        index,
-                        media_path,
-                        media_type,
-                        media_verdict.get("reason", ""),
-                    )
-
-                    media_path = None
-                    media_type = None
-
-            # 24h reuse-lock тільки для AUTO media. Він ніколи не прибирає
-            # саму новину: при повторі старого фото/відео пост іде текстом.
-            if (
-                not manual_media_locked
-                and media_path
-                and media_type in {"photo", "video"}
-            ):
-                media_fingerprint = publisher.build_media_fingerprint(
-                    media_path,
-                    media_type,
+                media_path = auto_media.get("media_path")
+                media_type = auto_media.get("media_type")
+                media_file_id = auto_media.get("media_file_id")
+                media_verdict = auto_media.get("media_verdict") or {}
+                media_rejected = bool(auto_media.get("media_rejected"))
+                media_reject_reason = str(
+                    auto_media.get("media_reject_reason") or ""
                 )
-                fingerprint_key = (
-                    media_type,
-                    media_fingerprint,
+                media_reuse_suppressed = bool(
+                    auto_media.get("media_reuse_suppressed")
                 )
-                if (
-                    media_fingerprint
-                    and (
-                        fingerprint_key in used_media_fingerprints
-                        or history.was_media_recently_used(
-                            media_fingerprint,
-                            media_type,
-                            hours=24,
-                        )
-                    )
-                ):
-                    media_reuse_suppressed = True
-                    logger.info(
-                        "MEDIA REUSE LOCK: news_index=%s event_id=%s "
-                        "type=%s fingerprint=%s. Публікуємо без повторного media.",
-                        index,
-                        item.get("event_id"),
-                        media_type,
-                        media_fingerprint[:24],
-                    )
-                    media_path = None
-                    media_type = None
+                media_fingerprint = auto_media.get("media_fingerprint")
+                original_media_path = auto_media.get("original_media_path")
+                original_media_type = auto_media.get("original_media_type")
+                attempted_media_source_ids = list(
+                    auto_media.get("attempted_source_ids") or []
+                )
 
             # Посилання додаємо ПІСЛЯ Vision-перевірки,
             # щоб службовий рядок не впливав на media-gate.
@@ -1161,6 +1346,13 @@ async def process_and_publish_news_cycle():
                     else False
                 ),
                 "selected_source_id": source_idx,
+                "attempted_source_ids": attempted_media_source_ids,
+                "fallback_used": bool(
+                    attempted_media_source_ids
+                    and isinstance(item.get("source_id"), int)
+                    and source_idx != item.get("source_id")
+                    and media_path
+                ),
             }
 
             published_news.append(
@@ -1503,3 +1695,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
