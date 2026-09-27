@@ -62,6 +62,25 @@ class NewsSummarizer:
     # придатних подій, бажано мати щонайменше 7 матеріалів.
     MIN_DIGEST_COUNT = 7
 
+    # Не робимо 5 новин жорсткою квотою: слабкий шум заради кількості не потрібен.
+    # Але для головних денних слотів 12:00 / 16:00 / 20:00 пул із 1-4 подій
+    # вважаємо занадто малим і запускаємо окремий broad recovery по ще не
+    # використаних постах. Для 08:00 recovery м'якший, для нічних слотів — лише
+    # страховка від майже порожнього випуску.
+    DAYTIME_FULLER_SLOT_HOURS = {12, 16, 20}
+    MORNING_SLOT_HOUR = 8
+    DAYTIME_RECOVERY_MIN = 5
+    MORNING_RECOVERY_MIN = 3
+    OTHER_RECOVERY_MIN = 2
+    SMALL_DIGEST_RECOVERY_MAX_CHARS = 40000
+    SMALL_DIGEST_RECOVERY_RETRIES_PER_MODEL = 1
+
+    # Якщо після всіх quality/history gates денний випуск усе ще нижче floor,
+    # дозволяємо дуже сильній ranked discovery-події заповнити вільний слот,
+    # навіть якщо вона трохи не дотягнула до суворого discovery_qualified.
+    # Це працює ТІЛЬКИ як small-digest fallback і не послаблює звичайний TOP-10.
+    SMALL_DIGEST_RELAXED_DISCOVERY_MIN_SCORE = 78.0
+
     EDITOR_CANDIDATES = 30
     HISTORY_LIMIT = 150
 
@@ -127,10 +146,10 @@ class NewsSummarizer:
     EMERGENCY_ANALYZER_MAX_EVENTS = 6
     EMERGENCY_SYNTHETIC_MAX_EVENTS = 3
 
-    # Discovery теж трохи розвантажуємо, але не урізаємо агресивно: його
-    # завдання вузьке, а останній ~49k pass успішно відпрацював. Основну
-    # проблему discovery вирішуємо quality gate, а не лише розміром контексту.
-    DISCOVERY_RECOVERY_MAX_CHARS = 45000
+    # Discovery теж трохи розвантажуємо. У логах контекст ~44.8k двічі дав
+    # malformed JSON на 3.5-flash-lite, тому тримаємо його ближче до 40k.
+    # Quality gate лишається головним захистом від слабких заповнювачів.
+    DISCOVERY_RECOVERY_MAX_CHARS = 40000
     DISCOVERY_MAX_POST_CHARS = 750
     MAX_DISCOVERY_PER_DIGEST = 3
     DISCOVERY_RECOVERY_CANDIDATES = 8
@@ -330,6 +349,20 @@ class NewsSummarizer:
             )
             return []
 
+        # SMALL-DIGEST BROAD RECOVERY.
+        # Денний випуск 12/16/20 не повинен залишатися на 1-4 матеріалах, якщо
+        # серед ще не використаних сирих постів є нормальні самостійні події.
+        # Recovery не знижує ranking/history quality gates: він лише дає другий
+        # широкий шанс постам, які не потрапили в перший Analyzer context/result.
+        analyzed_events, ranked_events = self._recover_small_digest_pool(
+            analyzed_events,
+            ranked_events,
+            posts,
+            past_events,
+            max_retries_per_model,
+            count,
+        )
+
         # ОКРЕМИЙ DISCOVERY-PASS.
         # Основний Analyzer може чудово знайти важкі новини, але загубити
         # науку/технології/бізнес/корисні зміни в великому контексті.
@@ -448,17 +481,23 @@ class NewsSummarizer:
             for ev in ranked_events
             if self._event_digest_role(ev) == "core"
         ]
-        discovery_ranked = [
+        all_discovery_ranked = [
             ev
             for ev in ranked_events
+            if self._event_digest_role(ev) == "discovery"
+        ]
+        discovery_ranked = [
+            ev
+            for ev in all_discovery_ranked
             if self._is_publishable_discovery(ev)
         ]
 
         logger.info(
             "Після ranking залишилось %s подій: core=%s, "
-            "discovery=%s, priority=%s.",
+            "discovery=%s (qualified=%s), priority=%s.",
             len(ranked_events),
             len(core_ranked),
+            len(all_discovery_ranked),
             len(discovery_ranked),
             len(priority_ranked),
         )
@@ -1025,6 +1064,264 @@ class NewsSummarizer:
         )
 
         return "\n\n---\n\n".join(result)
+
+    @staticmethod
+    def _nominal_digest_slot_hour() -> int:
+        """
+        Повертає номінальну годину випуску у локальному timezone процесу.
+
+        Scheduler стартує приблизно о xx:59, а сам пост виходить уже на наступній
+        годині. Тому 19:59 має вважатися слотом 20:00. Для ручного запуску між
+        слотами беремо найближчу стандартну 4-годинну точку.
+        """
+        now_local = datetime.now().astimezone()
+        candidate_hour = (
+            now_local.hour + (1 if now_local.minute >= 45 else 0)
+        ) % 24
+        slots = (0, 4, 8, 12, 16, 20)
+
+        def circular_distance(slot: int) -> int:
+            direct = abs(slot - candidate_hour)
+            return min(direct, 24 - direct)
+
+        return min(slots, key=circular_distance)
+
+    def _small_digest_recovery_floor(self, max_count: int) -> int:
+        """Бажаний floor, нижче якого запускаємо додатковий broad recovery."""
+        if max_count <= 0:
+            return 0
+
+        slot_hour = self._nominal_digest_slot_hour()
+        if slot_hour in self.DAYTIME_FULLER_SLOT_HOURS:
+            desired = self.DAYTIME_RECOVERY_MIN
+        elif slot_hour == self.MORNING_SLOT_HOUR:
+            desired = self.MORNING_RECOVERY_MIN
+        else:
+            desired = self.OTHER_RECOVERY_MIN
+
+        return min(max_count, desired)
+
+    def _is_relaxed_small_digest_discovery(
+        self,
+        ev: Dict[str, Any],
+    ) -> bool:
+        """
+        Дуже вузький fallback для сильних ranked discovery-кандидатів.
+
+        Подія вже пройшла Analyzer, history, low-value gate і ranking. Тут лише
+        дозволяємо їй зайняти вільний слот у занадто малому випуску, якщо вона
+        трохи не пройшла суворий discovery_qualified.
+        """
+        if self._event_digest_role(ev) != "discovery":
+            return False
+        if self._is_publishable_discovery(ev):
+            return True
+
+        if (
+            bool(ev.get("is_history_repeat"))
+            and self._safe_score(ev.get("history_update_strength"))
+            < self.HISTORY_SIGNIFICANT_UPDATE_MIN
+        ):
+            return False
+
+        score = float(
+            ev.get(
+                "balanced_score",
+                ev.get("editorial_score", ev.get("raw_score", 0)),
+            )
+            or 0
+        )
+        if score < self.SMALL_DIGEST_RELAXED_DISCOVERY_MIN_SCORE:
+            return False
+
+        reliability = self._safe_score(ev.get("reliability"))
+        novelty = self._safe_score(ev.get("novelty"))
+        if reliability < 55 or novelty < 50:
+            return False
+
+        return bool(
+            self._safe_score(ev.get("curiosity")) >= 78
+            or self._safe_score(ev.get("practical_value")) >= 70
+            or self._safe_score(ev.get("public_interest")) >= 65
+            or self._safe_score(ev.get("importance")) >= 62
+            or self._safe_score(ev.get("national_relevance")) >= 60
+        )
+
+    def _recover_small_digest_pool(
+        self,
+        analyzed_events: List[Dict[str, Any]],
+        ranked_events: List[Dict[str, Any]],
+        posts: List[Dict[str, Any]],
+        past_events: Optional[
+            Union[
+                List[str],
+                List[Dict[str, str]],
+            ]
+        ],
+        max_retries: int,
+        max_count: int,
+    ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """
+        Другий широкий Analyzer-pass лише коли випуск реально замалий.
+
+        Ми НЕ послаблюємо quality/history gates. Беремо лише ще не використані
+        сирі пости, знову просимо звичайний Analyzer знайти самостійні події,
+        після чого проганяємо recovered pool через ті самі dedup/history/ranking.
+        Результат приймаємо тільки якщо кількість валідних ranked events зросла.
+        """
+        target_floor = self._small_digest_recovery_floor(max_count)
+        current_count = len(ranked_events or [])
+        if target_floor <= 0 or current_count >= target_floor:
+            return analyzed_events, ranked_events
+
+        slot_hour = self._nominal_digest_slot_hour()
+        covered_source_ids = {
+            source_id
+            for ev in analyzed_events or []
+            if isinstance(ev, dict)
+            for source_id in self._valid_source_ids(ev.get("source_ids"), posts)
+        }
+        uncovered_ids = [
+            idx
+            for idx, post in enumerate(posts)
+            if (
+                idx not in covered_source_ids
+                and bool(str(post.get("text") or "").strip())
+            )
+        ]
+
+        if not uncovered_ids:
+            logger.info(
+                "Small-digest recovery: slot=%02d:00 current=%s target=%s, "
+                "але всі текстові пости вже покриті Analyzer.",
+                slot_hour,
+                current_count,
+                target_floor,
+            )
+            return analyzed_events, ranked_events
+
+        recovery_context = self._build_posts_context(
+            posts,
+            only_ids=uncovered_ids,
+            max_chars=self.SMALL_DIGEST_RECOVERY_MAX_CHARS,
+        )
+        if not recovery_context:
+            return analyzed_events, ranked_events
+
+        logger.warning(
+            "Small-digest recovery: slot=%02d:00 current=%s target>=%s. "
+            "Повторно аналізуємо %s ще не покритих постів.",
+            slot_hour,
+            current_count,
+            target_floor,
+            len(uncovered_ids),
+        )
+
+        recovery_retries = max(
+            1,
+            min(
+                int(max_retries or 1),
+                self.SMALL_DIGEST_RECOVERY_RETRIES_PER_MODEL,
+            ),
+        )
+        recovered = self._analyze_events(
+            recovery_context,
+            past_events,
+            recovery_retries,
+        )
+        if not recovered:
+            logger.info(
+                "Small-digest recovery: додатковий Analyzer не дав нових кандидатів."
+            )
+            return analyzed_events, ranked_events
+
+        candidate_events = [
+            dict(ev)
+            for ev in analyzed_events or []
+            if isinstance(ev, dict)
+        ]
+        added = 0
+        merged_count = 0
+
+        for raw_candidate in recovered:
+            if not isinstance(raw_candidate, dict):
+                continue
+            candidate = dict(raw_candidate)
+            source_ids = self._valid_source_ids(
+                candidate.get("source_ids"),
+                posts,
+            )
+            if not source_ids:
+                continue
+            candidate["source_ids"] = source_ids
+
+            match_idx = self._find_matching_event_index(
+                candidate_events,
+                candidate,
+                posts,
+            )
+            if match_idx is not None:
+                candidate_events[match_idx] = self._merge_events(
+                    candidate_events[match_idx],
+                    candidate,
+                    posts,
+                )
+                merged_count += 1
+                continue
+
+            candidate["event_id"] = self._unique_event_id(
+                str(candidate.get("event_id") or "FILL_RECOVER"),
+                candidate_events,
+            )
+            candidate_events.append(candidate)
+            added += 1
+
+        if not added and not merged_count:
+            return analyzed_events, ranked_events
+
+        candidate_events = self._deduplicate_current_events(
+            candidate_events,
+            posts,
+        )
+        candidate_events = self._apply_deterministic_history_guard(
+            candidate_events,
+            posts,
+            past_events,
+        )
+        candidate_events = self._apply_semantic_history_review(
+            candidate_events,
+            posts,
+            past_events,
+            max_retries,
+        )
+        recovered_ranked = self._rank_events(
+            candidate_events,
+            posts,
+        )
+
+        if len(recovered_ranked) <= current_count:
+            logger.info(
+                "Small-digest recovery: отримано=%s, додано=%s, змерджено=%s, "
+                "але ranked pool не зріс (%s -> %s). Зберігаємо попередній пул.",
+                len(recovered),
+                added,
+                merged_count,
+                current_count,
+                len(recovered_ranked),
+            )
+            return analyzed_events, ranked_events
+
+        logger.warning(
+            "Small-digest recovery: отримано=%s, додано=%s, змерджено=%s; "
+            "ranked pool зріс %s -> %s (target>=%s).",
+            len(recovered),
+            added,
+            merged_count,
+            current_count,
+            len(recovered_ranked),
+            target_floor,
+        )
+        return candidate_events, recovered_ranked
 
     def _desired_discovery_slots(
         self,
@@ -6706,6 +7003,43 @@ discovery-блок.
             if self._is_publishable_discovery(ev)
         ]
 
+        # У малому випуску не втрачаємо сильний ranked discovery лише через те,
+        # що він трохи не дотягнув до суворого discovery_qualified. Це саме той
+        # випадок, який у логах давав ranked=4, але Digest mix бачив лише 3.
+        recovery_floor = self._small_digest_recovery_floor(count)
+        relaxed_added = 0
+        if len(core_events) + len(discovery_events) < recovery_floor:
+            already_selected_ids = {
+                str(ev.get("event_id") or "")
+                for ev in discovery_events
+            }
+            relaxed_candidates = [
+                ev
+                for ev in ranked_events
+                if (
+                    str(ev.get("event_id") or "") not in already_selected_ids
+                    and self._is_relaxed_small_digest_discovery(ev)
+                )
+            ]
+            relaxed_candidates.sort(
+                key=self._discovery_sort_score,
+                reverse=True,
+            )
+
+            for ev in relaxed_candidates:
+                if len(core_events) + len(discovery_events) >= recovery_floor:
+                    break
+                discovery_events.append(ev)
+                relaxed_added += 1
+
+            if relaxed_added:
+                logger.warning(
+                    "Digest mix small-floor fallback: додано %s сильних "
+                    "relaxed discovery candidate(s), floor=%s.",
+                    relaxed_added,
+                    recovery_floor,
+                )
+
         core_events.sort(
             key=self._core_presentation_score,
             reverse=True,
@@ -7020,12 +7354,14 @@ discovery-блок.
 
         logger.info(
             "Digest mix: available core=%s, discovery=%s; "
-            "selected core=%s, discovery=%s; total=%s.",
+            "selected core=%s, discovery=%s; total=%s; floor=%s; relaxed=%s.",
             len(core_events),
             len(discovery_events),
             len(core_items),
             len(discovery_items),
             len(final_items),
+            recovery_floor,
+            relaxed_added,
         )
 
         for idx, item in enumerate(final_items, start=1):
@@ -7289,15 +7625,25 @@ discovery-блок.
         event: Dict[str, Any],
     ) -> bool:
         """
-        Gemini video is now exceptional, not the default. Only a borderline
-        AUTO clip with very weak text linkage gets the expensive check. Clear
-        location conflicts are already rejected by _media_source_matches_event.
+        Відео з фізичних атак завжди проходить фінальну Gemini-перевірку.
+
+        Для таких подій текстова схожість недостатня: кілька постів про одну
+        атаку в місті можуть описувати різні влучання, а короткий caption легко
+        дає помилковий match. Для невоєнних AUTO-відео зберігаємо дешевий fast
+        path і вмикаємо Gemini лише при дуже слабкій текстовій прив'язці.
+        Manual media не чіпаємо — його свідомо обрав адміністратор.
         """
         if not isinstance(source_id, int) or not (0 <= source_id < len(posts)):
             return False
         post = posts[source_id]
         if post.get("is_priority") or not post.get("has_video"):
             return False
+
+        # Ключова страховка від ситуації "текст про будинок, відео іншого
+        # влучання/іншої цілі". Publisher отримає video_validation_needed=True
+        # і не повинен застосовувати AUTO VIDEO FAST-PASS без Vision check.
+        if self._event_is_physical_attack(event):
+            return True
 
         event_text = self._event_text_bundle(event)
         post_text = str(post.get("text") or "").strip()
@@ -7312,7 +7658,6 @@ discovery-блок.
             & self._story_signature(post_text)
         )
 
-        # Borderline only: ordinary selected videos skip Gemini completely.
         return bool(
             relevance < 0.12
             and not shared_entities
@@ -9477,4 +9822,5 @@ CASES:
         )
 
         return text.strip()
+
 
