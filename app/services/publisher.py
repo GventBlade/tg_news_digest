@@ -56,7 +56,10 @@ class NewsPublisher:
         # high-confidence mismatches are still rejected.
         self.video_validation_inline_max_bytes = 12 * 1024 * 1024
         self.video_validation_processing_timeout = 45
-        self.video_validation_fail_closed = False
+        # Для відео, які ОБОВ'ЯЗКОВО пішли на Gemini-перевірку (насамперед
+        # AUTO-відео фізичних атак), безпечніше втратити медіа і лишити текст,
+        # ніж опублікувати ролик з іншого влучання/місця.
+        self.video_validation_fail_closed = True
 
     async def publish_telegram_post(
         self,
@@ -66,6 +69,7 @@ class NewsPublisher:
         validate_media: bool = True,
         media_file_id: str | None = None,
         require_media: bool = False,
+        video_validation_needed: bool = False,
     ) -> bool:
         """
         Publish one Telegram item.
@@ -84,6 +88,7 @@ class NewsPublisher:
                     text=text,
                     media_path=media_path,
                     media_type=media_type,
+                    video_validation_needed=video_validation_needed,
                 )
 
                 if not verdict.get("is_relevant", False):
@@ -200,10 +205,11 @@ class NewsPublisher:
         """
         Єдина перевірка медіа перед публікацією на будь-якій платформі.
 
-        Фото проходять Gemini Vision-перевірку. Відео поки не аналізуємо
-        покадрово, тому зберігаємо попередню поведінку й дозволяємо їх,
-        якщо файл існує. Результат цього методу треба використовувати
-        одночасно для Telegram та Instagram.
+        Фото проходять Gemini Vision-перевірку. AUTO-відео фізичних атак
+        теж обов'язково перевіряємо Gemini, навіть якщо caller забув передати
+        video_validation_needed=True. Для решти відео зберігаємо дешевий fast-path,
+        якщо Summarizer не позначив ролик як підозрілий. Результат цього методу
+        треба використовувати одночасно для Telegram та Instagram.
         """
         if not media_path or not Path(media_path).exists():
             return {
@@ -243,12 +249,16 @@ class NewsPublisher:
             return verdict
 
         if media_type == "video":
-            # Normal AUTO video no longer goes through Gemini. In production
-            # this was the biggest latency source (often 1-3 minutes per clip)
-            # while the final policy was fail-open anyway. Summarizer already
-            # applies a cheap text/location consistency gate. Gemini is reserved
-            # only for rare borderline candidates explicitly marked suspicious.
-            if not video_validation_needed:
+            # Подвійна страховка. Summarizer передає video_validation_needed=True
+            # для фізичних атак, але Publisher сам повторно впізнає такі новини.
+            # Тому навіть якщо десь у caller загубиться цей прапорець, AUTO-відео
+            # удару/влучання не пройде VIDEO MEDIA FAST-PASS без Vision-check.
+            force_video_validation = bool(
+                video_validation_needed
+                or self._looks_like_physical_attack_news(text)
+            )
+
+            if not force_video_validation:
                 verdict = {
                     "is_relevant": True,
                     "confidence": 0,
@@ -266,8 +276,10 @@ class NewsPublisher:
                 return verdict
 
             logger.info(
-                "VIDEO MEDIA BORDERLINE CHECK: path=%s",
+                "VIDEO MEDIA REQUIRED CHECK: path=%s attack=%s requested=%s",
                 media_path,
+                self._looks_like_physical_attack_news(text),
+                bool(video_validation_needed),
             )
             verdict = await self._validate_video_relevance(
                 text=text,
@@ -301,6 +313,49 @@ class NewsPublisher:
             "reason": f"unsupported_media_type: {media_type}",
             "media_type": media_type,
         }
+
+    @staticmethod
+    def _looks_like_physical_attack_news(text: str) -> bool:
+        """
+        Publisher-side fail-safe for AUTO video.
+
+        Не покладаємось лише на прапорець із Summarizer: якщо фінальний текст
+        явно описує фізичний удар/влучання з ракетою, БпЛА тощо, відео має
+        пройти Gemini-перевірку. Метафоричні/кібер "атаки" не підходять.
+        """
+        clean = NewsPublisher._strip_html(str(text or "")).lower()
+        clean = re.sub(r"\s+", " ", clean)
+        if not clean:
+            return False
+
+        cyber_markers = (
+            "кібератак", "хакер", "cyberattack", "кібершпиг",
+        )
+        weapon_markers = (
+            "бпла", "дрон", "шахед", "ракет", "обстріл", "обстрілу",
+            "артилер", "авіабомб", "каб ", "кабами",
+        )
+        impact_markers = (
+            "влуч", "приліт", "прильот", "удар", "вибух", "пожеж",
+            "зруйн", "руйнув", "пошкод",
+        )
+
+        has_weapon = any(marker in clean for marker in weapon_markers)
+        has_impact = any(marker in clean for marker in impact_markers)
+
+        if has_weapon and has_impact:
+            return True
+
+        # "обстріл" сам по собі вже достатньо фізичний сигнал.
+        if any(marker in clean for marker in ("обстріл", "обстрілу")):
+            return True
+
+        # Одне слово "атака" не використовуємо: воно може бути політичним чи
+        # кібернетичним. Якщо є лише cyber-сигнали — точно не фізична атака.
+        if any(marker in clean for marker in cyber_markers) and not has_weapon:
+            return False
+
+        return False
 
     async def _validate_video_relevance(
         self,
@@ -345,8 +400,13 @@ class NewsPublisher:
 
 Особливо для ударів/пожеж/аварій:
 - інше місто, район, об'єкт або очевидно інший інцидент = reject;
-- загальні кадри вибуху/диму без ознак суперечності можна дозволити, але з
-  нижчою confidence;
+- якщо текст називає КОНКРЕТНУ ціль/місце (житловий будинок, завод, міст,
+  порт, водойма тощо), а відео явно показує влучання в несумісне середовище
+  або іншу ціль — is_relevant=false і conflicting_context=true;
+- приклад: текст про влучання у житловий будинок, а ролик явно показує
+  падіння/вибух у воді чи відкритій місцевості без будинку — це reject;
+- загальні кадри вибуху/диму, де конкретну ціль неможливо розпізнати і немає
+  видимого протиріччя, можна дозволити, але з нижчою confidence;
 - водяні знаки каналу самі по собі НЕ є конфліктом;
 - якщо в кадрі/аудіо/плашках видно назву іншого міста, об'єкта, компанії чи
   іншої новини — conflicting_context=true;
@@ -437,21 +497,26 @@ confidence — ціле число 0-100.
                     model_relevant = bool(data.get("is_relevant", False))
                     conflicting = bool(data.get("conflicting_context", False))
 
-                    # Відео — fail-open. Модель часто погано розуміє нічні,
-                    # короткі або задимлені ролики. Відхиляємо ТІЛЬКИ коли вона
-                    # сама позначила explicit conflict і впевненість >=95.
-                    # Просто "is_relevant=false" без такого конфлікту НЕ блокує.
+                    # Для ролика, який уже пішов на обов'язкову перевірку,
+                    # краще відкинути явний mismatch, ніж показати інше влучання.
+                    # Водночас не караємо нічні/задимлені кадри лише за невисоку
+                    # впевненість, якщо модель не бачить конкретного протиріччя.
                     clear_mismatch = bool(
-                        conflicting
-                        and confidence >= 95
+                        (conflicting and confidence >= 80)
+                        or ((not model_relevant) and confidence >= 90)
                     )
                     is_relevant = not clear_mismatch
 
                     reason = str(data.get("reason") or "")[:500]
-                    if not clear_mismatch:
+                    if clear_mismatch:
                         reason = (
                             reason
-                            + " | allowed: soft video gate"
+                            + " | rejected: clear video/event mismatch"
+                        ).strip()
+                    else:
+                        reason = (
+                            reason
+                            + " | allowed: no clear video/event mismatch"
                         ).strip()
 
                     return {
