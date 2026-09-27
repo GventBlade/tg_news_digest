@@ -5254,7 +5254,11 @@ MANUAL POSTS:
                 manual_media_locked = bool(
                     media_source is not None
                     and posts[media_source].get("is_priority")
-                    and posts[media_source].get("manual_media_path")
+                    and (
+                        posts[media_source].get("manual_media_path")
+                        or posts[media_source].get("manual_telegram_file_id")
+                        or posts[media_source].get("telegram_file_id")
+                    )
                     and posts[media_source].get("manual_media_type") in {"photo", "video"}
                 )
 
@@ -7052,10 +7056,15 @@ discovery-блок.
         for source_id in source_ids:
             post = posts[source_id]
             media_path = str(post.get("manual_media_path") or "").strip()
+            media_file_id = str(
+                post.get("manual_telegram_file_id")
+                or post.get("telegram_file_id")
+                or ""
+            ).strip()
             media_type = str(post.get("manual_media_type") or "").strip().lower()
             if (
                 bool(post.get("is_priority"))
-                and media_path
+                and (media_path or media_file_id)
                 and media_type in {"photo", "video"}
             ):
                 locked.append(source_id)
@@ -7074,9 +7083,13 @@ discovery-блок.
         relevance: float,
     ) -> bool:
         """
-        Conservative pre-download gate for AUTO media. It is intentionally
-        stricter than the old relevance>=0.10 rule: better no media than a
-        convincing photo/video from a neighbouring story.
+        AUTO media pre-gate.
+
+        Photos stay relatively strict. Videos are deliberately softer because
+        short/night/impact clips often have tiny captions and are hard to
+        classify reliably. A video is rejected here mainly on an explicit
+        location conflict; otherwise moderate text overlap is enough and the
+        Publisher has one final fail-open obvious-conflict check.
         """
         post_text = str(posts[source_id].get("text") or "").strip()
         event_text = self._event_text_bundle(event)
@@ -7096,14 +7109,20 @@ discovery-блок.
             part for part in (event_text, factual_text) if part
         )
 
-        # Same factual source is naturally a strong media candidate.
-        if source_id == factual_id and relevance >= 0.10:
-            return True
+        is_video = bool(posts[source_id].get("has_video"))
+
+        # Same factual source is naturally strong. Video gets an even softer
+        # threshold because caption can be only a few words.
+        if source_id == factual_id:
+            return relevance >= (0.04 if is_video else 0.10)
 
         post_entities = self._entity_signature(post_text)
         ref_entities = self._entity_signature(reference_text)
         shared_entities = post_entities & ref_entities
-        shared_story = self._story_signature(post_text) & self._story_signature(reference_text)
+        shared_story = (
+            self._story_signature(post_text)
+            & self._story_signature(reference_text)
+        )
 
         post_is_attack = self._looks_like_attack_text(post_text)
         ref_is_attack = self._looks_like_attack_text(reference_text)
@@ -7111,10 +7130,20 @@ discovery-блок.
         if post_is_attack or ref_is_attack:
             post_centers = self._regional_center_names(post_text)
             ref_centers = self._regional_center_names(reference_text)
-            if post_centers and ref_centers and post_centers.isdisjoint(ref_centers):
+
+            # This is the one strong deterministic video reject: both texts
+            # explicitly name different regional centres.
+            if (
+                post_centers
+                and ref_centers
+                and post_centers.isdisjoint(ref_centers)
+            ):
                 return False
 
-            if self._attack_same_story_anchor_match(post_text, reference_text):
+            if self._attack_same_story_anchor_match(
+                post_text,
+                reference_text,
+            ):
                 return True
 
             shared_anchors = (
@@ -7122,25 +7151,46 @@ discovery-блок.
                 & self._attack_anchor_signature(reference_text)
             )
 
-            # Short direct-impact captions are often only a few words. A
-            # concrete shared target/location is enough, but generic attack
-            # vocabulary is not.
-            if (
-                bool(posts[source_id].get("has_video"))
-                and self._is_direct_impact_video_post(posts[source_id])
-                and (shared_entities or len(shared_anchors) >= 2)
-                and relevance >= 0.16
-            ):
-                return True
+            if is_video:
+                # Direct-impact clips deserve extra tolerance. Do not demand
+                # long caption similarity if target/location anchors agree.
+                if (
+                    self._is_direct_impact_video_post(posts[source_id])
+                    and (
+                        shared_entities
+                        or shared_anchors
+                        or relevance >= 0.06
+                    )
+                ):
+                    return True
 
+                if shared_entities or shared_anchors:
+                    return True
+                if len(shared_story) >= 1:
+                    return True
+                return relevance >= 0.08
+
+            # Photos stay stricter than videos.
             return bool(
                 relevance >= 0.34
-                and (shared_entities or len(shared_anchors) >= 2 or len(shared_story) >= 3)
+                and (
+                    shared_entities
+                    or len(shared_anchors) >= 2
+                    or len(shared_story) >= 3
+                )
             )
+
+        if is_video:
+            if shared_entities or len(shared_story) >= 2:
+                return True
+            return relevance >= 0.12
 
         if relevance >= 0.36:
             return True
-        if relevance >= 0.24 and (shared_entities or len(shared_story) >= 3):
+        if relevance >= 0.24 and (
+            shared_entities
+            or len(shared_story) >= 3
+        ):
             return True
         return False
 

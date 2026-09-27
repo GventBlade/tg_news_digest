@@ -301,48 +301,95 @@ async def handle_admin_forwarded_message(
 
     media_path = None
     media_type = None
+    telegram_file_id = ""
+    telegram_file_unique_id = ""
+    telegram_file_size = 0
 
     os.makedirs(
         "downloads",
         exist_ok=True,
     )
 
-    try:
-        if message.photo:
-            photo = message.photo[-1]
-            file = await photo.get_file()
-
-            media_path = (
-                f"downloads/manual_"
-                f"{message.message_id}.jpg"
-            )
-
-            await file.download_to_drive(
-                media_path
-            )
-
-            media_type = "photo"
-
-        elif message.video:
-            video = message.video
-            file = await video.get_file()
-
-            media_path = (
-                f"downloads/manual_"
-                f"{message.message_id}.mp4"
-            )
-
-            await file.download_to_drive(
-                media_path
-            )
-
-            media_type = "video"
-
-    except Exception as e:
-        logger.error(
-            "Не вдалося зберегти прикріплене "
-            f"медіа від адміна: {e}"
+    # Для manual media Telegram file_id є головною страховкою. Bot API може
+    # відмовити у download великого відео ("File is too big"), але той самий
+    # бот все одно може повторно відправити оригінал за file_id.
+    if message.photo:
+        photo = message.photo[-1]
+        media_type = "photo"
+        telegram_file_id = str(
+            getattr(photo, "file_id", "") or ""
         )
+        telegram_file_unique_id = str(
+            getattr(photo, "file_unique_id", "") or ""
+        )
+        telegram_file_size = int(
+            getattr(photo, "file_size", 0) or 0
+        )
+        target_path = (
+            f"downloads/manual_"
+            f"{message.message_id}.jpg"
+        )
+        try:
+            file = await photo.get_file()
+            await file.download_to_drive(
+                target_path
+            )
+            if os.path.exists(target_path):
+                media_path = target_path
+        except Exception as e:
+            logger.warning(
+                "MANUAL MEDIA local download failed; "
+                "залишаємо Telegram file_id fallback: %s",
+                e,
+            )
+
+    elif message.video:
+        video = message.video
+        media_type = "video"
+        telegram_file_id = str(
+            getattr(video, "file_id", "") or ""
+        )
+        telegram_file_unique_id = str(
+            getattr(video, "file_unique_id", "") or ""
+        )
+        telegram_file_size = int(
+            getattr(video, "file_size", 0) or 0
+        )
+        target_path = (
+            f"downloads/manual_"
+            f"{message.message_id}.mp4"
+        )
+        try:
+            file = await video.get_file()
+            await file.download_to_drive(
+                target_path
+            )
+            if os.path.exists(target_path):
+                media_path = target_path
+        except Exception as e:
+            logger.warning(
+                "MANUAL MEDIA local download failed; "
+                "залишаємо Telegram file_id fallback: %s",
+                e,
+            )
+
+    has_manual_media = bool(
+        media_type in {"photo", "video"}
+        and (media_path or telegram_file_id)
+    )
+
+    # Якщо користувач реально надіслав media, але ми не маємо ні локального
+    # файла, ні Telegram file_id, не створюємо оманливий text-only manual.
+    if media_type in {"photo", "video"} and not has_manual_media:
+        await message.reply_text(
+            "⚠️ Не вдалося зафіксувати медіа. "
+            "Новину не додано до черги — надішли її ще раз."
+        )
+        logger.error(
+            "MANUAL MEDIA capture failed completely: telegram_message_id=%s",
+            message.message_id,
+        )
+        return
 
     history = NewsHistory()
 
@@ -352,16 +399,25 @@ async def handle_admin_forwarded_message(
         channel_username=channel_username,
         media_path=media_path,
         media_type=media_type,
-        has_media=bool(media_path),
+        has_media=has_manual_media,
         has_video=(
             media_type == "video"
         ),
+        telegram_file_id=telegram_file_id,
+        telegram_file_unique_id=telegram_file_unique_id,
+        telegram_file_size=telegram_file_size,
     )
 
+    media_note = (
+        " Медіа зафіксовано й не буде замінюватися."
+        if has_manual_media
+        else ""
+    )
     await message.reply_text(
         "✅ Новину збережено до черги. "
         "Вона гарантовано піде в найближчий слот; "
         "короткий опис із медіа теж допускається."
+        + media_note
     )
 
     logger.info(
@@ -549,10 +605,15 @@ def _locked_manual_media_source_for_item(
         seen.add(source_idx)
         post = posts[source_idx]
         media_path = str(post.get("manual_media_path") or "").strip()
+        media_file_id = str(
+            post.get("manual_telegram_file_id")
+            or post.get("telegram_file_id")
+            or ""
+        ).strip()
         media_type = str(post.get("manual_media_type") or "").strip().lower()
         if (
             bool(post.get("is_priority"))
-            and media_path
+            and (media_path or media_file_id)
             and media_type in {"photo", "video"}
         ):
             return source_idx
@@ -645,11 +706,24 @@ async def process_and_publish_news_cycle():
                 "manual_media_type": manual[
                     "media_type"
                 ],
+                "manual_telegram_file_id": str(
+                    manual.get("telegram_file_id") or ""
+                ),
+                "manual_telegram_file_unique_id": str(
+                    manual.get("telegram_file_unique_id") or ""
+                ),
+                "manual_telegram_file_size": int(
+                    manual.get("telegram_file_size") or 0
+                ),
                 "manual_queue_id": queue_id,
                 "is_priority": True,
                 # Media attached by admin is immutable. Summarizer may enrich
-                # text from other sources, but publication must use this file.
-                "media_locked": bool(manual["media_path"]),
+                # text from other sources, but publication must use the admin
+                # media either from local path OR Telegram file_id.
+                "media_locked": bool(
+                    manual.get("media_path")
+                    or manual.get("telegram_file_id")
+                ),
                 "media_document_id": None,
                 "video_duration": None,
                 "message_obj": None,
@@ -753,6 +827,7 @@ async def process_and_publish_news_cycle():
         ig_media_items = []
         published_news = []
         published_manual_ids = set()
+        used_media_fingerprints = set()
 
         for index, item in enumerate(
             top_news,
@@ -802,16 +877,23 @@ async def process_and_publish_news_cycle():
 
             media_path = None
             media_type = None
+            media_file_id = None
 
-            if target_post.get(
-                "manual_media_path"
-            ):
-                media_path = target_post[
-                    "manual_media_path"
-                ]
-                media_type = target_post[
-                    "manual_media_type"
-                ]
+            if manual_media_locked:
+                media_type = str(
+                    target_post.get("manual_media_type") or ""
+                ).strip().lower()
+                candidate_path = str(
+                    target_post.get("manual_media_path") or ""
+                ).strip()
+                if candidate_path and os.path.exists(candidate_path):
+                    media_path = candidate_path
+
+                media_file_id = str(
+                    target_post.get("manual_telegram_file_id")
+                    or target_post.get("telegram_file_id")
+                    or ""
+                ).strip() or None
 
             elif target_post.get(
                 "message_obj"
@@ -834,19 +916,22 @@ async def process_and_publish_news_cycle():
                         f"для новини #{index}: {dl_err}"
                     )
 
+            # Manual media має дві рівноправні форми: локальний файл або
+            # Telegram file_id. Якщо немає обох — НЕ публікуємо текстом і
+            # НЕ позначаємо queue processed.
             if manual_media_locked and (
-                not media_path
-                or media_type not in {"photo", "video"}
-                or not os.path.exists(media_path)
+                media_type not in {"photo", "video"}
+                or not (media_path or media_file_id)
             ):
                 logger.error(
                     "MANUAL MEDIA LOCK FAILED: news_index=%s event_id=%s "
-                    "source_id=%s path=%s type=%s. Не публікуємо цей manual "
-                    "текстом без вибраного адміном медіа; queue лишається pending.",
+                    "source_id=%s path=%s file_id=%s type=%s. "
+                    "Queue лишається pending.",
                     index,
                     item.get("event_id"),
                     source_idx,
                     media_path,
+                    bool(media_file_id),
                     media_type,
                 )
                 continue
@@ -855,33 +940,35 @@ async def process_and_publish_news_cycle():
             # Audit не запускає Vision вдруге; він лише перевірить,
             # що відхилене медіа не залишилось у фінальному pipeline.
             original_media_path = media_path
+            original_media_file_id = media_file_id
             original_media_type = media_type
             media_rejected = False
             media_reject_reason = ""
+            media_reuse_suppressed = False
+            media_fingerprint = None
 
-            # ЄДИНИЙ media-gate для ОБОХ платформ.
-            # Manual media is an explicit admin choice: it is NEVER replaced or
-            # dropped by automatic Vision. AUTO media still passes validation.
+            # Manual media — без Vision узагалі. Це явний вибір адміна.
+            # AUTO photo лишається суворішим; AUTO video — лише м'який
+            # obvious-conflict gate у Publisher.
             media_verdict = {}
-            if (
+            if manual_media_locked:
+                media_verdict = {
+                    "is_relevant": True,
+                    "confidence": 100,
+                    "reason": "manual_media_locked_no_validation",
+                    "media_type": media_type,
+                }
+            elif (
                 media_path
                 and media_type in {"photo", "video"}
             ):
-                if manual_media_locked:
-                    media_verdict = {
-                        "is_relevant": True,
-                        "confidence": 100,
-                        "reason": "manual_media_locked",
-                        "media_type": media_type,
-                    }
-                else:
-                    media_verdict = (
-                        await publisher.validate_media_for_news(
-                            text=item["text"],
-                            media_path=media_path,
-                            media_type=media_type,
-                        )
+                media_verdict = (
+                    await publisher.validate_media_for_news(
+                        text=item["text"],
+                        media_path=media_path,
+                        media_type=media_type,
                     )
+                )
 
                 if not media_verdict.get(
                     "is_relevant",
@@ -908,6 +995,44 @@ async def process_and_publish_news_cycle():
                     media_path = None
                     media_type = None
 
+            # 24h reuse-lock тільки для AUTO media. Він ніколи не прибирає
+            # саму новину: при повторі старого фото/відео пост іде текстом.
+            if (
+                not manual_media_locked
+                and media_path
+                and media_type in {"photo", "video"}
+            ):
+                media_fingerprint = publisher.build_media_fingerprint(
+                    media_path,
+                    media_type,
+                )
+                fingerprint_key = (
+                    media_type,
+                    media_fingerprint,
+                )
+                if (
+                    media_fingerprint
+                    and (
+                        fingerprint_key in used_media_fingerprints
+                        or history.was_media_recently_used(
+                            media_fingerprint,
+                            media_type,
+                            hours=24,
+                        )
+                    )
+                ):
+                    media_reuse_suppressed = True
+                    logger.info(
+                        "MEDIA REUSE LOCK: news_index=%s event_id=%s "
+                        "type=%s fingerprint=%s. Публікуємо без повторного media.",
+                        index,
+                        item.get("event_id"),
+                        media_type,
+                        media_fingerprint[:24],
+                    )
+                    media_path = None
+                    media_type = None
+
             # Посилання додаємо ПІСЛЯ Vision-перевірки,
             # щоб службовий рядок не впливав на media-gate.
             publication_text = append_reference_link(
@@ -921,9 +1046,12 @@ async def process_and_publish_news_cycle():
                     text=publication_text,
                     media_path=media_path,
                     media_type=media_type,
+                    media_file_id=media_file_id,
 
-                    # Уже перевірили вище один раз.
+                    # Уже перевірили вище; manual взагалі bypass.
                     validate_media=False,
+                    # Manual не має права тихо впасти до text-only.
+                    require_media=manual_media_locked,
                 )
             )
 
@@ -933,6 +1061,21 @@ async def process_and_publish_news_cycle():
                 )
                 await asyncio.sleep(3)
                 continue
+
+            if (
+                not manual_media_locked
+                and media_path
+                and media_type in {"photo", "video"}
+                and media_fingerprint
+            ):
+                used_media_fingerprints.add(
+                    (media_type, media_fingerprint)
+                )
+                history.record_media_used(
+                    media_fingerprint,
+                    media_type,
+                    source_kind="auto",
+                )
 
             published_item = dict(item)
             # source_id in audit/runtime must reflect the media source actually
@@ -990,18 +1133,29 @@ async def process_and_publish_news_cycle():
             # записуються у semantic history.
             published_item["_audit_media"] = {
                 "original_path": original_media_path,
+                "original_file_id": bool(original_media_file_id),
                 "original_type": original_media_type,
                 "rejected": media_rejected,
                 "reject_reason": media_reject_reason,
                 "validation_reason": str(media_verdict.get("reason") or ""),
                 "validation_confidence": media_verdict.get("confidence"),
+                "reuse_suppressed": media_reuse_suppressed,
                 "final_path": media_path,
+                "final_file_id": bool(media_file_id),
                 "final_type": media_type,
                 "manual_locked": manual_media_locked,
                 "manual_expected_path": (
                     str(target_post.get("manual_media_path") or "")
                     if manual_media_locked
                     else ""
+                ),
+                "manual_expected_file_id": (
+                    bool(
+                        target_post.get("manual_telegram_file_id")
+                        or target_post.get("telegram_file_id")
+                    )
+                    if manual_media_locked
+                    else False
                 ),
                 "selected_source_id": source_idx,
             }

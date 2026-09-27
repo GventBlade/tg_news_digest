@@ -1,5 +1,6 @@
 import asyncio
 import io
+import hashlib
 import json
 import logging
 import mimetypes
@@ -63,12 +64,21 @@ class NewsPublisher:
         media_path: str | None = None,
         media_type: str | None = None,
         validate_media: bool = True,
+        media_file_id: str | None = None,
+        require_media: bool = False,
     ) -> bool:
+        """
+        Publish one Telegram item.
+
+        `media_file_id` is primarily for manual admin media that Telegram already
+        stores. It lets us re-send a large original video even when Bot API
+        refuses to download it locally. If `require_media=True`, failure to send
+        that media returns False instead of silently degrading to text-only.
+        """
         try:
-            # За замовчуванням метод сам захищений media-gate.
-            # main.py може передати validate_media=False, якщо вже отримав
-            # verdict через validate_media_for_news() і використовує його
-            # одночасно для Telegram та Instagram.
+            # Local AUTO media can still be validated here when caller did not
+            # already validate it. Telegram file_id media is used only for the
+            # manual locked path and intentionally bypasses Vision.
             if media_path and validate_media:
                 verdict = await self.validate_media_for_news(
                     text=text,
@@ -80,36 +90,88 @@ class NewsPublisher:
                     media_path = None
                     media_type = None
 
-            if media_path and Path(media_path).exists():
-                try:
-                    if media_type == "photo":
-                        await self.bot.send_photo(
-                            chat_id=settings.TARGET_CHANNEL_ID,
-                            photo=FSInputFile(media_path),
-                            caption=text,
-                        )
-                        logger.info(
-                            "Фото-пост опубліковано в Telegram."
-                        )
-                        return True
+            has_local_media = bool(
+                media_path
+                and Path(media_path).exists()
+                and media_type in {"photo", "video"}
+            )
+            has_file_id_media = bool(
+                media_file_id
+                and media_type in {"photo", "video"}
+            )
 
-                    if media_type == "video":
-                        await self.bot.send_video(
-                            chat_id=settings.TARGET_CHANNEL_ID,
-                            video=FSInputFile(media_path),
-                            caption=text,
-                            supports_streaming=True,
-                        )
-                        logger.info(
-                            "Відео-пост опубліковано в Telegram."
-                        )
-                        return True
-
-                except Exception as media_error:
-                    logger.warning(
-                        f"Не вдалося відправити медіа "
-                        f"({media_error}), відправляємо текстом."
+            if has_file_id_media or has_local_media:
+                media_candidates = []
+                if has_file_id_media:
+                    media_candidates.append(
+                        ("file_id", str(media_file_id))
                     )
+                if has_local_media:
+                    media_candidates.append(
+                        ("local", FSInputFile(str(media_path)))
+                    )
+
+                last_media_error = None
+                for source_kind, payload in media_candidates:
+                    try:
+                        if media_type == "photo":
+                            await self.bot.send_photo(
+                                chat_id=settings.TARGET_CHANNEL_ID,
+                                photo=payload,
+                                caption=text,
+                            )
+                            logger.info(
+                                "Фото-пост опубліковано в Telegram%s.",
+                                " через file_id"
+                                if source_kind == "file_id"
+                                else "",
+                            )
+                            return True
+
+                        if media_type == "video":
+                            await self.bot.send_video(
+                                chat_id=settings.TARGET_CHANNEL_ID,
+                                video=payload,
+                                caption=text,
+                                supports_streaming=True,
+                            )
+                            logger.info(
+                                "Відео-пост опубліковано в Telegram%s.",
+                                " через file_id"
+                                if source_kind == "file_id"
+                                else "",
+                            )
+                            return True
+
+                    except Exception as media_error:
+                        last_media_error = media_error
+                        logger.warning(
+                            "Telegram media send failed via %s: %s",
+                            source_kind,
+                            media_error,
+                        )
+
+                if require_media:
+                    logger.error(
+                        "REQUIRED MEDIA send failed via all available paths; "
+                        "text-only fallback заборонено: %s",
+                        last_media_error,
+                        exc_info=last_media_error is not None,
+                    )
+                    return False
+
+                logger.warning(
+                    "Не вдалося відправити медіа, відправляємо текстом."
+                )
+
+            elif require_media:
+                logger.error(
+                    "REQUIRED MEDIA missing: type=%s path=%s file_id=%s",
+                    media_type,
+                    media_path,
+                    bool(media_file_id),
+                )
+                return False
 
             await self.bot.send_message(
                 chat_id=settings.TARGET_CHANNEL_ID,
@@ -249,7 +311,7 @@ class NewsPublisher:
         size = path.stat().st_size
 
         prompt = f"""
-Ти — суворий відеоредактор українського новинного Telegram-каналу.
+Ти — обережний відеоредактор українського новинного Telegram-каналу.
 
 Порівняй ФАКТИЧНЕ ВІДЕО з текстом новини нижче. Потрібно визначити, чи
 цей ролик справді стосується тієї самої конкретної події.
@@ -263,7 +325,7 @@ class NewsPublisher:
   іншої новини — conflicting_context=true;
 - не вимагай, щоб відео показувало всі факти тексту: достатньо, щоб воно
   чесно ілюструвало саме цю подію;
-- якщо не можеш встановити відповідність, не вигадуй деталей.
+- якщо не можеш встановити відповідність або сумніваєшся — НЕ відхиляй;\n  conflicting_context=true став лише при явному, видимому протиріччі.
 
 НОВИНА:
 {clean_text[:1800]}
@@ -348,17 +410,22 @@ confidence — ціле число 0-100.
                     model_relevant = bool(data.get("is_relevant", False))
                     conflicting = bool(data.get("conflicting_context", False))
 
-                    # Reject only a clear mismatch. Ambiguous video is allowed
-                    # because text-based source gating already ran upstream.
-                    clear_mismatch = (
-                        (not model_relevant and confidence >= 70)
-                        or (conflicting and confidence >= 55)
+                    # Відео — fail-open. Модель часто погано розуміє нічні,
+                    # короткі або задимлені ролики. Відхиляємо ТІЛЬКИ коли вона
+                    # сама позначила explicit conflict і впевненість >=95.
+                    # Просто "is_relevant=false" без такого конфлікту НЕ блокує.
+                    clear_mismatch = bool(
+                        conflicting
+                        and confidence >= 95
                     )
                     is_relevant = not clear_mismatch
 
                     reason = str(data.get("reason") or "")[:500]
-                    if not clear_mismatch and not model_relevant:
-                        reason = (reason + " | allowed: low-confidence mismatch").strip()
+                    if not clear_mismatch:
+                        reason = (
+                            reason
+                            + " | allowed: soft video gate"
+                        ).strip()
 
                     return {
                         "is_relevant": is_relevant,
@@ -625,6 +692,85 @@ confidence — ЦІЛЕ ЧИСЛО ВІД 0 ДО 100, де 100 = повна вп
             text = text[first:last + 1]
 
         return re.sub(r",\s*([}\]])", r"\1", text).strip()
+
+    @staticmethod
+    def build_media_fingerprint(
+        media_path: str,
+        media_type: str,
+    ) -> str | None:
+        """
+        Stable lightweight fingerprint for 24h AUTO-media reuse lock.
+
+        Photos use a 64-bit dHash, which normally survives Telegram resize/
+        recompression. Videos use sampled SHA1 + size; this intentionally catches
+        exact/same-file reuse without trying to "understand" video content.
+        """
+        path = Path(str(media_path or ""))
+        kind = str(media_type or "").strip().lower()
+        if not path.exists() or kind not in {"photo", "video"}:
+            return None
+
+        try:
+            if kind == "photo":
+                with Image.open(path) as image:
+                    image = ImageOps.exif_transpose(image).convert("L")
+                    image = image.resize((9, 8), Image.Resampling.LANCZOS)
+                    pixels = list(image.getdata())
+
+                bits = 0
+                bit_index = 0
+                for row in range(8):
+                    offset = row * 9
+                    for col in range(8):
+                        left = pixels[offset + col]
+                        right = pixels[offset + col + 1]
+                        if left > right:
+                            bits |= 1 << bit_index
+                        bit_index += 1
+
+                # Додаємо average-hash, щоб не було випадкових колізій
+                # на дуже простих/монотонних зображеннях.
+                with Image.open(path) as image:
+                    avg_img = ImageOps.exif_transpose(image).convert("L")
+                    avg_img = avg_img.resize(
+                        (8, 8),
+                        Image.Resampling.LANCZOS,
+                    )
+                    avg_pixels = list(avg_img.getdata())
+                avg_value = sum(avg_pixels) / max(1, len(avg_pixels))
+                avg_bits = 0
+                for idx, value in enumerate(avg_pixels):
+                    if value >= avg_value:
+                        avg_bits |= 1 << idx
+
+                return f"phash128:{bits:016x}{avg_bits:016x}"
+
+            size = path.stat().st_size
+            hasher = hashlib.sha1()
+            chunk = 1024 * 1024
+            with path.open("rb") as fh:
+                first = fh.read(chunk)
+                hasher.update(first)
+
+                if size > chunk * 2:
+                    middle_pos = max(0, size // 2 - chunk // 2)
+                    fh.seek(middle_pos)
+                    hasher.update(fh.read(chunk))
+
+                if size > chunk:
+                    fh.seek(max(0, size - chunk))
+                    hasher.update(fh.read(chunk))
+
+            hasher.update(str(size).encode("ascii"))
+            return f"vsha1:{hasher.hexdigest()}:{size}"
+
+        except Exception as exc:
+            logger.warning(
+                "Не вдалося побудувати media fingerprint для %s: %s",
+                media_path,
+                exc,
+            )
+            return None
 
     def create_public_media_url(
         self,

@@ -400,8 +400,13 @@ class NewsCollector:
 
     @staticmethod
     def _get_media_document_id(message) -> Optional[int]:
+        # Для відео Telegram має document.id, для фото — photo.id.
+        # Обидва корисні як cheap exact-media signal у same-cycle dedup.
         document = getattr(message, "document", None)
         value = getattr(document, "id", None)
+        if value is None:
+            photo = getattr(message, "photo", None)
+            value = getattr(photo, "id", None)
         try:
             return int(value) if value is not None else None
         except (TypeError, ValueError):

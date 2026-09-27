@@ -1142,31 +1142,51 @@ CASES:
                 )
                 or ""
             ).strip()
+            final_file_id = bool(
+                audit.get("final_file_id")
+            )
 
             manual_locked = bool(audit.get("manual_locked"))
             manual_expected_path = str(
                 audit.get("manual_expected_path") or ""
             ).strip()
+            manual_expected_file_id = bool(
+                audit.get("manual_expected_file_id")
+            )
 
-            if (
-                manual_locked
-                and manual_expected_path
-                and final_path != manual_expected_path
-            ):
-                issues.append({
-                    "type": "manual_media_lock_issue",
-                    "event_id": str(item.get("event_id") or ""),
-                    "confidence": 100,
-                    "reason": (
-                        "Manual media було замінено/втрачено: "
-                        f"expected={manual_expected_path}, final={final_path or 'none'}."
-                    ),
-                })
+            manual_media_present = bool(
+                final_path
+                or final_file_id
+            )
+
+            if manual_locked:
+                lock_broken = False
+                if manual_expected_path:
+                    lock_broken = final_path != manual_expected_path
+                elif manual_expected_file_id:
+                    lock_broken = not final_file_id
+                else:
+                    lock_broken = not manual_media_present
+
+                if lock_broken:
+                    issues.append({
+                        "type": "manual_media_lock_issue",
+                        "event_id": str(item.get("event_id") or ""),
+                        "confidence": 100,
+                        "reason": (
+                            "Manual media було замінено/втрачено: "
+                            f"expected_path={manual_expected_path or 'none'}, "
+                            f"expected_file_id={manual_expected_file_id}, "
+                            f"final_path={final_path or 'none'}, "
+                            f"final_file_id={final_file_id}."
+                        ),
+                    })
 
             if (
                 rejected
                 and (
                     final_path
+                    or final_file_id
                     or final_type
                 )
             ):
@@ -1189,7 +1209,7 @@ CASES:
                 })
 
             elif (
-                bool(final_path)
+                bool(final_path or final_file_id)
                 != bool(final_type)
             ):
                 issues.append({
@@ -1204,7 +1224,7 @@ CASES:
                     ),
                     "confidence": 100,
                     "reason": (
-                        "media_path і media_type "
+                        "media path/file_id і media_type "
                         "неузгоджені."
                     ),
                 })

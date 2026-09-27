@@ -77,11 +77,47 @@ class NewsHistory:
                     channel_username TEXT DEFAULT '',
                     media_path TEXT DEFAULT NULL,
                     media_type TEXT DEFAULT NULL,
+                    telegram_file_id TEXT DEFAULT '',
+                    telegram_file_unique_id TEXT DEFAULT '',
+                    telegram_file_size INTEGER DEFAULT 0,
                     has_media INTEGER DEFAULT 0,
                     has_video INTEGER DEFAULT 0,
                     views INTEGER DEFAULT 50000,
                     processed INTEGER DEFAULT 0,
                     created_at TEXT
+                )
+            """)
+
+            # Безпечна auto-migration для старої БД. Великі manual-відео
+            # Telegram може не дати скачати через Bot API, тому зберігаємо
+            # file_id і можемо повторно відправити оригінал без локального файла.
+            manual_columns = {
+                row[1]
+                for row in conn.execute(
+                    "PRAGMA table_info(manual_news_queue)"
+                ).fetchall()
+            }
+            for column_name, definition in (
+                ("telegram_file_id", "TEXT DEFAULT ''"),
+                ("telegram_file_unique_id", "TEXT DEFAULT ''"),
+                ("telegram_file_size", "INTEGER DEFAULT 0"),
+            ):
+                if column_name not in manual_columns:
+                    conn.execute(
+                        f"ALTER TABLE manual_news_queue "
+                        f"ADD COLUMN {column_name} {definition}"
+                    )
+
+            # Історія реально використаних AUTO media. Це не блокує новину:
+            # при повторі ми просто публікуємо її без старого медіа.
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS published_media_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    fingerprint TEXT NOT NULL,
+                    media_type TEXT DEFAULT '',
+                    source_kind TEXT DEFAULT 'auto',
+                    published_at TEXT,
+                    UNIQUE(fingerprint, media_type)
                 )
             """)
 
@@ -185,6 +221,12 @@ class NewsHistory:
 
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS
+                idx_published_media_history_time
+                ON published_media_history(published_at)
+            """)
+
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS
                 idx_quality_audit_runs_created_at
                 ON quality_audit_runs(created_at)
             """)
@@ -219,6 +261,9 @@ class NewsHistory:
         media_type: str = None,
         has_media: bool = False,
         has_video: bool = False,
+        telegram_file_id: str = "",
+        telegram_file_unique_id: str = "",
+        telegram_file_size: int = 0,
     ) -> int:
 
         now_str = (
@@ -245,11 +290,14 @@ class NewsHistory:
                     channel_username,
                     media_path,
                     media_type,
+                    telegram_file_id,
+                    telegram_file_unique_id,
+                    telegram_file_size,
                     has_media,
                     has_video,
                     created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     raw_text.strip(),
@@ -257,6 +305,9 @@ class NewsHistory:
                     channel_username,
                     media_path,
                     media_type,
+                    str(telegram_file_id or ""),
+                    str(telegram_file_unique_id or ""),
+                    self._safe_int(telegram_file_size),
                     1 if has_media else 0,
                     1 if has_video else 0,
                     now_str,
@@ -341,6 +392,80 @@ class NewsHistory:
             )
 
             conn.commit()
+
+    def was_media_recently_used(
+        self,
+        fingerprint: str,
+        media_type: str,
+        hours: int = 24,
+    ) -> bool:
+        """24h lock for AUTO media fingerprints. Fail-open on DB errors."""
+        fp = str(fingerprint or "").strip()
+        kind = str(media_type or "").strip().lower()
+        if not fp or kind not in {"photo", "video"}:
+            return False
+
+        threshold = (
+            datetime.now(timezone.utc)
+            - timedelta(hours=max(1, int(hours or 24)))
+        ).strftime("%Y-%m-%d %H:%M:%S")
+
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                row = conn.execute(
+                    """
+                    SELECT 1
+                    FROM published_media_history
+                    WHERE fingerprint = ?
+                      AND media_type = ?
+                      AND published_at > ?
+                    LIMIT 1
+                    """,
+                    (fp, kind, threshold),
+                ).fetchone()
+                return row is not None
+        except Exception as exc:
+            logger.warning("MEDIA HISTORY lookup failed: %s", exc)
+            return False
+
+    def record_media_used(
+        self,
+        fingerprint: str,
+        media_type: str,
+        source_kind: str = "auto",
+    ):
+        """Remember media only after a successful Telegram publication."""
+        fp = str(fingerprint or "").strip()
+        kind = str(media_type or "").strip().lower()
+        if not fp or kind not in {"photo", "video"}:
+            return
+
+        now_str = datetime.now(timezone.utc).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO published_media_history
+                    (fingerprint, media_type, source_kind, published_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(fingerprint, media_type)
+                    DO UPDATE SET
+                        source_kind = excluded.source_kind,
+                        published_at = excluded.published_at
+                    """,
+                    (
+                        fp,
+                        kind,
+                        str(source_kind or "auto")[:32],
+                        now_str,
+                    ),
+                )
+                conn.commit()
+        except Exception as exc:
+            logger.warning("MEDIA HISTORY write failed: %s", exc)
 
     # ═════════════════════════════════════════════
     # PUBLISHED NEWS HISTORY
@@ -1143,6 +1268,19 @@ class NewsHistory:
                 ),
             )
 
+            media_threshold = (
+                datetime.now(timezone.utc)
+                - timedelta(days=7)
+            ).strftime("%Y-%m-%d %H:%M:%S")
+
+            conn.execute(
+                """
+                DELETE FROM published_media_history
+                WHERE published_at < ?
+                """,
+                (media_threshold,),
+            )
+
             conn.execute(
                 """
                 DELETE FROM quality_audit_runs
@@ -1186,3 +1324,4 @@ class NewsHistory:
             return int(
                 default
             )
+
