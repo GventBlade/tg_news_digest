@@ -1,302 +1,388 @@
-    import json
-    import logging
-    import math
-    import re
-    import time
-    from difflib import SequenceMatcher
-    from datetime import datetime, timezone
-    from typing import Any, Dict, List, Optional, Union
-    from urllib.parse import urlparse
-    
-    from google import genai
-    from google.genai import types
-    
-    from app.config import settings
-    
-    logger = logging.getLogger(__name__)
-    
-    
-    SOURCE_TIERS = {
-        "suspilnenews": 1.2,
-        "ukrpravda_news": 1.2,
-        "babel": 1.2,
-        "nvua_official": 1.2,
-        "liganet": 1.2,
-        "bbcukrainian": 1.2,
-        "radiosvoboda": 1.2,
-        "forbesukraines": 1.2,
-        "forbesukraine": 1.2,
-    
-        "DeepStateUA": 1.1,
-        "DIUkraine": 1.1,
-        "milinua": 1.1,
-        "kpszsu": 1.1,
-        "operativnoZSU": 1.1,
-        "Tsaplienko": 1.1,
-    
-        "TCH_channel": 0.9,
-        "times_ukraina": 0.9,
-        "truexanewsua": 0.9,
-        "voynareal": 0.9,
-        "lachentyt": 0.9,
-        "vanek_nikolaev": 0.9,
+import json
+import logging
+import math
+import re
+import time
+from difflib import SequenceMatcher
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Union
+from urllib.parse import urlparse
+
+from google import genai
+from google.genai import types
+
+from app.config import settings
+
+logger = logging.getLogger(__name__)
+
+
+SOURCE_TIERS = {
+    "suspilnenews": 1.2,
+    "ukrpravda_news": 1.2,
+    "babel": 1.2,
+    "nvua_official": 1.2,
+    "liganet": 1.2,
+    "bbcukrainian": 1.2,
+    "radiosvoboda": 1.2,
+    "forbesukraines": 1.2,
+    "forbesukraine": 1.2,
+
+    "DeepStateUA": 1.1,
+    "DIUkraine": 1.1,
+    "milinua": 1.1,
+    "kpszsu": 1.1,
+    "operativnoZSU": 1.1,
+    "Tsaplienko": 1.1,
+
+    "TCH_channel": 0.9,
+    "times_ukraina": 0.9,
+    "truexanewsua": 0.9,
+    "voynareal": 0.9,
+    "lachentyt": 0.9,
+    "vanek_nikolaev": 0.9,
+}
+
+
+LOW_VALUE_EVENT_TYPES = {
+    "routine_attack",
+    "routine_statement",
+    "minor_local_event",
+    "minor_accident",
+}
+
+HARD_REJECT_EVENT_TYPES = {
+    "alert_only",
+}
+
+
+class NewsSummarizer:
+    DEFAULT_COUNT = 10
+
+    # Тепер намагаємось давати щільніший випуск: якщо є достатньо
+    # придатних подій, бажано мати щонайменше 7 матеріалів.
+    MIN_DIGEST_COUNT = 7
+
+    EDITOR_CANDIDATES = 30
+    HISTORY_LIMIT = 150
+
+    # Якщо та сама подія вже була у попередньому 4-годинному випуску,
+    # не дозволяємо дрібним уточненням/іншому формулюванню повернути її
+    # одразу вдруге. Це окрема жорстка страховка саме від сусідніх випусків.
+    ADJACENT_DUPLICATE_LOCK_HOURS = 6.5
+
+    # Агреговане зведення Повітряних сил / ППО зі статистикою збитих
+    # ракет і БпЛА показуємо не частіше одного разу на добу.
+    DAILY_AIR_DEFENSE_SUMMARY_LOCK_HOURS = 24.0
+
+    # Для законів, санкційних пакетів, угод і подібних одноразових рішень
+    # не повторюємо ту саму базову історію протягом доби лише через інший
+    # заголовок, повторне голосування в іншому формулюванні, "готовність
+    # підписати" або передачу документа на підпис. Виняток — реальний
+    # перехід юридичного статусу: пропозиція -> ухвалення, фактичний підпис,
+    # набуття чинності, фактичне запровадження/вето.
+    DAILY_DECISION_STORY_LOCK_HOURS = 24.0
+
+    # Повтор старої історії повертаємо у дайджест лише при справді
+    # великому розвитку. 60 виявилося занадто м'яким порогом: модель
+    # могла вважати +1 пораненого або кілька локальних пошкоджень
+    # достатнім апдейтом.
+    HISTORY_SIGNIFICANT_UPDATE_MIN = 80
+
+    # Друга лінія захисту від семантичних дублів. Python ловить очевидні
+    # збіги детерміновано, а короткий окремий LLM-review розбирає лише
+    # неоднозначні пари "поточна подія ↔ архів". Це особливо важливо для
+    # історій, де заголовок повністю переписано (Claude/Anthropic, звіти,
+    # дослідження, дипломатія тощо).
+    SEMANTIC_HISTORY_REVIEW_ENABLED = True
+    SEMANTIC_HISTORY_CANDIDATES_PER_EVENT = 4
+    SEMANTIC_HISTORY_REVIEW_MAX_EVENTS = 20
+    SEMANTIC_HISTORY_MIN_CANDIDATE_SCORE = 16.0
+    SEMANTIC_HISTORY_LOOKBACK_HOURS = 48.0
+
+    # Один додатковий batch-check уже ПІСЛЯ Editor. Він не відбирає новини
+    # заново, а лише прибирає/переформульовує твердження, які ширші за
+    # надані source-факти (наприклад, одна бригада -> "усе військо"),
+    # плутають план із фактом або повторюють один факт двома реченнями.
+    FINAL_FACT_CHECK_ENABLED = True
+
+    # Для українського дайджесту не використовуємо внутрішній російський
+    # lifestyle/trivia/туризм як discovery-заповнювач. Важливі військові,
+    # економічні, санкційні чи міжнародні події про РФ це правило НЕ блокує.
+    FILTER_LOW_VALUE_RUSSIA_DISCOVERY = True
+
+    # Основний Analyzer трохи зменшуємо: 55k уже давав malformed JSON,
+    # тоді як контексти біля 50k у логах працювали стабільніше.
+    MAX_INPUT_CHARS = 50000
+    PRIORITY_RECOVERY_MAX_CHARS = 30000
+
+    # Після ТЕХНІЧНОГО failure 50k НЕ стрибаємо одразу в emergency.
+    # Спочатку двічі повторюємо ТОЙ САМИЙ повний Analyzer на компактнішому
+    # контексті. Це зберігає широкий пошук 10-16 кандидатів і повноцінність
+    # випуску, але поступово зменшує ризик malformed JSON.
+    FULL_ANALYZER_RECOVERY_CHAR_LIMITS = (40000, 30000)
+    FULL_ANALYZER_RECOVERY_RETRIES_PER_MODEL = 1
+
+    # Emergency лишається останньою LLM-страховкою після 50k -> 40k -> 30k.
+    EMERGENCY_ANALYZER_MAX_CHARS = 26000
+    EMERGENCY_ANALYZER_MAX_EVENTS = 6
+    EMERGENCY_SYNTHETIC_MAX_EVENTS = 3
+
+    # Discovery теж трохи розвантажуємо, але не урізаємо агресивно: його
+    # завдання вузьке, а останній ~49k pass успішно відпрацював. Основну
+    # проблему discovery вирішуємо quality gate, а не лише розміром контексту.
+    DISCOVERY_RECOVERY_MAX_CHARS = 45000
+    DISCOVERY_MAX_POST_CHARS = 750
+    MAX_DISCOVERY_PER_DIGEST = 3
+    DISCOVERY_RECOVERY_CANDIDATES = 8
+
+    MAX_EVENT_SOURCE_CHARS = 3000
+
+    # Геополітично чутливі інциденти без жертв не можна автоматично
+    # прирівнювати до "рутинного обстрілу". Наприклад, якщо під час атаки
+    # поруч перебуває міжнародна делегація / політики найвищого рівня,
+    # або інцидент створює прямий ризик ескалації біля кордону НАТО.
+    STRATEGIC_CONTEXT_ANALYZER_BONUS = 36.0
+    STRATEGIC_CONTEXT_RANK_BONUS = 14.0
+
+    # Окремо захищаємо короткі video-first повідомлення про реальні влучання /
+    # безпосередні наслідки ударів у Києві, обласних центрах або по помітних
+    # промислових/логістичних/інфраструктурних цілях. Це не автоматична
+    # публікація будь-якого відео: потрібні attack + location/target + impact
+    # сигнали в тексті, а history/dedup і фінальний media-gate лишаються.
+    DIRECT_IMPACT_VIDEO_ANALYZER_BONUS = 34.0
+    DIRECT_IMPACT_VIDEO_RANK_BONUS = 12.0
+    DIRECT_IMPACT_VIDEO_RECOVERY_MAX = 4
+
+    # AUTO media must be actually publishable by Collector. Oversized videos
+    # are excluded already during source selection so the selector can try a
+    # relevant photo/another clip instead of choosing media that will later
+    # disappear at publication time. Keep in sync with collector.MAX_VIDEO_SIZE.
+    AUTO_VIDEO_MAX_BYTES = 35 * 1024 * 1024
+
+    # Visual discovery is useful only when the reader can actually see the
+    # object. These are stems on purpose to cover Ukrainian inflections.
+    VISUAL_DISCOVERY_TERMS = (
+        "пам'ятник", "пам’ятник", "монумент", "фонтан", "скульптур",
+        "артоб'єкт", "арт-об'єкт", "артоб'єкт", "інсталяц", "мурал",
+        "архітект", "експозиц", "виставк", "музейн експон", "артпростір",
+    )
+
+    # Дозволяємо трохи більше контексту й 3-6 повних речень.
+    MAX_NEWS_CHARS = 900
+
+    ALLOWED_CATEGORIES = {
+        "war",
+        "politics",
+        "economy",
+        "international",
+        "society",
+        "technology",
+        "science",
+        "culture",
+        "other",
     }
-    
-    
-    LOW_VALUE_EVENT_TYPES = {
-        "routine_attack",
-        "routine_statement",
-        "minor_local_event",
-        "minor_accident",
-    }
-    
-    HARD_REJECT_EVENT_TYPES = {
-        "alert_only",
-    }
-    
-    
-    class NewsSummarizer:
-        DEFAULT_COUNT = 10
-    
-        # Тепер намагаємось давати щільніший випуск: якщо є достатньо
-        # придатних подій, бажано мати щонайменше 7 матеріалів.
-        MIN_DIGEST_COUNT = 7
-    
-        EDITOR_CANDIDATES = 30
-        HISTORY_LIMIT = 150
-    
-        # Якщо та сама подія вже була у попередньому 4-годинному випуску,
-        # не дозволяємо дрібним уточненням/іншому формулюванню повернути її
-        # одразу вдруге. Це окрема жорстка страховка саме від сусідніх випусків.
-        ADJACENT_DUPLICATE_LOCK_HOURS = 6.5
-    
-        # Агреговане зведення Повітряних сил / ППО зі статистикою збитих
-        # ракет і БпЛА показуємо не частіше одного разу на добу.
-        DAILY_AIR_DEFENSE_SUMMARY_LOCK_HOURS = 24.0
-    
-        # Для законів, санкційних пакетів, угод і подібних одноразових рішень
-        # не повторюємо ту саму базову історію протягом доби лише через інший
-        # заголовок, повторне голосування в іншому формулюванні, "готовність
-        # підписати" або передачу документа на підпис. Виняток — реальний
-        # перехід юридичного статусу: пропозиція -> ухвалення, фактичний підпис,
-        # набуття чинності, фактичне запровадження/вето.
-        DAILY_DECISION_STORY_LOCK_HOURS = 24.0
-    
-        # Повтор старої історії повертаємо у дайджест лише при справді
-        # великому розвитку. 60 виявилося занадто м'яким порогом: модель
-        # могла вважати +1 пораненого або кілька локальних пошкоджень
-        # достатнім апдейтом.
-        HISTORY_SIGNIFICANT_UPDATE_MIN = 80
-    
-        # Друга лінія захисту від семантичних дублів. Python ловить очевидні
-        # збіги детерміновано, а короткий окремий LLM-review розбирає лише
-        # неоднозначні пари "поточна подія ↔ архів". Це особливо важливо для
-        # історій, де заголовок повністю переписано (Claude/Anthropic, звіти,
-        # дослідження, дипломатія тощо).
-        SEMANTIC_HISTORY_REVIEW_ENABLED = True
-        SEMANTIC_HISTORY_CANDIDATES_PER_EVENT = 4
-        SEMANTIC_HISTORY_REVIEW_MAX_EVENTS = 20
-        SEMANTIC_HISTORY_MIN_CANDIDATE_SCORE = 16.0
-        SEMANTIC_HISTORY_LOOKBACK_HOURS = 48.0
-    
-        # Один додатковий batch-check уже ПІСЛЯ Editor. Він не відбирає новини
-        # заново, а лише прибирає/переформульовує твердження, які ширші за
-        # надані source-факти (наприклад, одна бригада -> "усе військо"),
-        # плутають план із фактом або повторюють один факт двома реченнями.
-        FINAL_FACT_CHECK_ENABLED = True
-    
-        # Для українського дайджесту не використовуємо внутрішній російський
-        # lifestyle/trivia/туризм як discovery-заповнювач. Важливі військові,
-        # економічні, санкційні чи міжнародні події про РФ це правило НЕ блокує.
-        FILTER_LOW_VALUE_RUSSIA_DISCOVERY = True
-    
-        # Основний Analyzer трохи зменшуємо: 55k уже давав malformed JSON,
-        # тоді як контексти біля 50k у логах працювали стабільніше.
-        MAX_INPUT_CHARS = 50000
-        PRIORITY_RECOVERY_MAX_CHARS = 30000
-    
-        # Після ТЕХНІЧНОГО failure 50k НЕ стрибаємо одразу в emergency.
-        # Спочатку двічі повторюємо ТОЙ САМИЙ повний Analyzer на компактнішому
-        # контексті. Це зберігає широкий пошук 10-16 кандидатів і повноцінність
-        # випуску, але поступово зменшує ризик malformed JSON.
-        FULL_ANALYZER_RECOVERY_CHAR_LIMITS = (40000, 30000)
-        FULL_ANALYZER_RECOVERY_RETRIES_PER_MODEL = 1
-    
-        # Emergency лишається останньою LLM-страховкою після 50k -> 40k -> 30k.
-        EMERGENCY_ANALYZER_MAX_CHARS = 26000
-        EMERGENCY_ANALYZER_MAX_EVENTS = 6
-        EMERGENCY_SYNTHETIC_MAX_EVENTS = 3
-    
-        # Discovery теж трохи розвантажуємо, але не урізаємо агресивно: його
-        # завдання вузьке, а останній ~49k pass успішно відпрацював. Основну
-        # проблему discovery вирішуємо quality gate, а не лише розміром контексту.
-        DISCOVERY_RECOVERY_MAX_CHARS = 45000
-        DISCOVERY_MAX_POST_CHARS = 750
-        MAX_DISCOVERY_PER_DIGEST = 3
-        DISCOVERY_RECOVERY_CANDIDATES = 8
-    
-        MAX_EVENT_SOURCE_CHARS = 3000
-    
-        # Геополітично чутливі інциденти без жертв не можна автоматично
-        # прирівнювати до "рутинного обстрілу". Наприклад, якщо під час атаки
-        # поруч перебуває міжнародна делегація / політики найвищого рівня,
-        # або інцидент створює прямий ризик ескалації біля кордону НАТО.
-        STRATEGIC_CONTEXT_ANALYZER_BONUS = 36.0
-        STRATEGIC_CONTEXT_RANK_BONUS = 14.0
-    
-        # Окремо захищаємо короткі video-first повідомлення про реальні влучання /
-        # безпосередні наслідки ударів у Києві, обласних центрах або по помітних
-        # промислових/логістичних/інфраструктурних цілях. Це не автоматична
-        # публікація будь-якого відео: потрібні attack + location/target + impact
-        # сигнали в тексті, а history/dedup і фінальний media-gate лишаються.
-        DIRECT_IMPACT_VIDEO_ANALYZER_BONUS = 34.0
-        DIRECT_IMPACT_VIDEO_RANK_BONUS = 12.0
-        DIRECT_IMPACT_VIDEO_RECOVERY_MAX = 4
-    
-        # AUTO media must be actually publishable by Collector. Oversized videos
-        # are excluded already during source selection so the selector can try a
-        # relevant photo/another clip instead of choosing media that will later
-        # disappear at publication time. Keep in sync with collector.MAX_VIDEO_SIZE.
-        AUTO_VIDEO_MAX_BYTES = 35 * 1024 * 1024
-    
-        # Visual discovery is useful only when the reader can actually see the
-        # object. These are stems on purpose to cover Ukrainian inflections.
-        VISUAL_DISCOVERY_TERMS = (
-            "пам'ятник", "пам’ятник", "монумент", "фонтан", "скульптур",
-            "артоб'єкт", "арт-об'єкт", "артоб'єкт", "інсталяц", "мурал",
-            "архітект", "експозиц", "виставк", "музейн експон", "артпростір",
+
+    def __init__(self):
+        self.client = genai.Client(
+            api_key=settings.GEMINI_API_KEY
         )
-    
-        # Дозволяємо трохи більше контексту й 3-6 повних речень.
-        MAX_NEWS_CHARS = 900
-    
-        ALLOWED_CATEGORIES = {
-            "war",
-            "politics",
-            "economy",
-            "international",
-            "society",
-            "technology",
-            "science",
-            "culture",
-            "other",
-        }
-    
-        def __init__(self):
-            self.client = genai.Client(
-                api_key=settings.GEMINI_API_KEY
-            )
-            self.models_priority = [
-                "gemini-3.5-flash-lite",
-                "gemini-3.1-flash-lite",
+        self.models_priority = [
+            "gemini-3.5-flash-lite",
+            "gemini-3.1-flash-lite",
+        ]
+
+        # Telemetry для post-publication quality audit.
+        # Це лише службова статистика останнього FINAL_FACT_CHECK:
+        # audit читає її після публікації, але вона не впливає
+        # на ranking, dedup або сам текст новин.
+        self.last_fact_check_stats: Dict[str, Any] = {}
+
+    def select_top_distinct_news(
+        self,
+        posts: List[Dict[str, Any]],
+        past_events: Optional[
+            Union[
+                List[str],
+                List[Dict[str, str]],
             ]
-    
-            # Telemetry для post-publication quality audit.
-            # Це лише службова статистика останнього FINAL_FACT_CHECK:
-            # audit читає її після публікації, але вона не впливає
-            # на ranking, dedup або сам текст новин.
-            self.last_fact_check_stats: Dict[str, Any] = {}
-    
-        def select_top_distinct_news(
-            self,
-            posts: List[Dict[str, Any]],
-            past_events: Optional[
-                Union[
-                    List[str],
-                    List[Dict[str, str]],
-                ]
-            ] = None,
-            count: int = DEFAULT_COUNT,
-            max_retries_per_model: int = 2,
-        ) -> List[Dict[str, Any]]:
-            # Кожен новий цикл починається з чистої telemetry.
-            # Це важливо, щоб audit ніколи не використав статистику
-            # попереднього випуску, якщо поточний цикл завершився раніше.
-            self.last_fact_check_stats = {}
-    
-            if not posts:
-                return []
-    
+        ] = None,
+        count: int = DEFAULT_COUNT,
+        max_retries_per_model: int = 2,
+    ) -> List[Dict[str, Any]]:
+        # Кожен новий цикл починається з чистої telemetry.
+        # Це важливо, щоб audit ніколи не використав статистику
+        # попереднього випуску, якщо поточний цикл завершився раніше.
+        self.last_fact_check_stats = {}
+
+        if not posts:
+            return []
+
+        logger.info(
+            "Формування дайджесту: "
+            f"{len(posts)} постів → максимум {count} новин"
+        )
+
+        priority_post_ids = self._get_priority_post_ids(posts)
+        if priority_post_ids:
             logger.info(
-                "Формування дайджесту: "
-                f"{len(posts)} постів → максимум {count} новин"
+                "У поточному пулі %s ручних пріоритетних постів.",
+                len(priority_post_ids),
             )
-    
-            priority_post_ids = self._get_priority_post_ids(posts)
-            if priority_post_ids:
-                logger.info(
-                    "У поточному пулі %s ручних пріоритетних постів.",
-                    len(priority_post_ids),
-                )
-    
-            posts_context = self._build_posts_context(posts)
-            if not posts_context:
-                return []
-    
-            analyzed_events = self._analyze_events(
-                posts_context,
-                past_events,
-                max_retries_per_model,
+
+        posts_context = self._build_posts_context(posts)
+        if not posts_context:
+            return []
+
+        analyzed_events = self._analyze_events(
+            posts_context,
+            past_events,
+            max_retries_per_model,
+        )
+
+        # ВАЖЛИВО: None означає технічний провал cascade, а [] — валідну
+        # відповідь Analyzer "подій немає". Раніше обидва випадки зливалися
+        # в один і технічний 503/битий JSON помилково давав порожній випуск.
+        if analyzed_events is None:
+            logger.error(
+                "ANALYZER TECHNICAL FAILURE: 50k cascade не дав валідної "
+                "JSON-відповіді. Запускаємо full recovery 40k -> 30k; "
+                "emergency буде лише останньою страховкою."
             )
-    
-            # ВАЖЛИВО: None означає технічний провал cascade, а [] — валідну
-            # відповідь Analyzer "подій немає". Раніше обидва випадки зливалися
-            # в один і технічний 503/битий JSON помилково давав порожній випуск.
-            if analyzed_events is None:
-                logger.error(
-                    "ANALYZER TECHNICAL FAILURE: 50k cascade не дав валідної "
-                    "JSON-відповіді. Запускаємо full recovery 40k -> 30k; "
-                    "emergency буде лише останньою страховкою."
-                )
-                analyzed_events = self._recover_after_analyzer_failure(
-                    posts,
-                    past_events,
-                    max_retries_per_model,
-                )
-    
-            if not analyzed_events:
-                logger.warning(
-                    "Analyzer не повернув подій. "
-                    "Перевіряємо ручні пріоритетні пости окремо."
-                )
-                analyzed_events = []
-            else:
-                logger.info(
-                    "Analyzer знайшов "
-                    f"{len(analyzed_events)} потенційних подій."
-                )
-    
-            # ЖОРСТКА ГАРАНТІЯ MANUAL:
-            # ручна новина не має права зникнути між Analyzer і ranking.
-            analyzed_events = self._ensure_priority_events(
-                analyzed_events,
+            analyzed_events = self._recover_after_analyzer_failure(
                 posts,
                 past_events,
                 max_retries_per_model,
             )
-    
-            # Manual-гарантія має бути ПОШТОВОЮ, а не лише event-level. Великий
-            # Analyzer іноді склеює два різні ручні відео однієї широкої теми
-            # (наприклад, два різні удари) в один event. Розділяємо такі групи
-            # консервативно: разом лишаються лише майже напевно ті самі події.
-            analyzed_events = self._separate_distinct_priority_events(
+
+        if not analyzed_events:
+            logger.warning(
+                "Analyzer не повернув подій. "
+                "Перевіряємо ручні пріоритетні пости окремо."
+            )
+            analyzed_events = []
+        else:
+            logger.info(
+                "Analyzer знайшов "
+                f"{len(analyzed_events)} потенційних подій."
+            )
+
+        # ЖОРСТКА ГАРАНТІЯ MANUAL:
+        # ручна новина не має права зникнути між Analyzer і ranking.
+        analyzed_events = self._ensure_priority_events(
+            analyzed_events,
+            posts,
+            past_events,
+            max_retries_per_model,
+        )
+
+        # Manual-гарантія має бути ПОШТОВОЮ, а не лише event-level. Великий
+        # Analyzer іноді склеює два різні ручні відео однієї широкої теми
+        # (наприклад, два різні удари) в один event. Розділяємо такі групи
+        # консервативно: разом лишаються лише майже напевно ті самі події.
+        analyzed_events = self._separate_distinct_priority_events(
+            analyzed_events,
+            posts,
+        )
+
+        # Якщо Analyzer взагалі пропустив короткий video-first пост із
+        # конкретним влучанням/наслідками у великому місті або по помітній
+        # цілі, додаємо його лише як КАНДИДАТ. Далі він проходить звичайні
+        # dedup/history/ranking gates і не має manual-гарантії.
+        analyzed_events = self._ensure_direct_impact_video_events(
+            analyzed_events,
+            posts,
+        )
+
+        # LLM добре бачить семантику, але history-repeat не можна лишати
+        # лише на його розсуд. Додаткова Python-перевірка ловить очевидні
+        # міжциклові дублікати навіть тоді, коли Analyzer помилково поставив
+        # is_history_repeat=false.
+        analyzed_events = self._deduplicate_current_events(
+            analyzed_events,
+            posts,
+        )
+        analyzed_events = self._apply_deterministic_history_guard(
+            analyzed_events,
+            posts,
+            past_events,
+        )
+        analyzed_events = self._apply_semantic_history_review(
+            analyzed_events,
+            posts,
+            past_events,
+            max_retries_per_model,
+        )
+
+        if not analyzed_events:
+            logger.warning(
+                "Після Analyzer і priority-recovery немає подій."
+            )
+            return []
+
+        ranked_events = self._rank_events(
+            analyzed_events,
+            posts,
+        )
+
+        if not ranked_events:
+            logger.warning(
+                "Після editorial gate не залишилось подій."
+            )
+            return []
+
+        # ОКРЕМИЙ DISCOVERY-PASS.
+        # Основний Analyzer може чудово знайти важкі новини, але загубити
+        # науку/технології/бізнес/корисні зміни в великому контексті.
+        # Тому спочатку дивимось, скільки є справжніх core-подій і скільки
+        # слотів за редакційним правилом лишається під "цікавинки".
+        core_count = len(
+            [
+                ev for ev in ranked_events
+                if self._event_digest_role(ev) == "core"
+            ]
+        )
+        desired_discovery_slots = self._desired_discovery_slots(
+            core_count,
+            count,
+        )
+        available_discovery = len(
+            [
+                ev for ev in ranked_events
+                if self._is_publishable_discovery(ev)
+            ]
+        )
+
+        if (
+            desired_discovery_slots > 0
+            and available_discovery < desired_discovery_slots
+        ):
+            logger.info(
+                "Discovery-check: core=%s, discovery=%s, "
+                "можливих слотів=%s. Запускаємо окремий пошук цікавинок.",
+                core_count,
+                available_discovery,
+                desired_discovery_slots,
+            )
+
+            # Зберігаємо останній уже валідний ranked pool ДО discovery.
+            # Discovery — це recovery для цікавих додаткових подій і він не має
+            # права обнулити вже готовий випуск через повторний history-pass.
+            pre_discovery_ranked_events = [
+                dict(ev)
+                for ev in ranked_events
+                if isinstance(ev, dict)
+            ]
+
+            analyzed_events = self._ensure_discovery_events(
                 analyzed_events,
                 posts,
+                past_events,
+                max_retries_per_model,
+                desired_count=desired_discovery_slots,
             )
-    
-            # Якщо Analyzer взагалі пропустив короткий video-first пост із
-            # конкретним влучанням/наслідками у великому місті або по помітній
-            # цілі, додаємо його лише як КАНДИДАТ. Далі він проходить звичайні
-            # dedup/history/ranking gates і не має manual-гарантії.
-            analyzed_events = self._ensure_direct_impact_video_events(
-                analyzed_events,
-                posts,
-            )
-    
-            # LLM добре бачить семантику, але history-repeat не можна лишати
-            # лише на його розсуд. Додаткова Python-перевірка ловить очевидні
-            # міжциклові дублікати навіть тоді, коли Analyzer помилково поставив
-            # is_history_repeat=false.
+
+            # Discovery-pass теж не має права повернути вже опубліковану
+            # подію через помилку LLM history-classification.
             analyzed_events = self._deduplicate_current_events(
                 analyzed_events,
                 posts,
@@ -312,3982 +398,3883 @@
                 past_events,
                 max_retries_per_model,
             )
-    
-            if not analyzed_events:
-                logger.warning(
-                    "Після Analyzer і priority-recovery немає подій."
-                )
-                return []
-    
+
+            # Після discovery-recovery обов'язково ранжуємо весь пул заново:
+            # нові кандидати мають пройти ТОЙ САМИЙ quality gate, history gate
+            # і source/media selection, що й звичайні події.
             ranked_events = self._rank_events(
                 analyzed_events,
                 posts,
             )
-    
+
             if not ranked_events:
-                logger.warning(
-                    "Після editorial gate не залишилось подій."
-                )
-                return []
-    
-            # ОКРЕМИЙ DISCOVERY-PASS.
-            # Основний Analyzer може чудово знайти важкі новини, але загубити
-            # науку/технології/бізнес/корисні зміни в великому контексті.
-            # Тому спочатку дивимось, скільки є справжніх core-подій і скільки
-            # слотів за редакційним правилом лишається під "цікавинки".
-            core_count = len(
-                [
-                    ev for ev in ranked_events
-                    if self._event_digest_role(ev) == "core"
-                ]
-            )
-            desired_discovery_slots = self._desired_discovery_slots(
-                core_count,
-                count,
-            )
-            available_discovery = len(
-                [
-                    ev for ev in ranked_events
-                    if self._is_publishable_discovery(ev)
-                ]
-            )
-    
-            if (
-                desired_discovery_slots > 0
-                and available_discovery < desired_discovery_slots
-            ):
-                logger.info(
-                    "Discovery-check: core=%s, discovery=%s, "
-                    "можливих слотів=%s. Запускаємо окремий пошук цікавинок.",
-                    core_count,
-                    available_discovery,
-                    desired_discovery_slots,
-                )
-    
-                # Зберігаємо останній уже валідний ranked pool ДО discovery.
-                # Discovery — це recovery для цікавих додаткових подій і він не має
-                # права обнулити вже готовий випуск через повторний history-pass.
-                pre_discovery_ranked_events = [
-                    dict(ev)
-                    for ev in ranked_events
-                    if isinstance(ev, dict)
-                ]
-    
-                analyzed_events = self._ensure_discovery_events(
-                    analyzed_events,
-                    posts,
-                    past_events,
-                    max_retries_per_model,
-                    desired_count=desired_discovery_slots,
-                )
-    
-                # Discovery-pass теж не має права повернути вже опубліковану
-                # подію через помилку LLM history-classification.
-                analyzed_events = self._deduplicate_current_events(
-                    analyzed_events,
-                    posts,
-                )
-                analyzed_events = self._apply_deterministic_history_guard(
-                    analyzed_events,
-                    posts,
-                    past_events,
-                )
-                analyzed_events = self._apply_semantic_history_review(
-                    analyzed_events,
-                    posts,
-                    past_events,
-                    max_retries_per_model,
-                )
-    
-                # Після discovery-recovery обов'язково ранжуємо весь пул заново:
-                # нові кандидати мають пройти ТОЙ САМИЙ quality gate, history gate
-                # і source/media selection, що й звичайні події.
-                ranked_events = self._rank_events(
-                    analyzed_events,
-                    posts,
-                )
-    
-                if not ranked_events:
-                    # Fail-safe: discovery-pass не є причиною втрачати вже валідні
-                    # core/discovery події, які пройшли перший history review.
-                    # Якщо recovery через будь-який повторний matcher обнулив пул,
-                    # повертаємось до останнього валідного pre-discovery ranking.
-                    if pre_discovery_ranked_events:
-                        logger.warning(
-                            "Discovery history fail-safe: повторний pass обнулив "
-                            "ranking. Відновлюємо %s валідних pre-discovery подій.",
-                            len(pre_discovery_ranked_events),
-                        )
-                        ranked_events = pre_discovery_ranked_events
-                    else:
-                        logger.warning(
-                            "Після discovery-recovery ranking не залишив подій."
-                        )
-                        return []
-    
-            priority_ranked = [
-                ev
-                for ev in ranked_events
-                if ev.get("is_priority")
-            ]
-    
-            # Manual завжди важливіший за стандартний ліміт. Якщо адміністратор
-            # навмисно додасть >10 РІЗНИХ подій, вони не обріжуться мовчки.
-            effective_count = max(count, len(priority_ranked))
-            if effective_count > count:
-                logger.warning(
-                    "Ручних пріоритетних подій (%s) більше, ніж ліміт "
-                    "дайджесту (%s). Тимчасово розширюємо випуск до %s.",
-                    len(priority_ranked),
-                    count,
-                    effective_count,
-                )
-    
-            core_ranked = [
-                ev
-                for ev in ranked_events
-                if self._event_digest_role(ev) == "core"
-            ]
-            discovery_ranked = [
-                ev
-                for ev in ranked_events
-                if self._is_publishable_discovery(ev)
-            ]
-    
-            logger.info(
-                "Після ranking залишилось %s подій: core=%s, "
-                "discovery=%s, priority=%s.",
-                len(ranked_events),
-                len(core_ranked),
-                len(discovery_ranked),
+                # Fail-safe: discovery-pass не є причиною втрачати вже валідні
+                # core/discovery події, які пройшли перший history review.
+                # Якщо recovery через будь-який повторний matcher обнулив пул,
+                # повертаємось до останнього валідного pre-discovery ranking.
+                if pre_discovery_ranked_events:
+                    logger.warning(
+                        "Discovery history fail-safe: повторний pass обнулив "
+                        "ranking. Відновлюємо %s валідних pre-discovery подій.",
+                        len(pre_discovery_ranked_events),
+                    )
+                    ranked_events = pre_discovery_ranked_events
+                else:
+                    logger.warning(
+                        "Після discovery-recovery ranking не залишив подій."
+                    )
+                    return []
+
+        priority_ranked = [
+            ev
+            for ev in ranked_events
+            if ev.get("is_priority")
+        ]
+
+        # Manual завжди важливіший за стандартний ліміт. Якщо адміністратор
+        # навмисно додасть >10 РІЗНИХ подій, вони не обріжуться мовчки.
+        effective_count = max(count, len(priority_ranked))
+        if effective_count > count:
+            logger.warning(
+                "Ручних пріоритетних подій (%s) більше, ніж ліміт "
+                "дайджесту (%s). Тимчасово розширюємо випуск до %s.",
                 len(priority_ranked),
+                count,
+                effective_count,
             )
-    
-            for idx, event in enumerate(
-                ranked_events[:20],
-                start=1,
-            ):
-                logger.info(
-                    "RANK #%s: %.2f | %s | role=%s | priority=%s | "
-                    "strategic=%s | cur=%.0f | practical=%.0f | %s",
-                    idx,
-                    float(
-                        event.get(
-                            "balanced_score",
-                            event.get("raw_score", 0),
-                        )
-                        or 0
-                    ),
-                    event.get("event_type", "other"),
-                    self._event_digest_role(event),
-                    bool(event.get("is_priority")),
-                    bool(event.get("strategic_attack_context")),
-                    float(event.get("curiosity", 0) or 0),
-                    float(event.get("practical_value", 0) or 0),
+
+        core_ranked = [
+            ev
+            for ev in ranked_events
+            if self._event_digest_role(ev) == "core"
+        ]
+        discovery_ranked = [
+            ev
+            for ev in ranked_events
+            if self._is_publishable_discovery(ev)
+        ]
+
+        logger.info(
+            "Після ranking залишилось %s подій: core=%s, "
+            "discovery=%s, priority=%s.",
+            len(ranked_events),
+            len(core_ranked),
+            len(discovery_ranked),
+            len(priority_ranked),
+        )
+
+        for idx, event in enumerate(
+            ranked_events[:20],
+            start=1,
+        ):
+            logger.info(
+                "RANK #%s: %.2f | %s | role=%s | priority=%s | "
+                "strategic=%s | cur=%.0f | practical=%.0f | %s",
+                idx,
+                float(
                     event.get(
-                        "headline_hint",
-                        event.get("summary", ""),
-                    ),
-                )
-    
-            # Editor як і раніше бачить широкий TOP-кандидатів і може написати
-            # природні тексти. Але додатково гарантовано підсовуємо йому:
-            # 1) усі manual; 2) найкращі discovery, навіть якщо їхній загальний
-            # score нижчий за TOP-30 через нижчу стратегічну важливість.
-            editor_events = ranked_events[
-                :self.EDITOR_CANDIDATES
-            ]
-            editor_event_ids = {
-                str(ev.get("event_id") or "")
-                for ev in editor_events
-            }
-    
-            must_show_to_editor = list(priority_ranked)
-            must_show_to_editor.extend(
-                sorted(
-                    discovery_ranked,
-                    key=self._discovery_sort_score,
-                    reverse=True,
-                )[: self.MAX_DISCOVERY_PER_DIGEST * 2]
-            )
-    
-            for ev in must_show_to_editor:
-                event_id = str(ev.get("event_id") or "")
-                if event_id and event_id not in editor_event_ids:
-                    editor_events.append(ev)
-                    editor_event_ids.add(event_id)
-    
-            final_news = self._generate_final_digest(
-                editor_events,
-                posts,
-                past_events,
-                effective_count,
-                max_retries_per_model,
-            )
-    
-            # Спочатку валідовуємо Editor-відповідь. Фінальний factual pass
-            # запускаємо ПІСЛЯ fallback + digest mix, щоб він охоплював буквально
-            # кожну новину, яка реально піде в публікацію.
-            validated = self._validate_final_news(
-                final_news,
-                ranked_events,
-                posts,
-                effective_count,
-            )
-    
-            # Manual лишається абсолютною гарантією навіть якщо Editor
-            # проігнорував конкретний event_id у своєму JSON.
-            validated = self._ensure_priority_news_in_final(
-                validated,
-                ranked_events,
-                posts,
-                effective_count,
-            )
-    
-            target_min = min(
-                effective_count,
-                self.MIN_DIGEST_COUNT,
-                len(ranked_events),
-            )
-    
-            if len(validated) < target_min:
-                logger.warning(
-                    "EDITOR сформував лише "
-                    f"{len(validated)} новин. "
-                    f"Fallback до {target_min}."
-                )
-    
-                validated = self._fill_missing_news(
-                    validated,
-                    ranked_events,
-                    posts,
-                    target_min,
-                )
-    
-            validated = self._ensure_priority_news_in_final(
-                validated,
-                ranked_events,
-                posts,
-                effective_count,
-            )
-    
-            # ФІНАЛЬНА ДЕТЕРМІНОВАНА РЕДАКЦІЙНА СТРУКТУРА:
-            # - 10 core => 10 core, 0 discovery;
-            # - 9 core  => 9 core + 1 discovery;
-            # - 8 core  => 8 core + до 2 discovery;
-            # - 7 core  => 7 core + до 3 discovery;
-            # - 5-6 core => вони + до 3 discovery.
-            # Discovery завжди ставимо В КІНЕЦЬ випуску.
-            # Manual при конфлікті має вищий пріоритет за цю квоту.
-            validated = self._enforce_digest_mix(
-                validated,
-                ranked_events,
-                posts,
-                effective_count,
-            )
-    
-            # ОСТАННЯ POST-LEVEL MANUAL ГАРАНТІЯ ДО FACT-CHECK.
-            # Перевіряємо не event_id, а конкретні manual source IDs. Якщо через
-            # неочікуваний merge/mix конкретний ручний пост все ж загубився,
-            # відновлюємо його як окрему priority-подію і лише тоді запускаємо
-            # FINAL_FACT_CHECK. Отже аварійне відновлення не обходить фактчек.
-            validated = self._ensure_priority_posts_in_final(
-                validated,
-                ranked_events,
-                posts,
-                effective_count,
-            )
-    
-            # Фінальний factual pass після всіх fallback/priority/mix/manual guard.
-            # Тепер перевіряються всі фактичні 7-10 постів.
-            validated = self._fact_check_final_news(
-                validated,
-                ranked_events,
-                posts,
-                max_retries_per_model,
-            )
-    
-            logger.info(
-                "Фінальний дайджест: "
-                f"{len(validated)} новин."
-            )
-    
-            return validated[:effective_count]
-    
-        def _build_posts_context(
-            self,
-            posts: List[Dict[str, Any]],
-            only_ids: Optional[List[int]] = None,
-            max_chars: Optional[int] = None,
-        ) -> str:
-            prepared = []
-            now_utc = datetime.now(timezone.utc)
-    
-            allowed_ids = (
-                set(only_ids)
-                if only_ids is not None
-                else None
-            )
-            char_limit = (
-                int(max_chars)
-                if isinstance(max_chars, int) and max_chars > 0
-                else self.MAX_INPUT_CHARS
-            )
-    
-            for idx, post in enumerate(posts):
-                if allowed_ids is not None and idx not in allowed_ids:
-                    continue
-    
-                text = (post.get("text") or "").strip()
-                if not text:
-                    continue
-    
-                media_tag = (
-                    "[ВІДЕО]"
-                    if post.get("has_video")
-                    else (
-                        "[ФОТО]"
-                        if post.get("has_media")
-                        else "[ТЕКСТ]"
+                        "balanced_score",
+                        event.get("raw_score", 0),
                     )
-                )
-    
-                channel_title = (
-                    post.get("channel_title")
-                    or post.get("channel_username")
-                    or "Джерело"
-                )
-    
-                channel_username = (
-                    str(post.get("channel_username", "") or "")
-                    .replace("@", "")
-                    .strip()
-                )
-    
-                views = int(post.get("views") or 0)
-                forwards = int(post.get("forwards") or 0)
-                replies = int(post.get("replies") or 0)
-                is_priority = bool(post.get("is_priority"))
-    
-                post_date = post.get("date")
-                age_minutes: Optional[float] = None
-                published_at = "невідомо"
-    
-                if isinstance(post_date, datetime):
-                    if post_date.tzinfo is None:
-                        post_date = post_date.replace(
-                            tzinfo=timezone.utc
-                        )
-    
-                    post_date_utc = post_date.astimezone(
-                        timezone.utc
-                    )
-    
-                    published_at = post_date_utc.strftime(
-                        "%Y-%m-%d %H:%M UTC"
-                    )
-    
-                    age_minutes = max(
-                        0.0,
-                        (
-                            now_utc - post_date_utc
-                        ).total_seconds()
-                        / 60.0,
-                    )
-    
-                tier_mult = self._get_source_multiplier(
-                    channel_username
-                )
-    
-                engagement_score = (
-                    min(
-                        math.log10(max(views, 1)) * 4,
-                        26,
-                    )
-                    + min(
-                        math.log10(max(forwards, 1)) * 3,
-                        12,
-                    )
-                    + min(
-                        math.log10(max(replies, 1)) * 2,
-                        8,
-                    )
-                )
-    
-                media_bonus = (
-                    9
-                    if post.get("has_video")
-                    else (
-                        4.5
-                        if post.get("has_media")
-                        else 0
-                    )
-                )
-    
-                # Freshness потрібен лише для доступу нового поста до Analyzer.
-                # Він не є автоматичним доказом важливості.
-                freshness_bonus = 0.0
-                if age_minutes is not None:
-                    freshness_bonus = max(
-                        0.0,
-                        12.0
-                        * (
-                            1.0
-                            - min(age_minutes, 240.0)
-                            / 240.0
-                        ),
-                    )
-    
-                # Manual завжди стоїть на початку контексту і гарантовано
-                # поміщається у ліміт символів раніше за звичайні пости.
-                score = (
-                    10000.0
-                    if is_priority
-                    else (
-                        engagement_score
-                        + media_bonus
-                        + freshness_bonus
-                    )
-                    * tier_mult
-                )
-    
-                # Не даємо короткій, але геополітично чутливій новині загубитися
-                # ще ДО Analyzer через нижчі перегляди/менший source tier.
-                # Це лише бонус доступу до контексту, а не автоматична публікація.
-                if (
-                    not is_priority
-                    and self._looks_like_attack_text(text)
-                    and self._strategic_geopolitical_signal(text)
-                ):
-                    score += self.STRATEGIC_CONTEXT_ANALYZER_BONUS
-    
-                direct_impact_video = (
-                    not is_priority
-                    and self._is_direct_impact_video_post(post)
-                )
-                if direct_impact_video:
-                    # Protected access до Analyzer: short video-first пост не повинен
-                    # програти десяткам довгих переказів лише через малу кількість
-                    # тексту/переглядів у перші хвилини.
-                    score += self.DIRECT_IMPACT_VIDEO_ANALYZER_BONUS
-    
-                prepared.append({
-                    "idx": idx,
-                    "text": text,
-                    "media_tag": media_tag,
-                    "channel_title": channel_title,
-                    "channel_username": channel_username,
-                    "views": views,
-                    "forwards": forwards,
-                    "replies": replies,
-                    "score": score,
-                    "published_at": published_at,
-                    "age_minutes": age_minutes,
-                    "priority_flag": (
-                        " ⭐ [ПРІОРИТЕТ АДМІНІСТРАТОРА]"
-                        if is_priority
-                        else ""
-                    ),
-                    "impact_video_flag": (
-                        " 🎥 [ВІДЕО ВЛУЧАННЯ/БЕЗПОСЕРЕДНІХ НАСЛІДКІВ]"
-                        if direct_impact_video
-                        else ""
-                    ),
-                })
-    
-            prepared.sort(
-                key=lambda x: x["score"],
+                    or 0
+                ),
+                event.get("event_type", "other"),
+                self._event_digest_role(event),
+                bool(event.get("is_priority")),
+                bool(event.get("strategic_attack_context")),
+                float(event.get("curiosity", 0) or 0),
+                float(event.get("practical_value", 0) or 0),
+                event.get(
+                    "headline_hint",
+                    event.get("summary", ""),
+                ),
+            )
+
+        # Editor як і раніше бачить широкий TOP-кандидатів і може написати
+        # природні тексти. Але додатково гарантовано підсовуємо йому:
+        # 1) усі manual; 2) найкращі discovery, навіть якщо їхній загальний
+        # score нижчий за TOP-30 через нижчу стратегічну важливість.
+        editor_events = ranked_events[
+            :self.EDITOR_CANDIDATES
+        ]
+        editor_event_ids = {
+            str(ev.get("event_id") or "")
+            for ev in editor_events
+        }
+
+        must_show_to_editor = list(priority_ranked)
+        must_show_to_editor.extend(
+            sorted(
+                discovery_ranked,
+                key=self._discovery_sort_score,
                 reverse=True,
+            )[: self.MAX_DISCOVERY_PER_DIGEST * 2]
+        )
+
+        for ev in must_show_to_editor:
+            event_id = str(ev.get("event_id") or "")
+            if event_id and event_id not in editor_event_ids:
+                editor_events.append(ev)
+                editor_event_ids.add(event_id)
+
+        final_news = self._generate_final_digest(
+            editor_events,
+            posts,
+            past_events,
+            effective_count,
+            max_retries_per_model,
+        )
+
+        # Спочатку валідовуємо Editor-відповідь. Фінальний factual pass
+        # запускаємо ПІСЛЯ fallback + digest mix, щоб він охоплював буквально
+        # кожну новину, яка реально піде в публікацію.
+        validated = self._validate_final_news(
+            final_news,
+            ranked_events,
+            posts,
+            effective_count,
+        )
+
+        # Manual лишається абсолютною гарантією навіть якщо Editor
+        # проігнорував конкретний event_id у своєму JSON.
+        validated = self._ensure_priority_news_in_final(
+            validated,
+            ranked_events,
+            posts,
+            effective_count,
+        )
+
+        target_min = min(
+            effective_count,
+            self.MIN_DIGEST_COUNT,
+            len(ranked_events),
+        )
+
+        if len(validated) < target_min:
+            logger.warning(
+                "EDITOR сформував лише "
+                f"{len(validated)} новин. "
+                f"Fallback до {target_min}."
             )
-    
-            result = []
-            current_length = 0
-    
-            for item in prepared:
-                age_text = (
-                    f"{item['age_minutes']:.0f} хв тому"
-                    if isinstance(
-                        item.get("age_minutes"),
-                        (int, float),
-                    )
-                    else "невідомо"
-                )
-    
-                block = (
-                    f"ID {item['idx']} "
-                    f"{item['media_tag']}"
-                    f"{item['priority_flag']}"
-                    f"{item['impact_video_flag']} "
-                    f"[{item['channel_title']}] "
-                    f"@{item['channel_username']}\n"
-                    f"Час: {item['published_at']} "
-                    f"({age_text})\n"
-                    f"Перегляди: {item['views']}\n"
-                    f"Пересилання: {item['forwards']}\n"
-                    f"Відповіді: {item['replies']}\n"
-                    f"{item['text']}"
-                )
-    
-                if current_length + len(block) > char_limit:
-                    continue
-    
-                result.append(block)
-                current_length += len(block) + 10
-    
-            logger.info(
-                "У контекст Analyzer потрапило "
-                f"{len(result)} з {len(prepared)} постів "
-                f"({current_length} символів)."
+
+            validated = self._fill_missing_news(
+                validated,
+                ranked_events,
+                posts,
+                target_min,
             )
-    
-            return "\n\n---\n\n".join(result)
-    
-        def _build_discovery_context(
-            self,
-            posts: List[Dict[str, Any]],
-        ) -> str:
-            """
-            Будує окремий контекст для discovery-pass.
-    
-            На відміну від основного контексту, тут ми:
-            - сильніше цінуємо тематичну новизну, а не лише великі перегляди;
-            - обмежуємо домінування одного каналу;
-            - даємо бонус науці, технологіям, бізнесу, сервісам, правилам,
-              виробництву, досягненням і незвичайним суспільним фактам;
-            - трохи знижуємо суто рутинний hard-news шум.
-    
-            Це НЕ вибір новин у фінал. Контекст лише підвищує recall, а кожен
-            знайдений event потім проходить звичайний ranking/history gate.
-            """
-            now_utc = datetime.now(timezone.utc)
-            prepared: List[Dict[str, Any]] = []
-    
-            discovery_keywords = [
-                "вчен", "дослід", "наук", "відкрит", "винахід",
-                "технолог", "штучн", "інтелект", "нейромереж", "gpt",
-                "стартап", "робот", "чип", "процесор", "космос",
-                "медицин", "лікуван", "біотех", "наномат", "матеріал",
-                "виробництв", "завод", "серійне", "запуст", "контракт",
-                "компан", "бізнес", "ринок", "авто", "автомоб",
-                "рекорд", "досягнен", "перший у світі", "вперше",
-                "правил", "тариф", "сервіс", "послуг", "застосунок",
-                "транспорт", "метро", "поїзд", "аеропорт", "обмеженн",
-                "освіта", "університет", "культур", "фільм", "музей",
-                "археолог", "історичн", "еколог", "енергі", "сонячн",
-            ]
-    
-            hard_news_keywords = [
-                "повітряна тривога", "рух бпла", "загроза баліст",
-                "обстріл", "масована атака", "фронт", "штурм",
-                "загинув", "поранен", "влучання ракети", "бойові дії",
-            ]
-    
-            for idx, post in enumerate(posts):
-                text = (post.get("text") or "").strip()
-                if not text:
-                    continue
-    
-                text_lower = text.lower()
-                username = (
-                    str(post.get("channel_username", "") or "")
-                    .replace("@", "")
-                    .strip()
+
+        validated = self._ensure_priority_news_in_final(
+            validated,
+            ranked_events,
+            posts,
+            effective_count,
+        )
+
+        # ФІНАЛЬНА ДЕТЕРМІНОВАНА РЕДАКЦІЙНА СТРУКТУРА:
+        # - 10 core => 10 core, 0 discovery;
+        # - 9 core  => 9 core + 1 discovery;
+        # - 8 core  => 8 core + до 2 discovery;
+        # - 7 core  => 7 core + до 3 discovery;
+        # - 5-6 core => вони + до 3 discovery.
+        # Discovery завжди ставимо В КІНЕЦЬ випуску.
+        # Manual при конфлікті має вищий пріоритет за цю квоту.
+        validated = self._enforce_digest_mix(
+            validated,
+            ranked_events,
+            posts,
+            effective_count,
+        )
+
+        # ОСТАННЯ POST-LEVEL MANUAL ГАРАНТІЯ ДО FACT-CHECK.
+        # Перевіряємо не event_id, а конкретні manual source IDs. Якщо через
+        # неочікуваний merge/mix конкретний ручний пост все ж загубився,
+        # відновлюємо його як окрему priority-подію і лише тоді запускаємо
+        # FINAL_FACT_CHECK. Отже аварійне відновлення не обходить фактчек.
+        validated = self._ensure_priority_posts_in_final(
+            validated,
+            ranked_events,
+            posts,
+            effective_count,
+        )
+
+        # Фінальний factual pass після всіх fallback/priority/mix/manual guard.
+        # Тепер перевіряються всі фактичні 7-10 постів.
+        validated = self._fact_check_final_news(
+            validated,
+            ranked_events,
+            posts,
+            max_retries_per_model,
+        )
+
+        logger.info(
+            "Фінальний дайджест: "
+            f"{len(validated)} новин."
+        )
+
+        return validated[:effective_count]
+
+    def _build_posts_context(
+        self,
+        posts: List[Dict[str, Any]],
+        only_ids: Optional[List[int]] = None,
+        max_chars: Optional[int] = None,
+    ) -> str:
+        prepared = []
+        now_utc = datetime.now(timezone.utc)
+
+        allowed_ids = (
+            set(only_ids)
+            if only_ids is not None
+            else None
+        )
+        char_limit = (
+            int(max_chars)
+            if isinstance(max_chars, int) and max_chars > 0
+            else self.MAX_INPUT_CHARS
+        )
+
+        for idx, post in enumerate(posts):
+            if allowed_ids is not None and idx not in allowed_ids:
+                continue
+
+            text = (post.get("text") or "").strip()
+            if not text:
+                continue
+
+            media_tag = (
+                "[ВІДЕО]"
+                if post.get("has_video")
+                else (
+                    "[ФОТО]"
+                    if post.get("has_media")
+                    else "[ТЕКСТ]"
                 )
-                title = (
-                    post.get("channel_title")
-                    or post.get("channel_username")
-                    or "Джерело"
-                )
-    
-                views = int(post.get("views") or 0)
-                forwards = int(post.get("forwards") or 0)
-    
-                post_date = post.get("date")
-                age_minutes: Optional[float] = None
-                published_at = "невідомо"
-                if isinstance(post_date, datetime):
-                    if post_date.tzinfo is None:
-                        post_date = post_date.replace(tzinfo=timezone.utc)
-                    post_date_utc = post_date.astimezone(timezone.utc)
-                    published_at = post_date_utc.strftime(
-                        "%Y-%m-%d %H:%M UTC"
+            )
+
+            channel_title = (
+                post.get("channel_title")
+                or post.get("channel_username")
+                or "Джерело"
+            )
+
+            channel_username = (
+                str(post.get("channel_username", "") or "")
+                .replace("@", "")
+                .strip()
+            )
+
+            views = int(post.get("views") or 0)
+            forwards = int(post.get("forwards") or 0)
+            replies = int(post.get("replies") or 0)
+            is_priority = bool(post.get("is_priority"))
+
+            post_date = post.get("date")
+            age_minutes: Optional[float] = None
+            published_at = "невідомо"
+
+            if isinstance(post_date, datetime):
+                if post_date.tzinfo is None:
+                    post_date = post_date.replace(
+                        tzinfo=timezone.utc
                     )
-                    age_minutes = max(
-                        0.0,
-                        (now_utc - post_date_utc).total_seconds() / 60.0,
-                    )
-    
-                keyword_hits = sum(
-                    1 for keyword in discovery_keywords
-                    if keyword in text_lower
+
+                post_date_utc = post_date.astimezone(
+                    timezone.utc
                 )
-                hard_hits = sum(
-                    1 for keyword in hard_news_keywords
-                    if keyword in text_lower
+
+                published_at = post_date_utc.strftime(
+                    "%Y-%m-%d %H:%M UTC"
                 )
-    
-                freshness = 0.0
-                if age_minutes is not None:
-                    freshness = max(
-                        0.0,
-                        8.0 * (1.0 - min(age_minutes, 240.0) / 240.0),
-                    )
-    
-                engagement = (
-                    min(math.log10(max(views, 1)) * 2.2, 12)
-                    + min(math.log10(max(forwards, 1)) * 1.5, 5)
+
+                age_minutes = max(
+                    0.0,
+                    (
+                        now_utc - post_date_utc
+                    ).total_seconds()
+                    / 60.0,
                 )
-    
-                media_bonus = (
-                    5.0
-                    if post.get("has_video")
-                    else (2.5 if post.get("has_media") else 0.0)
+
+            tier_mult = self._get_source_multiplier(
+                channel_username
+            )
+
+            engagement_score = (
+                min(
+                    math.log10(max(views, 1)) * 4,
+                    26,
                 )
-    
-                # Keyword bonus домінує лише в recovery-pass. Сам ranking далі
-                # оцінить фактичну інформаційну цінність події.
-                score = (
-                    keyword_hits * 10.0
-                    + engagement
-                    + freshness
+                + min(
+                    math.log10(max(forwards, 1)) * 3,
+                    12,
+                )
+                + min(
+                    math.log10(max(replies, 1)) * 2,
+                    8,
+                )
+            )
+
+            media_bonus = (
+                9
+                if post.get("has_video")
+                else (
+                    4.5
+                    if post.get("has_media")
+                    else 0
+                )
+            )
+
+            # Freshness потрібен лише для доступу нового поста до Analyzer.
+            # Він не є автоматичним доказом важливості.
+            freshness_bonus = 0.0
+            if age_minutes is not None:
+                freshness_bonus = max(
+                    0.0,
+                    12.0
+                    * (
+                        1.0
+                        - min(age_minutes, 240.0)
+                        / 240.0
+                    ),
+                )
+
+            # Manual завжди стоїть на початку контексту і гарантовано
+            # поміщається у ліміт символів раніше за звичайні пости.
+            score = (
+                10000.0
+                if is_priority
+                else (
+                    engagement_score
                     + media_bonus
-                ) * self._get_source_multiplier(username)
-    
-                if hard_hits and keyword_hits == 0:
-                    score -= min(hard_hits * 6.0, 18.0)
-    
-                # Manual не треба "шукати" вдруге, але якщо він тематично
-                # discovery — залишаємо шанс моделі правильно класифікувати його.
-                if post.get("is_priority"):
-                    score += 4.0
-    
-                media_tag = (
-                    "[ВІДЕО]"
-                    if post.get("has_video")
-                    else ("[ФОТО]" if post.get("has_media") else "[ТЕКСТ]")
+                    + freshness_bonus
                 )
-    
-                excerpt = re.sub(r"\s+", " ", text).strip()
-                excerpt = self._truncate_plain_text(
-                    excerpt,
-                    self.DISCOVERY_MAX_POST_CHARS,
-                )
-    
-                prepared.append({
-                    "idx": idx,
-                    "score": score,
-                    "channel_key": username.lower() or str(title).lower(),
-                    "title": title,
-                    "username": username,
-                    "media_tag": media_tag,
-                    "published_at": published_at,
-                    "excerpt": excerpt,
-                })
-    
-            prepared.sort(key=lambda item: item["score"], reverse=True)
-    
-            # Перший прохід: не більше 7 постів одного джерела. Це різко зменшує
-            # шанс, що один великий канал заб'є весь discovery-контекст однією темою.
-            selected: List[Dict[str, Any]] = []
-            per_channel: Dict[str, int] = {}
-            for item in prepared:
-                key = item["channel_key"]
-                if per_channel.get(key, 0) >= 7:
-                    continue
-                selected.append(item)
-                per_channel[key] = per_channel.get(key, 0) + 1
-    
-            result: List[str] = []
-            current_length = 0
-    
-            for item in selected:
-                block = (
-                    f"ID {item['idx']} {item['media_tag']} "
-                    f"[{item['title']}] @{item['username']}\n"
-                    f"Час: {item['published_at']}\n"
-                    f"{item['excerpt']}"
-                )
-    
-                if (
-                    current_length + len(block)
-                    > self.DISCOVERY_RECOVERY_MAX_CHARS
-                ):
-                    continue
-    
-                result.append(block)
-                current_length += len(block) + 10
-    
-            logger.info(
-                "У discovery-контекст потрапило %s з %s постів (%s символів).",
-                len(result),
-                len(prepared),
-                current_length,
+                * tier_mult
             )
-    
-            return "\n\n---\n\n".join(result)
-    
-        def _desired_discovery_slots(
-            self,
-            core_count: int,
-            max_count: int,
-        ) -> int:
-            """
-            Редакційне правило користувача:
-            10 core -> 0 discovery
-             9 core -> 1 discovery
-             8 core -> до 2 discovery
-             7 core -> до 3 discovery
-            <=6 core -> до 3 discovery
-    
-            Формула проста: заповнюємо вільні місця, але не більше трьох.
-            """
-            if max_count <= 0 or core_count >= max_count:
-                return 0
-    
-            free_slots = max_count - max(0, core_count)
-            return min(self.MAX_DISCOVERY_PER_DIGEST, free_slots)
-    
-        def _event_digest_role(
-            self,
-            ev: Dict[str, Any],
-        ) -> str:
-            role = str(ev.get("digest_role") or "").strip().lower()
-            if role in {"core", "discovery"}:
-                return role
-            return "discovery" if ev.get("is_discovery_candidate") else "core"
-    
-        def _is_publishable_discovery(
-            self,
-            ev: Dict[str, Any],
-        ) -> bool:
-            if self._event_digest_role(ev) != "discovery":
-                return False
-    
-            # Manual ніколи не відкидаємо через score-based discovery quality.
-            if ev.get("is_priority"):
-                return True
-    
-            return bool(ev.get("discovery_qualified", False))
-    
-        def _resolve_digest_role(
-            self,
-            ev: Dict[str, Any],
-            event_type: str,
-            category: str,
-            importance: float,
-            national_relevance: float,
-            urgency: float,
-            curiosity: float,
-            practical_value: float,
-            novelty: float,
-            public_interest: float,
-        ) -> str:
-            """
-            Нормалізує core/discovery. LLM має перше слово, але великі hard-news
-            події захищаємо від випадкової класифікації як "цікавинка".
-            """
-            explicit = str(ev.get("digest_role") or "").strip().lower()
-    
-            always_core_types = {
-                "major_attack",
-                "battlefield_change",
-                "critical_infrastructure",
-                "major_accident",
-                "major_crime",
-                "political_decision",
-            }
-            strategic_core_types = {
-                "military_event",
-                "international_decision",
-                "economic_event",
-                "social_event",
-            }
-    
+
+            # Не даємо короткій, але геополітично чутливій новині загубитися
+            # ще ДО Analyzer через нижчі перегляди/менший source tier.
+            # Це лише бонус доступу до контексту, а не автоматична публікація.
             if (
-                event_type in always_core_types
-                and (
-                    importance >= 72
-                    or national_relevance >= 70
-                    or urgency >= 78
+                not is_priority
+                and self._looks_like_attack_text(text)
+                and self._strategic_geopolitical_signal(text)
+            ):
+                score += self.STRATEGIC_CONTEXT_ANALYZER_BONUS
+
+            direct_impact_video = (
+                not is_priority
+                and self._is_direct_impact_video_post(post)
+            )
+            if direct_impact_video:
+                # Protected access до Analyzer: short video-first пост не повинен
+                # програти десяткам довгих переказів лише через малу кількість
+                # тексту/переглядів у перші хвилини.
+                score += self.DIRECT_IMPACT_VIDEO_ANALYZER_BONUS
+
+            prepared.append({
+                "idx": idx,
+                "text": text,
+                "media_tag": media_tag,
+                "channel_title": channel_title,
+                "channel_username": channel_username,
+                "views": views,
+                "forwards": forwards,
+                "replies": replies,
+                "score": score,
+                "published_at": published_at,
+                "age_minutes": age_minutes,
+                "priority_flag": (
+                    " ⭐ [ПРІОРИТЕТ АДМІНІСТРАТОРА]"
+                    if is_priority
+                    else ""
+                ),
+                "impact_video_flag": (
+                    " 🎥 [ВІДЕО ВЛУЧАННЯ/БЕЗПОСЕРЕДНІХ НАСЛІДКІВ]"
+                    if direct_impact_video
+                    else ""
+                ),
+            })
+
+        prepared.sort(
+            key=lambda x: x["score"],
+            reverse=True,
+        )
+
+        result = []
+        current_length = 0
+
+        for item in prepared:
+            age_text = (
+                f"{item['age_minutes']:.0f} хв тому"
+                if isinstance(
+                    item.get("age_minutes"),
+                    (int, float),
                 )
-            ):
-                return "core"
-    
-            if (
-                event_type in strategic_core_types
-                and (
-                    importance >= 84
-                    or national_relevance >= 84
-                    or urgency >= 90
+                else "невідомо"
+            )
+
+            block = (
+                f"ID {item['idx']} "
+                f"{item['media_tag']}"
+                f"{item['priority_flag']}"
+                f"{item['impact_video_flag']} "
+                f"[{item['channel_title']}] "
+                f"@{item['channel_username']}\n"
+                f"Час: {item['published_at']} "
+                f"({age_text})\n"
+                f"Перегляди: {item['views']}\n"
+                f"Пересилання: {item['forwards']}\n"
+                f"Відповіді: {item['replies']}\n"
+                f"{item['text']}"
+            )
+
+            if current_length + len(block) > char_limit:
+                continue
+
+            result.append(block)
+            current_length += len(block) + 10
+
+        logger.info(
+            "У контекст Analyzer потрапило "
+            f"{len(result)} з {len(prepared)} постів "
+            f"({current_length} символів)."
+        )
+
+        return "\n\n---\n\n".join(result)
+
+    def _build_discovery_context(
+        self,
+        posts: List[Dict[str, Any]],
+    ) -> str:
+        """
+        Будує окремий контекст для discovery-pass.
+
+        На відміну від основного контексту, тут ми:
+        - сильніше цінуємо тематичну новизну, а не лише великі перегляди;
+        - обмежуємо домінування одного каналу;
+        - даємо бонус науці, технологіям, бізнесу, сервісам, правилам,
+          виробництву, досягненням і незвичайним суспільним фактам;
+        - трохи знижуємо суто рутинний hard-news шум.
+
+        Це НЕ вибір новин у фінал. Контекст лише підвищує recall, а кожен
+        знайдений event потім проходить звичайний ranking/history gate.
+        """
+        now_utc = datetime.now(timezone.utc)
+        prepared: List[Dict[str, Any]] = []
+
+        discovery_keywords = [
+            "вчен", "дослід", "наук", "відкрит", "винахід",
+            "технолог", "штучн", "інтелект", "нейромереж", "gpt",
+            "стартап", "робот", "чип", "процесор", "космос",
+            "медицин", "лікуван", "біотех", "наномат", "матеріал",
+            "виробництв", "завод", "серійне", "запуст", "контракт",
+            "компан", "бізнес", "ринок", "авто", "автомоб",
+            "рекорд", "досягнен", "перший у світі", "вперше",
+            "правил", "тариф", "сервіс", "послуг", "застосунок",
+            "транспорт", "метро", "поїзд", "аеропорт", "обмеженн",
+            "освіта", "університет", "культур", "фільм", "музей",
+            "археолог", "історичн", "еколог", "енергі", "сонячн",
+        ]
+
+        hard_news_keywords = [
+            "повітряна тривога", "рух бпла", "загроза баліст",
+            "обстріл", "масована атака", "фронт", "штурм",
+            "загинув", "поранен", "влучання ракети", "бойові дії",
+        ]
+
+        for idx, post in enumerate(posts):
+            text = (post.get("text") or "").strip()
+            if not text:
+                continue
+
+            text_lower = text.lower()
+            username = (
+                str(post.get("channel_username", "") or "")
+                .replace("@", "")
+                .strip()
+            )
+            title = (
+                post.get("channel_title")
+                or post.get("channel_username")
+                or "Джерело"
+            )
+
+            views = int(post.get("views") or 0)
+            forwards = int(post.get("forwards") or 0)
+
+            post_date = post.get("date")
+            age_minutes: Optional[float] = None
+            published_at = "невідомо"
+            if isinstance(post_date, datetime):
+                if post_date.tzinfo is None:
+                    post_date = post_date.replace(tzinfo=timezone.utc)
+                post_date_utc = post_date.astimezone(timezone.utc)
+                published_at = post_date_utc.strftime(
+                    "%Y-%m-%d %H:%M UTC"
                 )
-            ):
-                return "core"
-    
-            if explicit in {"core", "discovery"}:
-                return explicit
-    
-            if bool(ev.get("is_discovery_candidate")):
-                return "discovery"
-    
-            if category in {"technology", "science", "culture"}:
-                if (
-                    curiosity >= 65
-                    or practical_value >= 70
-                    or novelty >= 70
-                ):
-                    return "discovery"
-    
-            if event_type in {"science_tech", "culture_event"}:
-                if curiosity >= 65 or novelty >= 70:
-                    return "discovery"
-    
-            # Суспільні/економічні/міжнародні цікаві факти можуть бути
-            # discovery, якщо їхня головна сила — новизна/користь, а не кризовість.
-            if (
-                importance < 82
-                and urgency < 86
-                and (
-                    (curiosity >= 80 and novelty >= 62)
-                    or (practical_value >= 82 and public_interest >= 58)
+                age_minutes = max(
+                    0.0,
+                    (now_utc - post_date_utc).total_seconds() / 60.0,
                 )
-            ):
-                return "discovery"
-    
-            return "core"
-    
-        @staticmethod
-        def _discovery_quality(
-            reliability: float,
-            novelty: float,
-            curiosity: float,
-            practical_value: float,
-            public_interest: float,
-            category: str,
-        ) -> bool:
-            """
-            Quality gate для "цікавинок".
-    
-            Високий curiosity сам по собі більше НЕ достатній. Це прибирає
-            lifestyle/вірусні історії, які легко отримують 90+ за цікавість, але
-            майже нічого не дають читачеві короткого 4-годинного дайджесту.
-            """
-            if reliability < 55 or novelty < 55:
-                return False
-    
-            # Практично корисна зміна може пройти навіть без "вау"-ефекту.
-            if practical_value >= 78 and public_interest >= 55:
-                return True
-    
-            # Наука/технології мають природно вищу пізнавальну цінність, але все
-            # одно вимагаємо новизни та хоча б помірного суспільного інтересу.
+
+            keyword_hits = sum(
+                1 for keyword in discovery_keywords
+                if keyword in text_lower
+            )
+            hard_hits = sum(
+                1 for keyword in hard_news_keywords
+                if keyword in text_lower
+            )
+
+            freshness = 0.0
+            if age_minutes is not None:
+                freshness = max(
+                    0.0,
+                    8.0 * (1.0 - min(age_minutes, 240.0) / 240.0),
+                )
+
+            engagement = (
+                min(math.log10(max(views, 1)) * 2.2, 12)
+                + min(math.log10(max(forwards, 1)) * 1.5, 5)
+            )
+
+            media_bonus = (
+                5.0
+                if post.get("has_video")
+                else (2.5 if post.get("has_media") else 0.0)
+            )
+
+            # Keyword bonus домінує лише в recovery-pass. Сам ranking далі
+            # оцінить фактичну інформаційну цінність події.
+            score = (
+                keyword_hits * 10.0
+                + engagement
+                + freshness
+                + media_bonus
+            ) * self._get_source_multiplier(username)
+
+            if hard_hits and keyword_hits == 0:
+                score -= min(hard_hits * 6.0, 18.0)
+
+            # Manual не треба "шукати" вдруге, але якщо він тематично
+            # discovery — залишаємо шанс моделі правильно класифікувати його.
+            if post.get("is_priority"):
+                score += 4.0
+
+            media_tag = (
+                "[ВІДЕО]"
+                if post.get("has_video")
+                else ("[ФОТО]" if post.get("has_media") else "[ТЕКСТ]")
+            )
+
+            excerpt = re.sub(r"\s+", " ", text).strip()
+            excerpt = self._truncate_plain_text(
+                excerpt,
+                self.DISCOVERY_MAX_POST_CHARS,
+            )
+
+            prepared.append({
+                "idx": idx,
+                "score": score,
+                "channel_key": username.lower() or str(title).lower(),
+                "title": title,
+                "username": username,
+                "media_tag": media_tag,
+                "published_at": published_at,
+                "excerpt": excerpt,
+            })
+
+        prepared.sort(key=lambda item: item["score"], reverse=True)
+
+        # Перший прохід: не більше 7 постів одного джерела. Це різко зменшує
+        # шанс, що один великий канал заб'є весь discovery-контекст однією темою.
+        selected: List[Dict[str, Any]] = []
+        per_channel: Dict[str, int] = {}
+        for item in prepared:
+            key = item["channel_key"]
+            if per_channel.get(key, 0) >= 7:
+                continue
+            selected.append(item)
+            per_channel[key] = per_channel.get(key, 0) + 1
+
+        result: List[str] = []
+        current_length = 0
+
+        for item in selected:
+            block = (
+                f"ID {item['idx']} {item['media_tag']} "
+                f"[{item['title']}] @{item['username']}\n"
+                f"Час: {item['published_at']}\n"
+                f"{item['excerpt']}"
+            )
+
             if (
-                category in {"technology", "science"}
-                and curiosity >= 68
-                and novelty >= 62
-                and public_interest >= 45
+                current_length + len(block)
+                > self.DISCOVERY_RECOVERY_MAX_CHARS
             ):
-                return True
-    
-            # Культура може бути якісною discovery, але планка трохи вища, щоб
-            # не тягнути селебріті/лайфстайл лише через високий curiosity.
-            if (
-                category == "culture"
-                and curiosity >= 76
-                and novelty >= 68
-                and public_interest >= 58
-            ):
-                return True
-    
-            # Для society/economy/international/other потрібна комбінація
-            # сильної цікавості + новизни + реального інтересу аудиторії.
-            if (
-                curiosity >= 84
-                and novelty >= 74
-                and public_interest >= 64
-                and reliability >= 60
-            ):
-                return True
-    
+                continue
+
+            result.append(block)
+            current_length += len(block) + 10
+
+        logger.info(
+            "У discovery-контекст потрапило %s з %s постів (%s символів).",
+            len(result),
+            len(prepared),
+            current_length,
+        )
+
+        return "\n\n---\n\n".join(result)
+
+    def _desired_discovery_slots(
+        self,
+        core_count: int,
+        max_count: int,
+    ) -> int:
+        """
+        Редакційне правило користувача:
+        10 core -> 0 discovery
+         9 core -> 1 discovery
+         8 core -> до 2 discovery
+         7 core -> до 3 discovery
+        <=6 core -> до 3 discovery
+
+        Формула проста: заповнюємо вільні місця, але не більше трьох.
+        """
+        if max_count <= 0 or core_count >= max_count:
+            return 0
+
+        free_slots = max_count - max(0, core_count)
+        return min(self.MAX_DISCOVERY_PER_DIGEST, free_slots)
+
+    def _event_digest_role(
+        self,
+        ev: Dict[str, Any],
+    ) -> str:
+        role = str(ev.get("digest_role") or "").strip().lower()
+        if role in {"core", "discovery"}:
+            return role
+        return "discovery" if ev.get("is_discovery_candidate") else "core"
+
+    def _is_publishable_discovery(
+        self,
+        ev: Dict[str, Any],
+    ) -> bool:
+        if self._event_digest_role(ev) != "discovery":
             return False
-    
-        @staticmethod
-        def _calculate_discovery_score(
-            curiosity: float,
-            novelty: float,
-            practical_value: float,
-            public_interest: float,
-            reliability: float,
-            media_quality: float,
-        ) -> float:
-            return round(
-                curiosity * 0.34
-                + novelty * 0.23
-                + practical_value * 0.16
-                + public_interest * 0.12
-                + reliability * 0.10
-                + media_quality * 0.05,
-                2,
+
+        # Manual ніколи не відкидаємо через score-based discovery quality.
+        if ev.get("is_priority"):
+            return True
+
+        return bool(ev.get("discovery_qualified", False))
+
+    def _resolve_digest_role(
+        self,
+        ev: Dict[str, Any],
+        event_type: str,
+        category: str,
+        importance: float,
+        national_relevance: float,
+        urgency: float,
+        curiosity: float,
+        practical_value: float,
+        novelty: float,
+        public_interest: float,
+    ) -> str:
+        """
+        Нормалізує core/discovery. LLM має перше слово, але великі hard-news
+        події захищаємо від випадкової класифікації як "цікавинка".
+        """
+        explicit = str(ev.get("digest_role") or "").strip().lower()
+
+        always_core_types = {
+            "major_attack",
+            "battlefield_change",
+            "critical_infrastructure",
+            "major_accident",
+            "major_crime",
+            "political_decision",
+        }
+        strategic_core_types = {
+            "military_event",
+            "international_decision",
+            "economic_event",
+            "social_event",
+        }
+
+        if (
+            event_type in always_core_types
+            and (
+                importance >= 72
+                or national_relevance >= 70
+                or urgency >= 78
             )
-    
-        @staticmethod
-        def _discovery_sort_score(
-            ev: Dict[str, Any],
-        ) -> float:
-            return float(
-                ev.get(
-                    "discovery_score",
-                    ev.get("editorial_score", ev.get("balanced_score", 0)),
-                )
-                or 0
+        ):
+            return "core"
+
+        if (
+            event_type in strategic_core_types
+            and (
+                importance >= 84
+                or national_relevance >= 84
+                or urgency >= 90
             )
-    
-        @staticmethod
-        def _core_presentation_score(
-            ev: Dict[str, Any],
-        ) -> float:
-            # presentation score навмисно НЕ містить +500 manual bonus.
-            # Manual гарантовано входить, але розташовується органічно за змістом.
-            return float(
-                ev.get(
-                    "editorial_score",
-                    ev.get("balanced_score", ev.get("raw_score", 0)),
-                )
-                or 0
+        ):
+            return "core"
+
+        if explicit in {"core", "discovery"}:
+            return explicit
+
+        if bool(ev.get("is_discovery_candidate")):
+            return "discovery"
+
+        if category in {"technology", "science", "culture"}:
+            if (
+                curiosity >= 65
+                or practical_value >= 70
+                or novelty >= 70
+            ):
+                return "discovery"
+
+        if event_type in {"science_tech", "culture_event"}:
+            if curiosity >= 65 or novelty >= 70:
+                return "discovery"
+
+        # Суспільні/економічні/міжнародні цікаві факти можуть бути
+        # discovery, якщо їхня головна сила — новизна/користь, а не кризовість.
+        if (
+            importance < 82
+            and urgency < 86
+            and (
+                (curiosity >= 80 and novelty >= 62)
+                or (practical_value >= 82 and public_interest >= 58)
             )
-    
-        def _ensure_discovery_events(
-            self,
-            events: List[Dict[str, Any]],
-            posts: List[Dict[str, Any]],
-            past_events: Optional[
-                Union[
-                    List[str],
-                    List[Dict[str, str]],
-                ]
-            ],
-            max_retries: int,
-            desired_count: int,
-        ) -> List[Dict[str, Any]]:
-            if desired_count <= 0:
-                return events
-    
-            discovery_context = self._build_discovery_context(posts)
-            if not discovery_context:
-                logger.warning(
-                    "Discovery-pass: не вдалося побудувати окремий контекст."
-                )
-                return events
-    
-            recovered = self._analyze_discovery_events(
-                discovery_context,
-                past_events,
-                max_retries,
-                desired_count,
+        ):
+            return "discovery"
+
+        return "core"
+
+    @staticmethod
+    def _discovery_quality(
+        reliability: float,
+        novelty: float,
+        curiosity: float,
+        practical_value: float,
+        public_interest: float,
+        category: str,
+    ) -> bool:
+        """
+        Quality gate для "цікавинок".
+
+        Високий curiosity сам по собі більше НЕ достатній. Це прибирає
+        lifestyle/вірусні історії, які легко отримують 90+ за цікавість, але
+        майже нічого не дають читачеві короткого 4-годинного дайджесту.
+        """
+        if reliability < 55 or novelty < 55:
+            return False
+
+        # Практично корисна зміна може пройти навіть без "вау"-ефекту.
+        if practical_value >= 78 and public_interest >= 55:
+            return True
+
+        # Наука/технології мають природно вищу пізнавальну цінність, але все
+        # одно вимагаємо новизни та хоча б помірного суспільного інтересу.
+        if (
+            category in {"technology", "science"}
+            and curiosity >= 68
+            and novelty >= 62
+            and public_interest >= 45
+        ):
+            return True
+
+        # Культура може бути якісною discovery, але планка трохи вища, щоб
+        # не тягнути селебріті/лайфстайл лише через високий curiosity.
+        if (
+            category == "culture"
+            and curiosity >= 76
+            and novelty >= 68
+            and public_interest >= 58
+        ):
+            return True
+
+        # Для society/economy/international/other потрібна комбінація
+        # сильної цікавості + новизни + реального інтересу аудиторії.
+        if (
+            curiosity >= 84
+            and novelty >= 74
+            and public_interest >= 64
+            and reliability >= 60
+        ):
+            return True
+
+        return False
+
+    @staticmethod
+    def _calculate_discovery_score(
+        curiosity: float,
+        novelty: float,
+        practical_value: float,
+        public_interest: float,
+        reliability: float,
+        media_quality: float,
+    ) -> float:
+        return round(
+            curiosity * 0.34
+            + novelty * 0.23
+            + practical_value * 0.16
+            + public_interest * 0.12
+            + reliability * 0.10
+            + media_quality * 0.05,
+            2,
+        )
+
+    @staticmethod
+    def _discovery_sort_score(
+        ev: Dict[str, Any],
+    ) -> float:
+        return float(
+            ev.get(
+                "discovery_score",
+                ev.get("editorial_score", ev.get("balanced_score", 0)),
             )
-    
-            if not recovered:
-                logger.warning(
-                    "Discovery-pass не повернув кандидатів. "
-                    "Нічого не вигадуємо і не знижуємо quality gate."
-                )
-                return events
-    
-            result: List[Dict[str, Any]] = [
-                dict(ev)
-                for ev in events
-                if isinstance(ev, dict)
+            or 0
+        )
+
+    @staticmethod
+    def _core_presentation_score(
+        ev: Dict[str, Any],
+    ) -> float:
+        # presentation score навмисно НЕ містить +500 manual bonus.
+        # Manual гарантовано входить, але розташовується органічно за змістом.
+        return float(
+            ev.get(
+                "editorial_score",
+                ev.get("balanced_score", ev.get("raw_score", 0)),
+            )
+            or 0
+        )
+
+    def _ensure_discovery_events(
+        self,
+        events: List[Dict[str, Any]],
+        posts: List[Dict[str, Any]],
+        past_events: Optional[
+            Union[
+                List[str],
+                List[Dict[str, str]],
             ]
-    
-            added = 0
-            merged_count = 0
-    
-            for recovered_ev in recovered:
-                if not isinstance(recovered_ev, dict):
-                    continue
-    
-                candidate = dict(recovered_ev)
-                source_ids = self._valid_source_ids(
-                    candidate.get("source_ids"),
-                    posts,
-                )
-                if not source_ids:
-                    continue
-    
-                candidate["source_ids"] = source_ids
-                candidate["digest_role"] = "discovery"
-                candidate["is_discovery_candidate"] = True
-    
-                # Discovery-pass не має права обходити history gate.
-                # eligible лишаємо тим, що повернула модель; ranking перевірить.
-                candidate["eligible_for_digest"] = bool(
-                    candidate.get("eligible_for_digest", True)
-                )
-    
-                match_idx = self._find_matching_event_index(
-                    result,
+        ],
+        max_retries: int,
+        desired_count: int,
+    ) -> List[Dict[str, Any]]:
+        if desired_count <= 0:
+            return events
+
+        discovery_context = self._build_discovery_context(posts)
+        if not discovery_context:
+            logger.warning(
+                "Discovery-pass: не вдалося побудувати окремий контекст."
+            )
+            return events
+
+        recovered = self._analyze_discovery_events(
+            discovery_context,
+            past_events,
+            max_retries,
+            desired_count,
+        )
+
+        if not recovered:
+            logger.warning(
+                "Discovery-pass не повернув кандидатів. "
+                "Нічого не вигадуємо і не знижуємо quality gate."
+            )
+            return events
+
+        result: List[Dict[str, Any]] = [
+            dict(ev)
+            for ev in events
+            if isinstance(ev, dict)
+        ]
+
+        added = 0
+        merged_count = 0
+
+        for recovered_ev in recovered:
+            if not isinstance(recovered_ev, dict):
+                continue
+
+            candidate = dict(recovered_ev)
+            source_ids = self._valid_source_ids(
+                candidate.get("source_ids"),
+                posts,
+            )
+            if not source_ids:
+                continue
+
+            candidate["source_ids"] = source_ids
+            candidate["digest_role"] = "discovery"
+            candidate["is_discovery_candidate"] = True
+
+            # Discovery-pass не має права обходити history gate.
+            # eligible лишаємо тим, що повернула модель; ranking перевірить.
+            candidate["eligible_for_digest"] = bool(
+                candidate.get("eligible_for_digest", True)
+            )
+
+            match_idx = self._find_matching_event_index(
+                result,
+                candidate,
+                posts,
+            )
+
+            if match_idx is not None:
+                existing_role = str(
+                    result[match_idx].get("digest_role") or ""
+                ).strip().lower()
+                result[match_idx] = self._merge_events(
+                    result[match_idx],
                     candidate,
                     posts,
                 )
-    
-                if match_idx is not None:
-                    existing_role = str(
-                        result[match_idx].get("digest_role") or ""
-                    ).strip().lower()
-                    result[match_idx] = self._merge_events(
-                        result[match_idx],
-                        candidate,
-                        posts,
-                    )
-                    # Не перетворюємо вже явну core-подію на цікавинку.
-                    if existing_role not in {"core", "discovery"}:
-                        result[match_idx]["digest_role"] = "discovery"
-                        result[match_idx]["is_discovery_candidate"] = True
-                    merged_count += 1
-                    continue
-    
-                candidate["event_id"] = self._unique_event_id(
-                    str(candidate.get("event_id") or "D_RECOVER"),
-                    result,
-                )
-                result.append(candidate)
-                added += 1
-    
-            logger.info(
-                "Discovery-pass: отримано=%s, додано=%s, змерджено=%s.",
-                len(recovered),
-                added,
-                merged_count,
+                # Не перетворюємо вже явну core-подію на цікавинку.
+                if existing_role not in {"core", "discovery"}:
+                    result[match_idx]["digest_role"] = "discovery"
+                    result[match_idx]["is_discovery_candidate"] = True
+                merged_count += 1
+                continue
+
+            candidate["event_id"] = self._unique_event_id(
+                str(candidate.get("event_id") or "D_RECOVER"),
+                result,
             )
-    
-            return result
-    
-        def _analyze_discovery_events(
-            self,
-            posts_context: str,
-            past_events: Optional[
-                Union[
-                    List[str],
-                    List[Dict[str, str]],
-                ]
-            ],
-            max_retries: int,
-            desired_count: int,
-        ) -> List[Dict[str, Any]]:
-            history_block = self._build_history_block(past_events)
-            candidate_count = max(
-                4,
-                min(
-                    self.DISCOVERY_RECOVERY_CANDIDATES,
-                    desired_count * 2 + 2,
-                ),
-            )
-    
-            prompt = f"""
-    Ти — окремий discovery-редактор українського Telegram-дайджесту.
-    
-    Основний Analyzer уже займається важкими новинами: війною, великими атаками,
-    політикою, міжнародними рішеннями та кризами. Твоє завдання — НЕ дублювати
-    його роботу, а знайти до {candidate_count} справді якісних "цікавинок".
-    
-    ЩО ТАКЕ DISCOVERY-НОВИНА:
-    - сильна технологічна або наукова новина;
-    - цікаве українське виробництво, винахід, стартап або бізнес-подія;
-    - незвичайний міжнародний факт, який має самостійну інформаційну цінність;
-    - практично корисна зміна правил, сервісів, транспорту, тарифів чи побуту;
-    - помітне досягнення, рекорд, новий продукт, дослідження або відкриття;
-    - якісна суспільна/культурна подія, про яку природно сказати
-      "О, цього я не знав".
-    
-    ЦЕ НЕ DISCOVERY:
-    - звичайна тривога, рух БпЛА, рутинний обстріл;
-    - чергова політична заява без рішення;
-    - дрібний кримінал, ДТП, локальна пожежа;
-    - шок-контент, плітки, клікбейт;
-    - просто важка воєнна новина, якщо її єдина цінність — стратегічна важливість;
-    - внутрішній російський lifestyle/trivia: побутові "цікаві факти" про РФ,
-      туризм, регіональні курйози, домашніх тварин, локальні рекорди та інший
-      soft-news без прямого значення для України або помітного міжнародного впливу.
-      Водночас НЕ відкидай через це санкції, війну, військову промисловість РФ,
-      НПЗ/енергетику, економічні зміни, дипломатію чи рішення, важливі для України.
-    
-    QUALITY GATE:
-    Поверни лише події, які реально не соромно поставити в КІНЕЦЬ короткого
-    дайджесту після 5-9 серйозних новин. Краще 1 сильний кандидат, ніж 5 слабких.
-    
-    КРИТИЧНО: високий curiosity САМ ПО СОБІ не робить подію якісною discovery.
-    У кандидата має бути ще хоча б одна змістовна опора: реальна практична користь,
-    наукова/технологічна новизна, помітне досягнення, сильний бізнес/виробничий факт,
-    важливе дослідження, суспільна зміна або незвичайний міжнародний факт із
-    самостійним значенням.
-    
-    Не бери як заповнювач:
-    - історію одного побачення/знайомства або іншу приватну lifestyle-анекдоту;
-    - селебріті/блогерські дрібниці, меми, вірусні курйози;
-    - дрібну функцію застосунку чи соцмережі без широкого впливу;
-    - "дивовижну історію однієї людини", якщо за нею немає дослідження, рішення,
-      системної зміни, значного досягнення або іншої самостійної новинної цінності.
-    
-    Водночас не відкидай тему лише через бренд/платформу: витік даних, масштабний
-    збій, регуляторне рішення, велика угода, дослідження чи інший реальний вплив
-    можуть бути сильною новиною. Не підганяй оцінки штучно.
-    
-    АРХІВ ВЖЕ ОПУБЛІКОВАНИХ ПОДІЙ:
-    {history_block}
-    
-    ПОВТОРИ:
-    Якщо ця сама реальна подія вже була в архіві, став is_history_repeat=true.
-    Інший заголовок, інше фото, інше джерело, розширений список деталей або
-    інший кут подачі НЕ створюють нової події. Для атак водночас не склеюй
-    різні удари без збігу конкретної локації/цілі/хвилі атаки.
-    Повтор може бути eligible_for_digest=true лише якщо history_update_strength
-    >= 80 і є справді новий значущий розвиток. Інше відкидай.
-    
-    Одна реальна подія = один event_id. Об'єднуй дублікати різних каналів, фото
-    та відео однієї події. Обирай найкраще factual-source і найкраще media-source.
-    
-    Для КОЖНОЇ повернутої події:
-    - digest_role="discovery";
-    - is_discovery_candidate=true;
-    - eligible_for_digest=true лише якщо вона проходить quality gate;
-    - усі оцінки 0-100 виставляй чесно;
-    - не вигадуй жодного факту.
-    
-    ДОЗВОЛЕНІ category:
-    war, politics, economy, international, society, technology, science, culture, other.
-    
-    ДОЗВОЛЕНІ event_type:
-    major_attack, battlefield_change, military_event, political_decision,
-    international_decision, economic_event, critical_infrastructure,
-    major_accident, major_crime, science_tech, social_event, culture_event,
-    routine_attack, routine_statement, minor_local_event, minor_accident,
-    alert_only, other.
-    
-    ВІДПОВІДЬ ТІЛЬКИ JSON:
+            result.append(candidate)
+            added += 1
+
+        logger.info(
+            "Discovery-pass: отримано=%s, додано=%s, змерджено=%s.",
+            len(recovered),
+            added,
+            merged_count,
+        )
+
+        return result
+
+    def _analyze_discovery_events(
+        self,
+        posts_context: str,
+        past_events: Optional[
+            Union[
+                List[str],
+                List[Dict[str, str]],
+            ]
+        ],
+        max_retries: int,
+        desired_count: int,
+    ) -> List[Dict[str, Any]]:
+        history_block = self._build_history_block(past_events)
+        candidate_count = max(
+            4,
+            min(
+                self.DISCOVERY_RECOVERY_CANDIDATES,
+                desired_count * 2 + 2,
+            ),
+        )
+
+        prompt = f"""
+Ти — окремий discovery-редактор українського Telegram-дайджесту.
+
+Основний Analyzer уже займається важкими новинами: війною, великими атаками,
+політикою, міжнародними рішеннями та кризами. Твоє завдання — НЕ дублювати
+його роботу, а знайти до {candidate_count} справді якісних "цікавинок".
+
+ЩО ТАКЕ DISCOVERY-НОВИНА:
+- сильна технологічна або наукова новина;
+- цікаве українське виробництво, винахід, стартап або бізнес-подія;
+- незвичайний міжнародний факт, який має самостійну інформаційну цінність;
+- практично корисна зміна правил, сервісів, транспорту, тарифів чи побуту;
+- помітне досягнення, рекорд, новий продукт, дослідження або відкриття;
+- якісна суспільна/культурна подія, про яку природно сказати
+  "О, цього я не знав".
+
+ЦЕ НЕ DISCOVERY:
+- звичайна тривога, рух БпЛА, рутинний обстріл;
+- чергова політична заява без рішення;
+- дрібний кримінал, ДТП, локальна пожежа;
+- шок-контент, плітки, клікбейт;
+- просто важка воєнна новина, якщо її єдина цінність — стратегічна важливість;
+- внутрішній російський lifestyle/trivia: побутові "цікаві факти" про РФ,
+  туризм, регіональні курйози, домашніх тварин, локальні рекорди та інший
+  soft-news без прямого значення для України або помітного міжнародного впливу.
+  Водночас НЕ відкидай через це санкції, війну, військову промисловість РФ,
+  НПЗ/енергетику, економічні зміни, дипломатію чи рішення, важливі для України.
+
+QUALITY GATE:
+Поверни лише події, які реально не соромно поставити в КІНЕЦЬ короткого
+дайджесту після 5-9 серйозних новин. Краще 1 сильний кандидат, ніж 5 слабких.
+
+КРИТИЧНО: високий curiosity САМ ПО СОБІ не робить подію якісною discovery.
+У кандидата має бути ще хоча б одна змістовна опора: реальна практична користь,
+наукова/технологічна новизна, помітне досягнення, сильний бізнес/виробничий факт,
+важливе дослідження, суспільна зміна або незвичайний міжнародний факт із
+самостійним значенням.
+
+Не бери як заповнювач:
+- історію одного побачення/знайомства або іншу приватну lifestyle-анекдоту;
+- селебріті/блогерські дрібниці, меми, вірусні курйози;
+- дрібну функцію застосунку чи соцмережі без широкого впливу;
+- "дивовижну історію однієї людини", якщо за нею немає дослідження, рішення,
+  системної зміни, значного досягнення або іншої самостійної новинної цінності.
+
+Водночас не відкидай тему лише через бренд/платформу: витік даних, масштабний
+збій, регуляторне рішення, велика угода, дослідження чи інший реальний вплив
+можуть бути сильною новиною. Не підганяй оцінки штучно.
+
+АРХІВ ВЖЕ ОПУБЛІКОВАНИХ ПОДІЙ:
+{history_block}
+
+ПОВТОРИ:
+Якщо ця сама реальна подія вже була в архіві, став is_history_repeat=true.
+Інший заголовок, інше фото, інше джерело, розширений список деталей або
+інший кут подачі НЕ створюють нової події. Для атак водночас не склеюй
+різні удари без збігу конкретної локації/цілі/хвилі атаки.
+Повтор може бути eligible_for_digest=true лише якщо history_update_strength
+>= 80 і є справді новий значущий розвиток. Інше відкидай.
+
+Одна реальна подія = один event_id. Об'єднуй дублікати різних каналів, фото
+та відео однієї події. Обирай найкраще factual-source і найкраще media-source.
+
+Для КОЖНОЇ повернутої події:
+- digest_role="discovery";
+- is_discovery_candidate=true;
+- eligible_for_digest=true лише якщо вона проходить quality gate;
+- усі оцінки 0-100 виставляй чесно;
+- не вигадуй жодного факту.
+
+ДОЗВОЛЕНІ category:
+war, politics, economy, international, society, technology, science, culture, other.
+
+ДОЗВОЛЕНІ event_type:
+major_attack, battlefield_change, military_event, political_decision,
+international_decision, economic_event, critical_infrastructure,
+major_accident, major_crime, science_tech, social_event, culture_event,
+routine_attack, routine_statement, minor_local_event, minor_accident,
+alert_only, other.
+
+ВІДПОВІДЬ ТІЛЬКИ JSON:
+{{
+  "events": [
     {{
-      "events": [
-        {{
-          "event_id": "D1",
-          "source_ids": [12, 44],
-          "best_factual_source_id": 12,
-          "best_media_source_id": 44,
-          "eligible_for_digest": true,
-          "rejection_reason": "",
-          "digest_role": "discovery",
-          "is_discovery_candidate": true,
-          "event_type": "science_tech",
-          "category": "technology",
-          "importance": 66,
-          "scale": 55,
-          "reliability": 84,
-          "public_interest": 76,
-          "novelty": 88,
-          "curiosity": 91,
-          "practical_value": 52,
-          "media_quality": 80,
-          "national_relevance": 58,
-          "urgency": 64,
-          "is_history_repeat": false,
-          "history_update_strength": 0,
-          "headline_hint": "Короткий конкретний заголовок",
-          "key_facts": ["Факт 1", "Факт 2"],
-          "why_it_matters": "Чому це справді цікаво або корисно.",
-          "summary": "Стислий фактологічний опис."
-        }}
-      ]
+      "event_id": "D1",
+      "source_ids": [12, 44],
+      "best_factual_source_id": 12,
+      "best_media_source_id": 44,
+      "eligible_for_digest": true,
+      "rejection_reason": "",
+      "digest_role": "discovery",
+      "is_discovery_candidate": true,
+      "event_type": "science_tech",
+      "category": "technology",
+      "importance": 66,
+      "scale": 55,
+      "reliability": 84,
+      "public_interest": 76,
+      "novelty": 88,
+      "curiosity": 91,
+      "practical_value": 52,
+      "media_quality": 80,
+      "national_relevance": 58,
+      "urgency": 64,
+      "is_history_repeat": false,
+      "history_update_strength": 0,
+      "headline_hint": "Короткий конкретний заголовок",
+      "key_facts": ["Факт 1", "Факт 2"],
+      "why_it_matters": "Чому це справді цікаво або корисно.",
+      "summary": "Стислий фактологічний опис."
     }}
-    
-    TELEGRAM POSTS FOR DISCOVERY SEARCH:
-    {posts_context}
-    """
-    
-            data = self._call_json_with_cascade(
-                prompt,
-                max_retries,
-                "DISCOVERY_ANALYZER",
-                temperature=0.18,
+  ]
+}}
+
+TELEGRAM POSTS FOR DISCOVERY SEARCH:
+{posts_context}
+"""
+
+        data = self._call_json_with_cascade(
+            prompt,
+            max_retries,
+            "DISCOVERY_ANALYZER",
+            temperature=0.18,
+        )
+
+        return (
+            data.get("events", [])
+            if (
+                data
+                and isinstance(data.get("events"), list)
             )
-    
-            return (
-                data.get("events", [])
-                if (
-                    data
-                    and isinstance(data.get("events"), list)
-                )
-                else []
-            )
-    
-        def _analyze_events(
-            self,
-            posts_context: str,
-            past_events: Optional[
-                Union[
-                    List[str],
-                    List[Dict[str, str]],
-                ]
-            ],
-            max_retries: int,
-        ) -> List[Dict[str, Any]]:
-            history_block = self._build_history_block(
-                past_events
-            )
-    
-            prompt = f"""
-    Ти — старший редактор загальноукраїнського новинного Telegram-дайджесту.
-    
-    ТВОЯ ЗАДАЧА:
-    Із потоку Telegram-повідомлень знайти події, які реально заслуговують
-    на місце серед головних, найкорисніших ТА найцікавіших новин останніх 4 годин.
-    
-    Це НЕ звичайна стрічка новин і НЕ збір усіх повідомлень.
-    
-    Читач відкриває канал кілька разів на день і хоче за кілька хвилин:
-    - зрозуміти головне;
-    - не пропустити важливе;
-    - побачити 1-3 події, про які природно хочеться сказати
-      "О, цього я не знав" або "Цікаво".
-    
-    Для кожної події запитай:
-    "Чи варто знати це людині, яка прочитає лише 7-10 новин?"
-    
-    Не плутай "цікаво" з клікбейтом.
-    Наша мета — не сенсаційність, а сильна інформаційна цінність,
-    корисність, новизна та тематичне різноманіття.
-    
-    ━━━━━━━━━━━━━━━━━━━━
-    АРХІВ ВЖЕ ОПУБЛІКОВАНИХ ПОДІЙ:
-    {history_block}
-    ━━━━━━━━━━━━━━━━━━━━
-    
-    ПРАВИЛО ПРО ПОВТОРИ:
-    
-    Архів — це вже опубліковані новини.
-    Не повторюй ту саму реальну подію тільки через новий пост,
-    інше формулювання, інший канал або нове фото.
-    
-    "Та сама подія" означає той самий базовий інцидент, звіт, дослідження,
-    оголошення, рішення, операцію або розслідування — навіть якщо новий пост
-    подає інший кут, інший заголовок чи додає подробиці. Наприклад, новий список
-    методів кібератаки в тому самому звіті про Claude/Anthropic — це уточнення
-    тієї самої історії, а не нова подія.
-    
-    Для атак НЕ склеюй різні удари лише тому, що в них той самий нападник,
-    тип зброї або загальна тема. Для однієї атаки мають збігатися конкретна
-    локація/ціль/хвиля атаки або інша унікальна прив'язка події.
-    
-    ОКРЕМЕ ПРАВИЛО ДЛЯ ЗВЕДЕНЬ ППО / ПОВІТРЯНИХ СИЛ:
-    агреговану статистику на кшталт "запущено N БпЛА/ракет, збито або подавлено M"
-    показуй не частіше ОДНОГО РАЗУ НА 24 ГОДИНИ. Нова хвиля, інші цифри або
-    оновлене вечірнє зведення самі по собі не виправдовують ще одну таку новину
-    того ж дня. Це правило НЕ стосується окремої події з великими жертвами,
-    ударом по критичному/стратегічному об'єкту, значним міжнародним контекстом
-    або іншим самостійно важливим наслідком.
-    
-    ОКРЕМЕ ПРАВИЛО ДЛЯ ЗАКОНІВ / САНКЦІЙ / УГОД / РІШЕНЬ:
-    ту саму базову policy-story не повертай у дайджест повторно протягом 24 годин
-    лише через інший заголовок, повторний переказ голосування, нові цитати,
-    "готовність президента підписати", "має підписати", "передадуть на підпис",
-    "очікує підпису" або інше формулювання тієї самої стадії.
-    
-    ЦЕ НЕ новий юридичний статус:
-    - "ухвалили" -> "остаточно ухвалили/схвалили";
-    - "Палата підтримала" -> ще один переказ того самого вже відомого ухвалення;
-    - "передадуть на підпис" -> "президент готовий/планує підписати";
-    - нові деталі пакета без зміни його фактичного статусу.
-    
-    Справжній material update для такої історії:
-    - пропозицію/проєкт ФАКТИЧНО ухвалили;
-    - документ ФАКТИЧНО підписано, а не лише обіцяно підписати;
-    - він ФАКТИЧНО набув чинності;
-    - санкції/мита ФАКТИЧНО запровадили;
-    - документ ветували/відхилили або стався інший реальний юридичний результат.
-    
-    Якщо подія вже є в архіві:
-    - is_history_repeat=true;
-    - history_update_strength показує силу НОВОГО розвитку від 0 до 100.
-    
-    history_update_strength 0-39:
-    суттєво нового немає — eligible_for_digest=false.
-    
-    history_update_strength 40-59:
-    є невелике уточнення, але його недостатньо для повторної появи
-    у короткому дайджесті — зазвичай eligible_for_digest=false.
-    
-    history_update_strength 60-79:
-    є помітне уточнення, але для повторної появи у короткому дайджесті
-    цього ще недостатньо — зазвичай eligible_for_digest=false.
-    
-    history_update_strength 80-100:
-    з'явився реально новий значущий розвиток: нові великі наслідки,
-    важливе рішення, підтвердження масштабу, нові жертви, новий об'єкт,
-    результат операції або інший факт, який змінює картину події.
-    Тоді подію можна допустити повторно.
-    
-    ━━━━━━━━━━━━━━━━━━━━
-    ЕТАП 1 — ЗГРУПУЙ ПОСТИ У ПОДІЇ.
-    
-    Одна реальна подія = один event_id.
-    
-    Об'єднуй:
-    - повідомлення про одну атаку;
-    - перші дані та подальші уточнення;
-    - фото та відео тієї самої події;
-    - повідомлення різних каналів про один факт.
-    
-    Не створюй новий event_id лише через інше формулювання
-    або через появу ще одного фото/відео.
-    
-    ━━━━━━━━━━━━━━━━━━━━
-    ЕТАП 2 — EDITORIAL GATE.
-    
-    Для кожної події визнач eligible_for_digest=true або false.
-    
-    eligible_for_digest=true став, якщо подія має хоча б один сильний фактор:
-    
-    1. Великий масштаб.
-    2. Значні людські наслідки.
-    3. Важлива зміна на фронті.
-    4. Значне військове рішення або операція.
-    5. Важливе рішення української влади.
-    6. Важливе рішення США, ЄС, НАТО або великої держави.
-    7. Значний міжнародний вплив.
-    8. Значні економічні наслідки.
-    9. Удар по критичній або стратегічній інфраструктурі.
-    10. Великий суспільний резонанс із реальним значенням.
-    11. Унікальна або виняткова подія.
-    12. Суттєвий новий розвиток великої історії.
-    13. Гаряча подія, яка прямо зараз суттєво змінює інформаційну картину.
-    14. Підтверджене влучання або наслідки на важливому промисловому,
-        енергетичному, логістичному, військовому чи великому комерційному об'єкті,
-        якщо це має реальне економічне, суспільне або новинне значення.
-    15. Висока самостійна цікавість: незвичайна, пізнавальна,
-        технологічна, наукова, бізнесова або суспільна подія,
-        про яку значна частина читачів захоче дізнатися.
-    16. Висока практична цінність: зміна правил, тарифів, транспорту,
-        сервісів, інфраструктури або повсякденного життя,
-        яка прямо стосується великої кількості людей.
-    17. Помітне українське досягнення: нове виробництво, технологія,
-        винахід, інфраструктурний проєкт, великий контракт або інша подія,
-        яка показує реальну зміну можливостей країни.
-    18. Сильна "discovery"-новина: не обов'язково стратегічна,
-        але вона має новизну, конкретику і природно запам'ятовується.
-    
-    ВАЖЛИВО ПРО РІЗНОМАНІТТЯ:
-    
-    Короткий дайджест повинен показувати не лише те, що було НАЙВАЖЛИВІШИМ,
-    а й те, що було НАЙЦІКАВІШИМ або НАЙКОРИСНІШИМ.
-    
-    Якщо за останні 4 години є 1-3 сильні технологічні, наукові,
-    суспільні, бізнесові, практично корисні чи просто незвичайні події,
-    не відкидай їх лише тому, що вони менш стратегічні,
-    ніж війна, політика або міжнародні рішення.
-    
-    Не занижуй подію тільки тому, що вона локальна,
-    якщо вона має високу практичну цінність, цікавість або резонанс.
-    
-    ЗАЗВИЧАЙ ВІДКИДАЙ:
-    
-    - рутинні обстріли без суттєвих наслідків;
-    - локальні пошкодження без ширшого значення;
-    - 1-2 поранених без інших значних факторів;
-    - тривоги;
-    - рух БпЛА;
-    - загрози ракет без підтверджених наслідків;
-    - дрібні ДТП;
-    - локальні побутові пожежі;
-    - дрібний кримінал без широкого резонансу;
-    - комунальні аварії без значного впливу;
-    - заяви політиків без реального рішення;
-    - повтори старих новин;
-    - чутки;
-    - клікбейтні курйози без інформаційної цінності;
-    - плітки про знаменитостей;
-    - контент, єдина цінність якого — шок або емоція;
-    - внутрішній російський lifestyle/trivia/туризм та побутові "цікаві факти"
-      про РФ без прямої користі/наслідків для України або помітного міжнародного
-      значення. Це НЕ стосується війни, санкцій, економіки РФ, військової
-      промисловості, енергетики, дипломатії та інших подій, що впливають на Україну.
-    
-    КРИТИЧНИЙ ВИНЯТОК ДЛЯ АТАК БЕЗ ЖЕРТВ:
-    
-    "Немає загиблих/поранених/великих руйнувань" НЕ означає автоматично
-    "рутинна й неважлива атака".
-    
-    Не відкидай подію як routine_attack, якщо сам контекст створює високу
-    політичну, дипломатичну, військову або міжнародну значущість. Зокрема:
-    - під час атаки у зоні прямого ризику перебували президенти, прем'єри,
-      канцлери, міністри, члени офіційних делегацій, радники керівників держав
-      або інші політики/посадовці світового рівня;
-    - атака безпосередньо зачепила міжнародний потяг, делегацію, дипломатичний
-      маршрут чи інший об'єкт, пов'язаний із такими особами;
-    - інцидент стався біля кордону НАТО/ЄС або містить реальний ризик
-      міжнародної ескалації;
-    - незвичайне поєднання місця, цілі та присутніх осіб саме по собі робить
-      подію важливою для України та міжнародної аудиторії.
-    
-    У таких випадках оцінюй significance за КОНТЕКСТОМ, а не за кількістю жертв:
-    importance, public_interest, national_relevance та urgency можуть бути високими.
-    Такі події зазвичай мають digest_role="core". Не завищуй оцінки механічно,
-    але й не карай їх за відсутність фізичних наслідків.
-    
-    Для атак допускай подію, якщо:
-    - атака масована або комбінована;
-    - є значна кількість жертв;
-    - пошкоджена критична або стратегічна інфраструктура;
-    - є серйозні наслідки для великого міста;
-    - є військовий, політичний або значний економічний результат;
-    - пошкоджено важливий промисловий, логістичний або великий комерційний об'єкт
-      і це має помітне ширше значення;
-    - подія має винятковий характер;
-    - у зоні прямого ризику перебували світові політики, офіційна міжнародна
-      делегація або інші високопосадовці, і цей факт має самостійну
-      геополітичну/дипломатичну вагу навіть без жертв;
-    - інцидент біля кордону НАТО/ЄС або на міжнародному транспорті створює
-      реальний контекст можливої ескалації чи міжнародного резонансу;
-    - з'явився суттєвий новий розвиток уже відомої великої атаки.
-    
-    ━━━━━━━━━━━━━━━━━━━━
-    ГАРЯЧІ ТА КОРОТКІ НОВИНИ.
-    
-    Довжина Telegram-повідомлення НЕ є показником важливості.
-    
-    Короткий пост із одного або двох речень може бути сильнішою новиною
-    за довгий текст.
-    
-    НЕ знижуй importance, novelty, public_interest, curiosity,
-    practical_value або urgency лише через малу довжину повідомлення.
-    
-    Коротка новина може бути eligible_for_digest=true, якщо вона містить
-    самодостатній сильний факт, зокрема:
-    
-    - підтверджене влучання;
-    - серйозні наслідки атаки;
-    - пожежу або пошкодження важливого об'єкта;
-    - удар по значному промисловому підприємству;
-    - удар по енергетичному, логістичному або військовому об'єкту;
-    - незвичну або значущу ціль атаки;
-    - перші підтверджені наслідки великої події;
-    - важливий новий розвиток історії, яка відбувається прямо зараз;
-    - нове правило, яке безпосередньо вплине на людей;
-    - сильний технологічний або науковий факт;
-    - помітне українське виробництво чи досягнення;
-    - незвичайну подію з широким суспільним інтересом.
-    
-    ━━━━━━━━━━━━━━━━━━━━
-    ЦІКАВІСТЬ ТА ПРАКТИЧНА КОРИСТЬ.
-    
-    curiosity:
-    наскільки новина викликає природну реакцію:
-    "О, цього я не знав", "Оце цікаво", "Це варто запам'ятати".
-    
-    Високий curiosity може мати:
-    - незвичайна технологія або відкриття;
-    - цікаве українське виробництво;
-    - неочікувана міжнародна подія;
-    - незвичайний бізнес-кейс;
-    - рекорд;
-    - сильне досягнення;
-    - помітна зміна у звичному житті;
-    - резонансна подія;
-    - конкретний факт, який легко переказати іншій людині.
-    
-    curiosity НЕ означає клікбейт.
-    Не підвищуй оцінку через плітки, шок-контент або дрібний кримінал.
-    
-    practical_value:
-    наскільки інформація реально корисна читачеві.
-    
-    Високий practical_value мають:
-    - зміни правил;
-    - транспорт;
-    - тарифи;
-    - державні сервіси;
-    - соціальні правила;
-    - зміни роботи міст;
-    - обмеження;
-    - нові можливості або сервіси;
-    - рішення, які прямо впливають на повсякденне життя.
-    
-    ━━━━━━━━━━━━━━━━━━━━
-    ФОТО ТА ВІДЕО:
-    
-    Наявність фото або відео сама по собі НЕ робить слабку подію важливою.
-    
-    ОКРЕМЕ ПРАВИЛО ДЛЯ VIDEO-FIRST УДАРІВ:
-    - якщо пост має [ВІДЕО ВЛУЧАННЯ/БЕЗПОСЕРЕДНІХ НАСЛІДКІВ], не карай його
-      за короткий опис;
-    - підтверджене влучання / момент удару / пожежа / руйнування у Києві або
-      обласному центрі має самостійну новинну цінність, особливо якщо у випуску
-      є вільні core-слоти;
-    - так само не губи прямі кадри удару по помітному промисловому,
-      енергетичному, логістичному, транспортному або великому комерційному об'єкту;
-    - така подія зазвичай digest_role="core";
-    - НЕ застосовуй це до тривоги, руху БпЛА, непідтвердженого звуку вибуху,
-      старого/ілюстративного ролика або відео без конкретної прив'язки до події;
-    - history/dedup все одно діють: старе відео тієї самої події не є новиною.
-    
-    Але реальне фото або відео безпосередньо з місця події є
-    додатковим сильним фактором, якщо воно:
-    - показує реальні наслідки значущої події;
-    - є першими кадрами з місця;
-    - додає нову фактичну інформацію;
-    - підтверджує масштаб або характер події;
-    - показує наслідки для важливого об'єкта.
-    
-    Не плутай це зі звичайним ілюстративним фото.
-    
-    ━━━━━━━━━━━━━━━━━━━━
-    ЕТАП 3 — ДЖЕРЕЛА.
-    
-    best_factual_source_id:
-    найкраще джерело для підтвердження фактів.
-    
-    best_media_source_id:
-    джерело з найкращим фото або відео з місця події.
-    
-    Це можуть бути різні джерела.
-    
-    Не став best_media_source_id лише тому, що пост має картинку.
-    Віддавай перевагу медіа, яке за текстом поста схоже саме на кадри
-    з місця події або наслідків.
-    
-    ━━━━━━━━━━━━━━━━━━━━
-    ОЦІНКИ 0-100:
-    
-    importance
-    scale
-    reliability
-    public_interest
-    novelty
-    curiosity
-    practical_value
-    media_quality
-    national_relevance
-    urgency
-    history_update_strength
-    
-    importance:
-    наскільки подія важлива сама по собі.
-    
-    public_interest:
-    наскільки багато читачів реально захочуть про це знати.
-    
-    novelty:
-    наскільки це новий факт або новий розвиток.
-    
-    curiosity:
-    наскільки подія цікава, незвичайна, пізнавальна або запам'ятовується.
-    
-    practical_value:
-    наскільки подія корисна у повсякденному житті читача.
-    
-    urgency:
-    наскільки подія є гарячою і актуальною саме зараз.
-    
-    Високий urgency став, якщо:
-    - подія відбулася щойно або активно розвивається;
-    - з'явилися перші підтверджені наслідки;
-    - це перша достовірна інформація про значущу подію;
-    - з'явилися важливі нові факти або кадри з місця.
-    
-    Сам по собі високий urgency НЕ робить тривогу,
-    рух БпЛА або непідтверджену загрозу головною новиною.
-    
-    event_type:
-    
-    major_attack
-    battlefield_change
-    military_event
-    political_decision
-    international_decision
-    economic_event
-    critical_infrastructure
-    major_accident
-    major_crime
-    science_tech
-    social_event
-    culture_event
-    routine_attack
-    routine_statement
-    minor_local_event
-    minor_accident
-    alert_only
-    other
-    
-    ДОДАТКОВО:
-    
-    headline_hint — короткий, конкретний заголовок.
-    key_facts — 2-6 найважливіших підтверджених фактів.
-    why_it_matters — коротко, чому це важливо, цікаво або корисно.
-    summary — стислий фактологічний опис.
-    rejection_reason — конкретна причина відхилення.
-    is_history_repeat — чи ця сама реальна подія вже є в архіві.
-    
-    digest_role — редакційна роль події:
-    - "core" = важка/головна новина: війна, значуща політика, великі рішення,
-      серйозні наслідки, важлива економіка, безпека, великі суспільні події;
-    - "discovery" = якісна цікавинка для КІНЦЯ випуску: наука, технології,
-      бізнес, виробництво, досягнення, практично корисна зміна, незвичайний
-      факт або інша подія, чия головна сила — curiosity/practical value.
-    
-    is_discovery_candidate=true став лише для справді самодостатньої
-    discovery-події. Не називай discovery звичайну важку новину тільки через
-    високий інтерес аудиторії.
-    
-    Якщо є ⭐ [ПРІОРИТЕТ АДМІНІСТРАТОРА]:
-    - ОБОВ'ЯЗКОВО включи цей пост до однієї з подій у source_ids;
-    - eligible_for_digest=true;
-    - не відкидай його через історію, низьку важливість або тип події;
-    - якщо кілька priority-постів описують одну реальну подію — об'єднай їх;
-    - importance, novelty, urgency, curiosity та інші оцінки виставляй ЧЕСНО
-      за змістом самої події, не завищуй їх автоматично лише через priority.
-    
-    Не створюй події з очевидного шуму серед звичайних постів.
-    Але й не будь надто суворим до якісних discovery-новин.
-    Якщо в потоці є достатньо матеріалу, поверни орієнтовно 10-16 добрих
-    кандидатів різних типів. НЕ зупиняйся штучно на 5 подіях, якщо є інші
-    якісні кандидати. Краще 10-16 добрих кандидатів різних типів,
-    ніж 7 однакових важких новин і пропущені цікаві події.
-    
-    ВІДПОВІДЬ ТІЛЬКИ JSON:
-    
+            else []
+        )
+
+    def _analyze_events(
+        self,
+        posts_context: str,
+        past_events: Optional[
+            Union[
+                List[str],
+                List[Dict[str, str]],
+            ]
+        ],
+        max_retries: int,
+    ) -> List[Dict[str, Any]]:
+        history_block = self._build_history_block(
+            past_events
+        )
+
+        prompt = f"""
+Ти — старший редактор загальноукраїнського новинного Telegram-дайджесту.
+
+ТВОЯ ЗАДАЧА:
+Із потоку Telegram-повідомлень знайти події, які реально заслуговують
+на місце серед головних, найкорисніших ТА найцікавіших новин останніх 4 годин.
+
+Це НЕ звичайна стрічка новин і НЕ збір усіх повідомлень.
+
+Читач відкриває канал кілька разів на день і хоче за кілька хвилин:
+- зрозуміти головне;
+- не пропустити важливе;
+- побачити 1-3 події, про які природно хочеться сказати
+  "О, цього я не знав" або "Цікаво".
+
+Для кожної події запитай:
+"Чи варто знати це людині, яка прочитає лише 7-10 новин?"
+
+Не плутай "цікаво" з клікбейтом.
+Наша мета — не сенсаційність, а сильна інформаційна цінність,
+корисність, новизна та тематичне різноманіття.
+
+━━━━━━━━━━━━━━━━━━━━
+АРХІВ ВЖЕ ОПУБЛІКОВАНИХ ПОДІЙ:
+{history_block}
+━━━━━━━━━━━━━━━━━━━━
+
+ПРАВИЛО ПРО ПОВТОРИ:
+
+Архів — це вже опубліковані новини.
+Не повторюй ту саму реальну подію тільки через новий пост,
+інше формулювання, інший канал або нове фото.
+
+"Та сама подія" означає той самий базовий інцидент, звіт, дослідження,
+оголошення, рішення, операцію або розслідування — навіть якщо новий пост
+подає інший кут, інший заголовок чи додає подробиці. Наприклад, новий список
+методів кібератаки в тому самому звіті про Claude/Anthropic — це уточнення
+тієї самої історії, а не нова подія.
+
+Для атак НЕ склеюй різні удари лише тому, що в них той самий нападник,
+тип зброї або загальна тема. Для однієї атаки мають збігатися конкретна
+локація/ціль/хвиля атаки або інша унікальна прив'язка події.
+
+ОКРЕМЕ ПРАВИЛО ДЛЯ ЗВЕДЕНЬ ППО / ПОВІТРЯНИХ СИЛ:
+агреговану статистику на кшталт "запущено N БпЛА/ракет, збито або подавлено M"
+показуй не частіше ОДНОГО РАЗУ НА 24 ГОДИНИ. Нова хвиля, інші цифри або
+оновлене вечірнє зведення самі по собі не виправдовують ще одну таку новину
+того ж дня. Це правило НЕ стосується окремої події з великими жертвами,
+ударом по критичному/стратегічному об'єкту, значним міжнародним контекстом
+або іншим самостійно важливим наслідком.
+
+ОКРЕМЕ ПРАВИЛО ДЛЯ ЗАКОНІВ / САНКЦІЙ / УГОД / РІШЕНЬ:
+ту саму базову policy-story не повертай у дайджест повторно протягом 24 годин
+лише через інший заголовок, повторний переказ голосування, нові цитати,
+"готовність президента підписати", "має підписати", "передадуть на підпис",
+"очікує підпису" або інше формулювання тієї самої стадії.
+
+ЦЕ НЕ новий юридичний статус:
+- "ухвалили" -> "остаточно ухвалили/схвалили";
+- "Палата підтримала" -> ще один переказ того самого вже відомого ухвалення;
+- "передадуть на підпис" -> "президент готовий/планує підписати";
+- нові деталі пакета без зміни його фактичного статусу.
+
+Справжній material update для такої історії:
+- пропозицію/проєкт ФАКТИЧНО ухвалили;
+- документ ФАКТИЧНО підписано, а не лише обіцяно підписати;
+- він ФАКТИЧНО набув чинності;
+- санкції/мита ФАКТИЧНО запровадили;
+- документ ветували/відхилили або стався інший реальний юридичний результат.
+
+Якщо подія вже є в архіві:
+- is_history_repeat=true;
+- history_update_strength показує силу НОВОГО розвитку від 0 до 100.
+
+history_update_strength 0-39:
+суттєво нового немає — eligible_for_digest=false.
+
+history_update_strength 40-59:
+є невелике уточнення, але його недостатньо для повторної появи
+у короткому дайджесті — зазвичай eligible_for_digest=false.
+
+history_update_strength 60-79:
+є помітне уточнення, але для повторної появи у короткому дайджесті
+цього ще недостатньо — зазвичай eligible_for_digest=false.
+
+history_update_strength 80-100:
+з'явився реально новий значущий розвиток: нові великі наслідки,
+важливе рішення, підтвердження масштабу, нові жертви, новий об'єкт,
+результат операції або інший факт, який змінює картину події.
+Тоді подію можна допустити повторно.
+
+━━━━━━━━━━━━━━━━━━━━
+ЕТАП 1 — ЗГРУПУЙ ПОСТИ У ПОДІЇ.
+
+Одна реальна подія = один event_id.
+
+Об'єднуй:
+- повідомлення про одну атаку;
+- перші дані та подальші уточнення;
+- фото та відео тієї самої події;
+- повідомлення різних каналів про один факт.
+
+Не створюй новий event_id лише через інше формулювання
+або через появу ще одного фото/відео.
+
+━━━━━━━━━━━━━━━━━━━━
+ЕТАП 2 — EDITORIAL GATE.
+
+Для кожної події визнач eligible_for_digest=true або false.
+
+eligible_for_digest=true став, якщо подія має хоча б один сильний фактор:
+
+1. Великий масштаб.
+2. Значні людські наслідки.
+3. Важлива зміна на фронті.
+4. Значне військове рішення або операція.
+5. Важливе рішення української влади.
+6. Важливе рішення США, ЄС, НАТО або великої держави.
+7. Значний міжнародний вплив.
+8. Значні економічні наслідки.
+9. Удар по критичній або стратегічній інфраструктурі.
+10. Великий суспільний резонанс із реальним значенням.
+11. Унікальна або виняткова подія.
+12. Суттєвий новий розвиток великої історії.
+13. Гаряча подія, яка прямо зараз суттєво змінює інформаційну картину.
+14. Підтверджене влучання або наслідки на важливому промисловому,
+    енергетичному, логістичному, військовому чи великому комерційному об'єкті,
+    якщо це має реальне економічне, суспільне або новинне значення.
+15. Висока самостійна цікавість: незвичайна, пізнавальна,
+    технологічна, наукова, бізнесова або суспільна подія,
+    про яку значна частина читачів захоче дізнатися.
+16. Висока практична цінність: зміна правил, тарифів, транспорту,
+    сервісів, інфраструктури або повсякденного життя,
+    яка прямо стосується великої кількості людей.
+17. Помітне українське досягнення: нове виробництво, технологія,
+    винахід, інфраструктурний проєкт, великий контракт або інша подія,
+    яка показує реальну зміну можливостей країни.
+18. Сильна "discovery"-новина: не обов'язково стратегічна,
+    але вона має новизну, конкретику і природно запам'ятовується.
+
+ВАЖЛИВО ПРО РІЗНОМАНІТТЯ:
+
+Короткий дайджест повинен показувати не лише те, що було НАЙВАЖЛИВІШИМ,
+а й те, що було НАЙЦІКАВІШИМ або НАЙКОРИСНІШИМ.
+
+Якщо за останні 4 години є 1-3 сильні технологічні, наукові,
+суспільні, бізнесові, практично корисні чи просто незвичайні події,
+не відкидай їх лише тому, що вони менш стратегічні,
+ніж війна, політика або міжнародні рішення.
+
+Не занижуй подію тільки тому, що вона локальна,
+якщо вона має високу практичну цінність, цікавість або резонанс.
+
+ЗАЗВИЧАЙ ВІДКИДАЙ:
+
+- рутинні обстріли без суттєвих наслідків;
+- локальні пошкодження без ширшого значення;
+- 1-2 поранених без інших значних факторів;
+- тривоги;
+- рух БпЛА;
+- загрози ракет без підтверджених наслідків;
+- дрібні ДТП;
+- локальні побутові пожежі;
+- дрібний кримінал без широкого резонансу;
+- комунальні аварії без значного впливу;
+- заяви політиків без реального рішення;
+- повтори старих новин;
+- чутки;
+- клікбейтні курйози без інформаційної цінності;
+- плітки про знаменитостей;
+- контент, єдина цінність якого — шок або емоція;
+- внутрішній російський lifestyle/trivia/туризм та побутові "цікаві факти"
+  про РФ без прямої користі/наслідків для України або помітного міжнародного
+  значення. Це НЕ стосується війни, санкцій, економіки РФ, військової
+  промисловості, енергетики, дипломатії та інших подій, що впливають на Україну.
+
+КРИТИЧНИЙ ВИНЯТОК ДЛЯ АТАК БЕЗ ЖЕРТВ:
+
+"Немає загиблих/поранених/великих руйнувань" НЕ означає автоматично
+"рутинна й неважлива атака".
+
+Не відкидай подію як routine_attack, якщо сам контекст створює високу
+політичну, дипломатичну, військову або міжнародну значущість. Зокрема:
+- під час атаки у зоні прямого ризику перебували президенти, прем'єри,
+  канцлери, міністри, члени офіційних делегацій, радники керівників держав
+  або інші політики/посадовці світового рівня;
+- атака безпосередньо зачепила міжнародний потяг, делегацію, дипломатичний
+  маршрут чи інший об'єкт, пов'язаний із такими особами;
+- інцидент стався біля кордону НАТО/ЄС або містить реальний ризик
+  міжнародної ескалації;
+- незвичайне поєднання місця, цілі та присутніх осіб саме по собі робить
+  подію важливою для України та міжнародної аудиторії.
+
+У таких випадках оцінюй significance за КОНТЕКСТОМ, а не за кількістю жертв:
+importance, public_interest, national_relevance та urgency можуть бути високими.
+Такі події зазвичай мають digest_role="core". Не завищуй оцінки механічно,
+але й не карай їх за відсутність фізичних наслідків.
+
+Для атак допускай подію, якщо:
+- атака масована або комбінована;
+- є значна кількість жертв;
+- пошкоджена критична або стратегічна інфраструктура;
+- є серйозні наслідки для великого міста;
+- є військовий, політичний або значний економічний результат;
+- пошкоджено важливий промисловий, логістичний або великий комерційний об'єкт
+  і це має помітне ширше значення;
+- подія має винятковий характер;
+- у зоні прямого ризику перебували світові політики, офіційна міжнародна
+  делегація або інші високопосадовці, і цей факт має самостійну
+  геополітичну/дипломатичну вагу навіть без жертв;
+- інцидент біля кордону НАТО/ЄС або на міжнародному транспорті створює
+  реальний контекст можливої ескалації чи міжнародного резонансу;
+- з'явився суттєвий новий розвиток уже відомої великої атаки.
+
+━━━━━━━━━━━━━━━━━━━━
+ГАРЯЧІ ТА КОРОТКІ НОВИНИ.
+
+Довжина Telegram-повідомлення НЕ є показником важливості.
+
+Короткий пост із одного або двох речень може бути сильнішою новиною
+за довгий текст.
+
+НЕ знижуй importance, novelty, public_interest, curiosity,
+practical_value або urgency лише через малу довжину повідомлення.
+
+Коротка новина може бути eligible_for_digest=true, якщо вона містить
+самодостатній сильний факт, зокрема:
+
+- підтверджене влучання;
+- серйозні наслідки атаки;
+- пожежу або пошкодження важливого об'єкта;
+- удар по значному промисловому підприємству;
+- удар по енергетичному, логістичному або військовому об'єкту;
+- незвичну або значущу ціль атаки;
+- перші підтверджені наслідки великої події;
+- важливий новий розвиток історії, яка відбувається прямо зараз;
+- нове правило, яке безпосередньо вплине на людей;
+- сильний технологічний або науковий факт;
+- помітне українське виробництво чи досягнення;
+- незвичайну подію з широким суспільним інтересом.
+
+━━━━━━━━━━━━━━━━━━━━
+ЦІКАВІСТЬ ТА ПРАКТИЧНА КОРИСТЬ.
+
+curiosity:
+наскільки новина викликає природну реакцію:
+"О, цього я не знав", "Оце цікаво", "Це варто запам'ятати".
+
+Високий curiosity може мати:
+- незвичайна технологія або відкриття;
+- цікаве українське виробництво;
+- неочікувана міжнародна подія;
+- незвичайний бізнес-кейс;
+- рекорд;
+- сильне досягнення;
+- помітна зміна у звичному житті;
+- резонансна подія;
+- конкретний факт, який легко переказати іншій людині.
+
+curiosity НЕ означає клікбейт.
+Не підвищуй оцінку через плітки, шок-контент або дрібний кримінал.
+
+practical_value:
+наскільки інформація реально корисна читачеві.
+
+Високий practical_value мають:
+- зміни правил;
+- транспорт;
+- тарифи;
+- державні сервіси;
+- соціальні правила;
+- зміни роботи міст;
+- обмеження;
+- нові можливості або сервіси;
+- рішення, які прямо впливають на повсякденне життя.
+
+━━━━━━━━━━━━━━━━━━━━
+ФОТО ТА ВІДЕО:
+
+Наявність фото або відео сама по собі НЕ робить слабку подію важливою.
+
+ОКРЕМЕ ПРАВИЛО ДЛЯ VIDEO-FIRST УДАРІВ:
+- якщо пост має [ВІДЕО ВЛУЧАННЯ/БЕЗПОСЕРЕДНІХ НАСЛІДКІВ], не карай його
+  за короткий опис;
+- підтверджене влучання / момент удару / пожежа / руйнування у Києві або
+  обласному центрі має самостійну новинну цінність, особливо якщо у випуску
+  є вільні core-слоти;
+- так само не губи прямі кадри удару по помітному промисловому,
+  енергетичному, логістичному, транспортному або великому комерційному об'єкту;
+- така подія зазвичай digest_role="core";
+- НЕ застосовуй це до тривоги, руху БпЛА, непідтвердженого звуку вибуху,
+  старого/ілюстративного ролика або відео без конкретної прив'язки до події;
+- history/dedup все одно діють: старе відео тієї самої події не є новиною.
+
+Але реальне фото або відео безпосередньо з місця події є
+додатковим сильним фактором, якщо воно:
+- показує реальні наслідки значущої події;
+- є першими кадрами з місця;
+- додає нову фактичну інформацію;
+- підтверджує масштаб або характер події;
+- показує наслідки для важливого об'єкта.
+
+Не плутай це зі звичайним ілюстративним фото.
+
+━━━━━━━━━━━━━━━━━━━━
+ЕТАП 3 — ДЖЕРЕЛА.
+
+best_factual_source_id:
+найкраще джерело для підтвердження фактів.
+
+best_media_source_id:
+джерело з найкращим фото або відео з місця події.
+
+Це можуть бути різні джерела.
+
+Не став best_media_source_id лише тому, що пост має картинку.
+Віддавай перевагу медіа, яке за текстом поста схоже саме на кадри
+з місця події або наслідків.
+
+━━━━━━━━━━━━━━━━━━━━
+ОЦІНКИ 0-100:
+
+importance
+scale
+reliability
+public_interest
+novelty
+curiosity
+practical_value
+media_quality
+national_relevance
+urgency
+history_update_strength
+
+importance:
+наскільки подія важлива сама по собі.
+
+public_interest:
+наскільки багато читачів реально захочуть про це знати.
+
+novelty:
+наскільки це новий факт або новий розвиток.
+
+curiosity:
+наскільки подія цікава, незвичайна, пізнавальна або запам'ятовується.
+
+practical_value:
+наскільки подія корисна у повсякденному житті читача.
+
+urgency:
+наскільки подія є гарячою і актуальною саме зараз.
+
+Високий urgency став, якщо:
+- подія відбулася щойно або активно розвивається;
+- з'явилися перші підтверджені наслідки;
+- це перша достовірна інформація про значущу подію;
+- з'явилися важливі нові факти або кадри з місця.
+
+Сам по собі високий urgency НЕ робить тривогу,
+рух БпЛА або непідтверджену загрозу головною новиною.
+
+event_type:
+
+major_attack
+battlefield_change
+military_event
+political_decision
+international_decision
+economic_event
+critical_infrastructure
+major_accident
+major_crime
+science_tech
+social_event
+culture_event
+routine_attack
+routine_statement
+minor_local_event
+minor_accident
+alert_only
+other
+
+ДОДАТКОВО:
+
+headline_hint — короткий, конкретний заголовок.
+key_facts — 2-6 найважливіших підтверджених фактів.
+why_it_matters — коротко, чому це важливо, цікаво або корисно.
+summary — стислий фактологічний опис.
+rejection_reason — конкретна причина відхилення.
+is_history_repeat — чи ця сама реальна подія вже є в архіві.
+
+digest_role — редакційна роль події:
+- "core" = важка/головна новина: війна, значуща політика, великі рішення,
+  серйозні наслідки, важлива економіка, безпека, великі суспільні події;
+- "discovery" = якісна цікавинка для КІНЦЯ випуску: наука, технології,
+  бізнес, виробництво, досягнення, практично корисна зміна, незвичайний
+  факт або інша подія, чия головна сила — curiosity/practical value.
+
+is_discovery_candidate=true став лише для справді самодостатньої
+discovery-події. Не називай discovery звичайну важку новину тільки через
+високий інтерес аудиторії.
+
+Якщо є ⭐ [ПРІОРИТЕТ АДМІНІСТРАТОРА]:
+- ОБОВ'ЯЗКОВО включи цей пост до однієї з подій у source_ids;
+- eligible_for_digest=true;
+- не відкидай його через історію, низьку важливість або тип події;
+- якщо кілька priority-постів описують одну реальну подію — об'єднай їх;
+- importance, novelty, urgency, curiosity та інші оцінки виставляй ЧЕСНО
+  за змістом самої події, не завищуй їх автоматично лише через priority.
+
+Не створюй події з очевидного шуму серед звичайних постів.
+Але й не будь надто суворим до якісних discovery-новин.
+Якщо в потоці є достатньо матеріалу, поверни орієнтовно 10-16 добрих
+кандидатів різних типів. НЕ зупиняйся штучно на 5 подіях, якщо є інші
+якісні кандидати. Краще 10-16 добрих кандидатів різних типів,
+ніж 7 однакових важких новин і пропущені цікаві події.
+
+ВІДПОВІДЬ ТІЛЬКИ JSON:
+
+{{
+  "events": [
     {{
-      "events": [
-        {{
-          "event_id": "E1",
-          "source_ids": [0, 2, 5],
-          "best_factual_source_id": 0,
-          "best_media_source_id": 5,
-          "eligible_for_digest": true,
-          "rejection_reason": "",
-          "digest_role": "core",
-          "is_discovery_candidate": false,
-          "event_type": "major_attack",
-          "category": "war",
-          "importance": 94,
-          "scale": 88,
-          "reliability": 93,
-          "public_interest": 91,
-          "novelty": 82,
-          "curiosity": 68,
-          "practical_value": 20,
-          "media_quality": 95,
-          "national_relevance": 94,
-          "urgency": 91,
-          "is_history_repeat": false,
-          "history_update_strength": 0,
-          "headline_hint": "Масована атака на Одесу",
-          "key_facts": ["Факт 1", "Факт 2", "Факт 3"],
-          "why_it_matters": "Коротке пояснення.",
-          "summary": "Фактологічний опис."
-        }}
-      ]
+      "event_id": "E1",
+      "source_ids": [0, 2, 5],
+      "best_factual_source_id": 0,
+      "best_media_source_id": 5,
+      "eligible_for_digest": true,
+      "rejection_reason": "",
+      "digest_role": "core",
+      "is_discovery_candidate": false,
+      "event_type": "major_attack",
+      "category": "war",
+      "importance": 94,
+      "scale": 88,
+      "reliability": 93,
+      "public_interest": 91,
+      "novelty": 82,
+      "curiosity": 68,
+      "practical_value": 20,
+      "media_quality": 95,
+      "national_relevance": 94,
+      "urgency": 91,
+      "is_history_repeat": false,
+      "history_update_strength": 0,
+      "headline_hint": "Масована атака на Одесу",
+      "key_facts": ["Факт 1", "Факт 2", "Факт 3"],
+      "why_it_matters": "Коротке пояснення.",
+      "summary": "Фактологічний опис."
     }}
-    
-    TELEGRAM POSTS:
-    {posts_context}
-    """
-    
-            data = self._call_json_with_cascade(
-                prompt,
-                max_retries,
-                "ANALYZER",
-                temperature=0.15,
+  ]
+}}
+
+TELEGRAM POSTS:
+{posts_context}
+"""
+
+        data = self._call_json_with_cascade(
+            prompt,
+            max_retries,
+            "ANALYZER",
+            temperature=0.15,
+        )
+
+        # None = технічний failure cascade. Порожній list = валідна
+        # JSON-відповідь, у якій Analyzer свідомо не знайшов подій.
+        if data is None:
+            return None
+
+        events = data.get("events")
+        return events if isinstance(events, list) else []
+
+    def _recover_after_analyzer_failure(
+        self,
+        posts: List[Dict[str, Any]],
+        past_events: Optional[
+            Union[
+                List[str],
+                List[Dict[str, str]],
+            ]
+        ],
+        max_retries: int,
+    ) -> List[Dict[str, Any]]:
+        """
+        Recovery після ТЕХНІЧНОГО провалу основного 50k Analyzer.
+
+        Градація навмисно м'яка:
+        1) повний Analyzer на 40k;
+        2) повний Analyzer на 30k;
+        3) лише потім emergency 26k / max 6 events;
+        4) Python synthetic fallback — тільки якщо Gemini недоступний і там.
+
+        40k/30k використовують ТОЙ САМИЙ широкий prompt, тому це не аварійний
+        скорочений випуск, а спроба зберегти нормальні 10-16 кандидатів.
+        """
+        compact_retries = max(
+            1,
+            min(
+                int(max_retries or 1),
+                self.FULL_ANALYZER_RECOVERY_RETRIES_PER_MODEL,
+            ),
+        )
+
+        for char_limit in self.FULL_ANALYZER_RECOVERY_CHAR_LIMITS:
+            compact_context = self._build_posts_context(
+                posts,
+                max_chars=char_limit,
             )
-    
-            # None = технічний failure cascade. Порожній list = валідна
-            # JSON-відповідь, у якій Analyzer свідомо не знайшов подій.
-            if data is None:
-                return None
-    
-            events = data.get("events")
-            return events if isinstance(events, list) else []
-    
-        def _recover_after_analyzer_failure(
-            self,
-            posts: List[Dict[str, Any]],
-            past_events: Optional[
-                Union[
-                    List[str],
-                    List[Dict[str, str]],
-                ]
-            ],
-            max_retries: int,
-        ) -> List[Dict[str, Any]]:
-            """
-            Recovery після ТЕХНІЧНОГО провалу основного 50k Analyzer.
-    
-            Градація навмисно м'яка:
-            1) повний Analyzer на 40k;
-            2) повний Analyzer на 30k;
-            3) лише потім emergency 26k / max 6 events;
-            4) Python synthetic fallback — тільки якщо Gemini недоступний і там.
-    
-            40k/30k використовують ТОЙ САМИЙ широкий prompt, тому це не аварійний
-            скорочений випуск, а спроба зберегти нормальні 10-16 кандидатів.
-            """
-            compact_retries = max(
-                1,
-                min(
-                    int(max_retries or 1),
-                    self.FULL_ANALYZER_RECOVERY_RETRIES_PER_MODEL,
-                ),
+            if not compact_context:
+                continue
+
+            logger.warning(
+                "FULL ANALYZER RECOVERY: повторюємо повний Analyzer "
+                "на контексті до %s символів (retries/model=%s).",
+                char_limit,
+                compact_retries,
             )
-    
-            for char_limit in self.FULL_ANALYZER_RECOVERY_CHAR_LIMITS:
-                compact_context = self._build_posts_context(
-                    posts,
-                    max_chars=char_limit,
-                )
-                if not compact_context:
-                    continue
-    
+
+            recovered = self._analyze_events(
+                compact_context,
+                past_events,
+                compact_retries,
+            )
+
+            if recovered:
                 logger.warning(
-                    "FULL ANALYZER RECOVERY: повторюємо повний Analyzer "
-                    "на контексті до %s символів (retries/model=%s).",
-                    char_limit,
-                    compact_retries,
+                    "FULL ANALYZER RECOVERY %sk recovered %s подій; "
+                    "emergency не потрібен.",
+                    int(char_limit / 1000),
+                    len(recovered),
                 )
-    
-                recovered = self._analyze_events(
-                    compact_context,
-                    past_events,
-                    compact_retries,
+                return recovered
+
+            if recovered is None:
+                logger.warning(
+                    "FULL ANALYZER RECOVERY %sk теж технічно не дав "
+                    "валідної JSON-відповіді. Переходимо до меншого контексту.",
+                    int(char_limit / 1000),
                 )
-    
+            else:
+                logger.warning(
+                    "FULL ANALYZER RECOVERY %sk повернув events=[]. "
+                    "Після технічного failure основного pass перевіряємо "
+                    "ще наступний компактніший рівень.",
+                    int(char_limit / 1000),
+                )
+
+        emergency_context = self._build_posts_context(
+            posts,
+            max_chars=self.EMERGENCY_ANALYZER_MAX_CHARS,
+        )
+
+        if emergency_context:
+            logger.warning(
+                "EMERGENCY ANALYZER: 50k -> 40k -> 30k не дали подій. "
+                "Запускаємо останній компактний recovery (ліміт=%s, max_events=%s).",
+                self.EMERGENCY_ANALYZER_MAX_CHARS,
+                self.EMERGENCY_ANALYZER_MAX_EVENTS,
+            )
+
+            recovered = self._analyze_emergency_events(
+                emergency_context,
+                past_events,
+                max_retries,
+            )
+
+            if recovered is not None:
                 if recovered:
                     logger.warning(
-                        "FULL ANALYZER RECOVERY %sk recovered %s подій; "
-                        "emergency не потрібен.",
-                        int(char_limit / 1000),
+                        "EMERGENCY ANALYZER recovered %s подій після "
+                        "невдалого full cascade 50k -> 40k -> 30k.",
                         len(recovered),
                     )
                     return recovered
-    
-                if recovered is None:
-                    logger.warning(
-                        "FULL ANALYZER RECOVERY %sk теж технічно не дав "
-                        "валідної JSON-відповіді. Переходимо до меншого контексту.",
-                        int(char_limit / 1000),
-                    )
-                else:
-                    logger.warning(
-                        "FULL ANALYZER RECOVERY %sk повернув events=[]. "
-                        "Після технічного failure основного pass перевіряємо "
-                        "ще наступний компактніший рівень.",
-                        int(char_limit / 1000),
-                    )
-    
-            emergency_context = self._build_posts_context(
-                posts,
-                max_chars=self.EMERGENCY_ANALYZER_MAX_CHARS,
-            )
-    
-            if emergency_context:
+
                 logger.warning(
-                    "EMERGENCY ANALYZER: 50k -> 40k -> 30k не дали подій. "
-                    "Запускаємо останній компактний recovery (ліміт=%s, max_events=%s).",
-                    self.EMERGENCY_ANALYZER_MAX_CHARS,
-                    self.EMERGENCY_ANALYZER_MAX_EVENTS,
+                    "EMERGENCY ANALYZER успішно відповів, але не знайшов "
+                    "придатних подій."
                 )
-    
-                recovered = self._analyze_emergency_events(
-                    emergency_context,
-                    past_events,
-                    max_retries,
-                )
-    
-                if recovered is not None:
-                    if recovered:
-                        logger.warning(
-                            "EMERGENCY ANALYZER recovered %s подій після "
-                            "невдалого full cascade 50k -> 40k -> 30k.",
-                            len(recovered),
-                        )
-                        return recovered
-    
-                    logger.warning(
-                        "EMERGENCY ANALYZER успішно відповів, але не знайшов "
-                        "придатних подій."
-                    )
-                    return []
-    
-            synthetic = self._build_emergency_synthetic_events(posts)
-            if synthetic:
-                logger.error(
-                    "EMERGENCY PYTHON FALLBACK: Gemini недоступний і для recovery. "
-                    "Створено %s synthetic candidate(s); вони ще пройдуть "
-                    "звичайні history/ranking gates.",
-                    len(synthetic),
-                )
-            else:
-                logger.error(
-                    "EMERGENCY PYTHON FALLBACK: не вдалося сформувати жодного "
-                    "безпечного synthetic candidate."
-                )
-    
-            return synthetic
-    
-        def _analyze_emergency_events(
-            self,
-            posts_context: str,
-            past_events: Optional[
-                Union[
-                    List[str],
-                    List[Dict[str, str]],
-                ]
-            ],
-            max_retries: int,
-        ) -> Optional[List[Dict[str, Any]]]:
-            history_block = self._build_history_block(past_events)
-    
-            prompt = f"""
-    Ти — аварійний редактор українського Telegram-дайджесту.
-    
-    Основний Analyzer технічно не зміг повернути валідний JSON. Зараз у тебе
-    КОРОТШИЙ контекст. Знайди максимум {self.EMERGENCY_ANALYZER_MAX_EVENTS}
-    найсильніших САМОСТІЙНИХ подій останніх 4 годин.
-    
-    Правила:
-    - не вигадуй фактів;
-    - одна реальна подія = один event;
-    - об'єднуй дублікати різних каналів;
-    - не бери тривоги, рух БпЛА, чутки, дрібний кримінал і побутовий шум;
-    - сильна атака, важливе рішення, велика аварія/злочин, значуща економічна,
-      міжнародна, технологічна або практично корисна подія може бути eligible;
-    - для атак не склеюй різні удари без спільної конкретної локації/цілі/хвилі;
-    - якщо та сама подія вже є в архіві, став is_history_repeat=true;
-    - повтор без справді значущого розвитку став eligible_for_digest=false;
-    - поверни КРАЩЕ 1-3 сильні події, ніж слабкі заповнювачі;
-    - response має бути одним компактним JSON object без Markdown.
-    
-    АРХІВ:
-    {history_block}
-    
-    ВІДПОВІДЬ ТІЛЬКИ JSON:
-    {{
-      "events": [
-        {{
-          "event_id": "ER1",
-          "source_ids": [12],
-          "best_factual_source_id": 12,
-          "best_media_source_id": 12,
-          "eligible_for_digest": true,
-          "rejection_reason": "",
-          "digest_role": "core",
-          "is_discovery_candidate": false,
-          "event_type": "other",
-          "category": "other",
-          "importance": 75,
-          "scale": 65,
-          "reliability": 80,
-          "public_interest": 75,
-          "novelty": 80,
-          "curiosity": 65,
-          "practical_value": 40,
-          "media_quality": 70,
-          "national_relevance": 70,
-          "urgency": 80,
-          "is_history_repeat": false,
-          "history_update_strength": 0,
-          "headline_hint": "Короткий конкретний заголовок",
-          "key_facts": ["Факт 1", "Факт 2"],
-          "why_it_matters": "Коротко.",
-          "summary": "Стислий фактологічний опис."
-        }}
-      ]
-    }}
-    
-    TELEGRAM POSTS:
-    {posts_context}
-    """
-    
-            data = self._call_json_with_cascade(
-                prompt,
-                max_retries,
-                "EMERGENCY_ANALYZER",
-                temperature=0.08,
-            )
-    
-            if data is None:
-                return None
-    
-            events = data.get("events")
-            return events if isinstance(events, list) else []
-    
-        def _build_emergency_synthetic_events(
-            self,
-            posts: List[Dict[str, Any]],
-        ) -> List[Dict[str, Any]]:
-            """
-            Остання страховка без LLM.
-    
-            Вона не публікує сирі пости напряму: лише створює до трьох candidate
-            events. Далі їх обов'язково перевіряють current dedup, history guard,
-            semantic review (якщо API ожив), ranking та Editor/fallback.
-            """
-            now_utc = datetime.now(timezone.utc)
-            candidates: List[tuple] = []
-    
-            for source_id, post in enumerate(posts):
-                text = str(post.get("text") or "").strip()
-                if not text or post.get("is_priority"):
-                    # Manual має власну абсолютну priority-recovery.
-                    continue
-    
-                normalized = self._normalize_similarity_text(text)
-                if len(normalized) < 35:
-                    continue
-    
-                # Не підтягуємо очевидний оперативний шум у аварійний випуск.
-                noise_markers = (
-                    "повітряна тривога",
-                    "відбій тривоги",
-                    "рух бпла",
-                    "рух шахед",
-                    "загроза баліст",
-                    "загроза застосування",
-                )
-                if any(marker in normalized for marker in noise_markers):
-                    continue
-    
-                views = int(post.get("views") or 0)
-                forwards = int(post.get("forwards") or 0)
-                replies = int(post.get("replies") or 0)
-                username = (
-                    str(post.get("channel_username") or "")
-                    .replace("@", "")
-                    .strip()
-                )
-    
-                score = (
-                    min(math.log10(max(views, 1)) * 4.0, 26.0)
-                    + min(math.log10(max(forwards, 1)) * 3.0, 12.0)
-                    + min(math.log10(max(replies, 1)) * 2.0, 8.0)
-                ) * self._get_source_multiplier(username)
-    
-                if post.get("has_video"):
-                    score += 5.0
-                elif post.get("has_media"):
-                    score += 2.5
-    
-                post_date = post.get("date")
-                if isinstance(post_date, datetime):
-                    if post_date.tzinfo is None:
-                        post_date = post_date.replace(tzinfo=timezone.utc)
-                    age_minutes = max(
-                        0.0,
-                        (now_utc - post_date.astimezone(timezone.utc)).total_seconds()
-                        / 60.0,
-                    )
-                    score += max(0.0, 8.0 * (1.0 - min(age_minutes, 240.0) / 240.0))
-    
-                # Сильні factual-маркери піднімають кандидата, але не гарантують
-                # публікацію: справжній quality gate іде пізніше.
-                strong_markers = (
-                    "загин", "поран", "зруйн", "знищ", "влуч", "масован",
-                    "ухвал", "схвал", "підпис", "санкц", "млрд", "мільярд",
-                    "евакуац", "затрим", "підозр", "вирок", "контракт",
-                    "запуст", "відкрив", "вперше", "рекорд",
-                )
-                score += min(
-                    sum(1 for marker in strong_markers if marker in normalized) * 3.0,
-                    15.0,
-                )
-    
-                candidates.append((score, source_id, text))
-    
-            candidates.sort(key=lambda item: item[0], reverse=True)
-    
-            selected_ids: List[int] = []
-            for _, source_id, text in candidates:
-                if any(
-                    self._texts_same_event(
-                        text,
-                        str(posts[other_id].get("text") or ""),
-                    )
-                    for other_id in selected_ids
-                ):
-                    continue
-    
-                selected_ids.append(source_id)
-                if len(selected_ids) >= self.EMERGENCY_SYNTHETIC_MAX_EVENTS:
-                    break
-    
-            result: List[Dict[str, Any]] = []
-            for sequence, source_id in enumerate(selected_ids, start=1):
-                event = self._build_synthetic_priority_event(
-                    [source_id],
-                    posts,
-                    sequence,
-                )
-                event["event_id"] = f"ER_SYNTH_{sequence}"
-                event["eligible_for_digest"] = True
-                event["rejection_reason"] = ""
-                # Не маскуємо fallback під manual.
-                event["emergency_synthetic"] = True
-                result.append(event)
-    
-            return result
-    
-        def _ensure_direct_impact_video_events(
-            self,
-            events: List[Dict[str, Any]],
-            posts: List[Dict[str, Any]],
-        ) -> List[Dict[str, Any]]:
-            """
-            Recovery для short video-first ударів, які Analyzer міг не повернути.
-    
-            Це НЕ auto-publish: synthetic event далі проходить dedup, history,
-            semantic review, ranking, Editor і FINAL_FACT_CHECK. Максимум кілька
-            найсильніших missing-постів, щоб воєнні відео не забили весь дайджест.
-            """
-            result = [dict(ev) for ev in (events or []) if isinstance(ev, dict)]
-            covered = {
-                source_id
-                for ev in result
-                for source_id in self._valid_source_ids(ev.get("source_ids"), posts)
-            }
-    
-            candidates = []
-            now_utc = datetime.now(timezone.utc)
-            for source_id, post in enumerate(posts):
-                if source_id in covered or post.get("is_priority"):
-                    continue
-                if not self._is_direct_impact_video_post(post):
-                    continue
-    
-                views = int(post.get("views") or 0)
-                forwards = int(post.get("forwards") or 0)
-                username = str(post.get("channel_username") or "").replace("@", "").strip()
-                score = (
-                    min(math.log10(max(views, 1)) * 3.0, 18.0)
-                    + min(math.log10(max(forwards, 1)) * 2.0, 8.0)
-                ) * self._get_source_multiplier(username)
-    
-                post_date = post.get("date")
-                if isinstance(post_date, datetime):
-                    if post_date.tzinfo is None:
-                        post_date = post_date.replace(tzinfo=timezone.utc)
-                    age_minutes = max(
-                        0.0,
-                        (now_utc - post_date.astimezone(timezone.utc)).total_seconds() / 60.0,
-                    )
-                    score += max(0.0, 8.0 * (1.0 - min(age_minutes, 240.0) / 240.0))
-    
-                candidates.append((score, source_id))
-    
-            candidates.sort(reverse=True)
-            added = 0
-            for _, source_id in candidates[: self.DIRECT_IMPACT_VIDEO_RECOVERY_MAX]:
-                event = self._build_direct_impact_video_event(source_id, posts)
-                event["event_id"] = self._unique_event_id(
-                    str(event.get("event_id") or f"IMPACT_VIDEO_{source_id}"),
-                    result,
-                )
-                result.append(event)
-                added += 1
-    
-            if added:
-                logger.info(
-                    "Direct-impact-video recovery: додано %s missing candidate(s) до history/ranking pipeline.",
-                    added,
-                )
-            return result
-    
-        def _build_direct_impact_video_event(
-            self,
-            source_id: int,
-            posts: List[Dict[str, Any]],
-        ) -> Dict[str, Any]:
-            post = posts[source_id]
-            source_text = str(post.get("text") or "").strip()
-            sentences = self._extract_sentences(source_text)
-            if not sentences and source_text:
-                sentences = [source_text]
-    
-            headline = self._priority_headline_from_text(source_text) or "Кадри наслідків удару"
-            summary_parts = [
-                self._ensure_sentence_end(sentence)
-                for sentence in sentences[:2]
-                if sentence.strip()
-            ]
-            summary = " ".join(summary_parts).strip()
-            key_facts = [
-                self._ensure_sentence_end(sentence)
-                for sentence in sentences[:4]
-                if sentence.strip()
-            ]
-    
-            return {
-                "event_id": f"IMPACT_VIDEO_{source_id}",
-                "source_ids": [source_id],
-                "best_factual_source_id": source_id,
-                "best_media_source_id": source_id,
-                "eligible_for_digest": True,
-                "rejection_reason": "",
-                "digest_role": "core",
-                "is_discovery_candidate": False,
-                "event_type": "routine_attack",
-                "category": "war",
-                # Консервативні оцінки: recovery лише повертає кандидата в гру.
-                # Він не повинен автоматично обігнати сильні національні події.
-                "importance": 62,
-                "scale": 55,
-                "reliability": 72,
-                "public_interest": 78,
-                "novelty": 72,
-                "curiosity": 70,
-                "practical_value": 30,
-                "media_quality": 88,
-                "national_relevance": 66,
-                "urgency": 84,
-                "is_history_repeat": False,
-                "history_update_strength": 0,
-                "headline_hint": headline,
-                "key_facts": key_facts,
-                "why_it_matters": "Прямі кадри конкретного удару або його безпосередніх наслідків.",
-                "summary": summary,
-                "direct_impact_video": True,
-            }
-    
-        def _get_priority_post_ids(
-            self,
-            posts: List[Dict[str, Any]],
-        ) -> List[int]:
-            return [
-                idx
-                for idx, post in enumerate(posts)
-                if (
-                    bool(post.get("is_priority"))
-                    and bool((post.get("text") or "").strip())
-                )
-            ]
-    
-        def _priority_source_ids_for_event(
-            self,
-            event: Dict[str, Any],
-            posts: List[Dict[str, Any]],
-        ) -> List[int]:
-            priority_ids = set(self._get_priority_post_ids(posts))
-            return [
-                source_id
-                for source_id in self._valid_source_ids(event.get("source_ids"), posts)
-                if source_id in priority_ids
-            ]
-    
-        def _priority_posts_definitely_same_event(
-            self,
-            left_id: int,
-            right_id: int,
-            posts: List[Dict[str, Any]],
-        ) -> bool:
-            """
-            Дуже строгий manual-to-manual matcher.
-    
-            Для ручних постів false merge гірший за зайвий дубль: адміністратор уже
-            свідомо вибрав кожен матеріал. Тому склеюємо їх лише при майже явній
-            тотожності тексту/події; generic attack similarity тут недостатня.
-            """
-            if left_id == right_id:
-                return True
-            if not (0 <= left_id < len(posts) and 0 <= right_id < len(posts)):
-                return False
-    
-            left = self._normalize_similarity_text(posts[left_id].get("text") or "")
-            right = self._normalize_similarity_text(posts[right_id].get("text") or "")
-            if not left or not right:
-                return False
-            if left == right:
-                return True
-    
-            # Різні явно названі обласні центри для фізичних атак = різні події.
-            if self._looks_like_attack_text(left) and self._looks_like_attack_text(right):
-                left_centers = self._regional_center_names(left)
-                right_centers = self._regional_center_names(right)
-                if left_centers and right_centers and left_centers.isdisjoint(right_centers):
-                    return False
-    
-            shorter = min(len(left), len(right))
-            longer = max(len(left), len(right))
-            if shorter >= 35 and (left in right or right in left):
-                if shorter / max(longer, 1) >= 0.78:
-                    return True
-    
-            seq = SequenceMatcher(None, left[:1400], right[:1400]).ratio()
-            tokens_left = set(re.findall(r"[0-9a-zа-яіїєґёъыэ-]{3,}", left))
-            tokens_right = set(re.findall(r"[0-9a-zа-яіїєґёъыэ-]{3,}", right))
-            if not tokens_left or not tokens_right:
-                return seq >= 0.92
-    
-            common = tokens_left & tokens_right
-            overlap = len(common) / max(min(len(tokens_left), len(tokens_right)), 1)
-            jaccard = len(common) / max(len(tokens_left | tokens_right), 1)
-            return (
-                seq >= 0.88
-                and len(common) >= 5
-                and overlap >= 0.70
-                and jaccard >= 0.52
-            )
-    
-        @staticmethod
-        def _regional_center_names(text: str) -> set:
-            t = NewsSummarizer._normalize_similarity_text(text)
-            aliases = {
-                "kyiv": ("київ", "києві", "києва", "києву", "києвом", "київськ"),
-                "vinnytsia": ("вінниця", "вінниці", "вінницьк"),
-                "lutsk": ("луцьк", "луцьку", "луцька"),
-                "dnipro": ("дніпро", "дніпрі", "дніпра"),
-                "donetsk": ("донецьк", "донецьку", "донецька"),
-                "zhytomyr": ("житомир", "житомирі", "житомира"),
-                "uzhhorod": ("ужгород", "ужгороді", "ужгорода"),
-                "zaporizhzhia": ("запоріжжя", "запоріжжі", "запорізьк"),
-                "ivano-frankivsk": ("івано-франківськ", "івано-франківську"),
-                "kropyvnytskyi": ("кропивницький", "кропивницькому"),
-                "luhansk": ("луганськ", "луганську", "луганська"),
-                "lviv": ("львів", "львові", "львова", "львову", "львівськ"),
-                "mykolaiv": ("миколаїв", "миколаєві", "миколаєва"),
-                "odesa": ("одеса", "одесі", "одесу", "одеськ"),
-                "poltava": ("полтава", "полтаві", "полтаву", "полтавськ"),
-                "rivne": ("рівне", "рівному", "рівненськ"),
-                "sumy": ("суми", "сумах", "сумськ"),
-                "ternopil": ("тернопіль", "тернополі", "тернопільськ"),
-                "kharkiv": ("харків", "харкові", "харкова", "харкову", "харківськ"),
-                "kherson": ("херсон", "херсоні", "херсона", "херсонськ"),
-                "khmelnytskyi": ("хмельницький", "хмельницькому"),
-                "cherkasy": ("черкаси", "черкасах", "черкаськ"),
-                "chernivtsi": ("чернівці", "чернівцях", "чернівецьк"),
-                "chernihiv": ("чернігів", "чернігові", "чернігова", "чернігівськ"),
-            }
-            return {
-                name
-                for name, variants in aliases.items()
-                if any(variant in t for variant in variants)
-            }
-    
-        def _priority_group_is_verified_duplicate(
-            self,
-            source_ids: List[int],
-            posts: List[Dict[str, Any]],
-        ) -> bool:
-            if len(source_ids) <= 1:
-                return True
-            anchor = source_ids[0]
-            return all(
-                self._priority_posts_definitely_same_event(anchor, other, posts)
-                for other in source_ids[1:]
-            )
-    
-        def _should_keep_priority_events_separate(
-            self,
-            left: Dict[str, Any],
-            right: Dict[str, Any],
-            posts: List[Dict[str, Any]],
-        ) -> bool:
-            left_ids = self._priority_source_ids_for_event(left, posts)
-            right_ids = self._priority_source_ids_for_event(right, posts)
-            if not left_ids or not right_ids:
-                return False
-            if set(left_ids) & set(right_ids):
-                return False
-    
-            # Дозволяємо merge лише якщо існує чітка manual-to-manual тотожність.
-            return not any(
-                self._priority_posts_definitely_same_event(a, b, posts)
-                for a in left_ids
-                for b in right_ids
-            )
-    
-        def _separate_distinct_priority_events(
-            self,
-            events: List[Dict[str, Any]],
-            posts: List[Dict[str, Any]],
-        ) -> List[Dict[str, Any]]:
-            result: List[Dict[str, Any]] = []
-            split_count = 0
-    
-            for raw_event in events or []:
-                if not isinstance(raw_event, dict):
-                    continue
-                event = dict(raw_event)
-                priority_ids = self._priority_source_ids_for_event(event, posts)
-                if len(priority_ids) <= 1:
-                    event["manual_merge_verified"] = True
-                    result.append(event)
-                    continue
-    
-                groups: List[List[int]] = []
-                for source_id in priority_ids:
-                    placed = False
-                    for group in groups:
-                        if any(
-                            self._priority_posts_definitely_same_event(source_id, other, posts)
-                            for other in group
-                        ):
-                            group.append(source_id)
-                            placed = True
-                            break
-                    if not placed:
-                        groups.append([source_id])
-    
-                if len(groups) == 1:
-                    event["manual_merge_verified"] = True
-                    result.append(event)
-                    continue
-    
-                split_count += len(groups) - 1
-                logger.warning(
-                    "Manual separation: event_id=%s містив %s різних manual-постів; "
-                    "розділяємо на %s priority-event(s), щоб жоден не загубився.",
-                    event.get("event_id"),
-                    len(priority_ids),
-                    len(groups),
-                )
-    
-                for group_number, group in enumerate(groups, start=1):
-                    synthetic = self._build_synthetic_priority_event(
-                        group,
-                        posts,
-                        group_number,
-                    )
-                    synthetic["event_id"] = self._unique_event_id(
-                        f"{event.get('event_id') or 'P'}_MANUAL_{group_number}",
-                        result,
-                    )
-                    synthetic["manual_merge_verified"] = (
-                        len(group) <= 1
-                        or self._priority_group_is_verified_duplicate(group, posts)
-                    )
-                    result.append(synthetic)
-    
-            if split_count:
-                logger.info(
-                    "Manual separation: відновлено %s окремих manual-event(s).",
-                    split_count,
-                )
-            return result
-    
-        def _covered_priority_ids(
-            self,
-            events: List[Dict[str, Any]],
-            posts: List[Dict[str, Any]],
-        ) -> set:
-            priority_ids = set(self._get_priority_post_ids(posts))
-            covered = set()
-    
-            for ev in events:
-                for source_id in ev.get("source_ids", []) or []:
-                    if (
-                        isinstance(source_id, int)
-                        and source_id in priority_ids
-                    ):
-                        covered.add(source_id)
-    
-            return covered
-    
-        def _ensure_priority_events(
-            self,
-            events: List[Dict[str, Any]],
-            posts: List[Dict[str, Any]],
-            past_events: Optional[
-                Union[
-                    List[str],
-                    List[Dict[str, str]],
-                ]
-            ],
-            max_retries: int,
-        ) -> List[Dict[str, Any]]:
-            priority_ids = self._get_priority_post_ids(posts)
-            if not priority_ids:
-                return events
-    
-            result: List[Dict[str, Any]] = []
-            for ev in events or []:
-                if not isinstance(ev, dict):
-                    continue
-    
-                ev_copy = dict(ev)
-                ev_copy["source_ids"] = self._valid_source_ids(
-                    ev_copy.get("source_ids"),
-                    posts,
-                )
-                result.append(ev_copy)
-    
-            covered = self._covered_priority_ids(result, posts)
-            missing = [
-                source_id
-                for source_id in priority_ids
-                if source_id not in covered
-            ]
-    
-            if not missing:
-                logger.info(
-                    "Priority-check: Analyzer покрив усі %s manual-пости.",
-                    len(priority_ids),
-                )
-                return result
-    
-            logger.warning(
-                "Priority-check: Analyzer пропустив %s з %s manual-постів: %s. "
-                "Запускаємо окремий priority-pass.",
-                len(missing),
-                len(priority_ids),
-                missing,
-            )
-    
-            # Аналізуємо ВСІ priority-пости разом, а не лише missing.
-            # Це дає моделі шанс правильно склеїти два ручні дублі в одну подію.
-            priority_context = self._build_posts_context(
-                posts,
-                only_ids=priority_ids,
-                max_chars=self.PRIORITY_RECOVERY_MAX_CHARS,
-            )
-    
-            recovered_events: List[Dict[str, Any]] = []
-            if priority_context:
-                recovered_events = self._analyze_priority_events(
-                    priority_context,
-                    past_events,
-                    max_retries,
-                )
-    
-            if recovered_events:
-                logger.info(
-                    "Priority-pass повернув %s подій.",
-                    len(recovered_events),
-                )
-    
-                for recovered in recovered_events:
-                    if not isinstance(recovered, dict):
-                        continue
-    
-                    recovered = dict(recovered)
-                    recovered_ids = [
-                        source_id
-                        for source_id in self._valid_source_ids(
-                            recovered.get("source_ids"),
-                            posts,
-                        )
-                        if source_id in priority_ids
-                    ]
-    
-                    if not recovered_ids:
-                        continue
-    
-                    recovered["source_ids"] = recovered_ids
-                    recovered["eligible_for_digest"] = True
-                    recovered["rejection_reason"] = ""
-    
-                    match_idx = self._find_matching_event_index(
-                        result,
-                        recovered,
-                        posts,
-                    )
-    
-                    if match_idx is not None:
-                        result[match_idx] = self._merge_events(
-                            result[match_idx],
-                            recovered,
-                            posts,
-                        )
-                    else:
-                        recovered["event_id"] = self._unique_event_id(
-                            str(recovered.get("event_id") or "P_RECOVER"),
-                            result,
-                        )
-                        result.append(recovered)
-    
-            # Після LLM recovery пробуємо приклеїти ще не покритий manual-post
-            # до вже наявної події суто за текстовою схожістю.
-            covered = self._covered_priority_ids(result, posts)
-            still_missing = [
-                source_id
-                for source_id in priority_ids
-                if source_id not in covered
-            ]
-    
-            for source_id in list(still_missing):
-                match_idx = self._find_event_for_post(
-                    result,
-                    source_id,
-                    posts,
-                )
-                if match_idx is None:
-                    continue
-    
-                merged_ids = self._valid_source_ids(
-                    list(result[match_idx].get("source_ids", []))
-                    + [source_id],
-                    posts,
-                )
-                result[match_idx]["source_ids"] = merged_ids
-                result[match_idx]["eligible_for_digest"] = True
-    
-            # Абсолютна гарантія: якщо моделі не спрацювали або знову щось
-            # не повернули, Python сам створює priority-event із сирого поста.
-            covered = self._covered_priority_ids(result, posts)
-            still_missing = [
-                source_id
-                for source_id in priority_ids
-                if source_id not in covered
-            ]
-    
-            if still_missing:
-                groups = self._group_priority_ids_by_similarity(
-                    still_missing,
-                    posts,
-                )
-    
-                for group_number, source_ids in enumerate(
-                    groups,
-                    start=1,
-                ):
-                    synthetic = self._build_synthetic_priority_event(
-                        source_ids,
-                        posts,
-                        group_number,
-                    )
-    
-                    match_idx = self._find_matching_event_index(
-                        result,
-                        synthetic,
-                        posts,
-                    )
-    
-                    if match_idx is not None:
-                        result[match_idx] = self._merge_events(
-                            result[match_idx],
-                            synthetic,
-                            posts,
-                        )
-                    else:
-                        synthetic["event_id"] = self._unique_event_id(
-                            str(synthetic.get("event_id") or "P_SYNTH"),
-                            result,
-                        )
-                        result.append(synthetic)
-    
-            final_covered = self._covered_priority_ids(result, posts)
-            final_missing = [
-                source_id
-                for source_id in priority_ids
-                if source_id not in final_covered
-            ]
-    
-            if final_missing:
-                # Сюди код практично не повинен доходити. Лог залишаємо,
-                # щоб будь-яку структурну помилку було видно одразу.
-                logger.error(
-                    "CRITICAL priority guarantee failed for source_ids=%s",
-                    final_missing,
-                )
-            else:
-                logger.info(
-                    "Priority guarantee: усі %s manual-пости присутні "
-                    "у подіях після Analyzer.",
-                    len(priority_ids),
-                )
-    
-            return result
-    
-        def _analyze_priority_events(
-            self,
-            posts_context: str,
-            past_events: Optional[
-                Union[
-                    List[str],
-                    List[Dict[str, str]],
-                ]
-            ],
-            max_retries: int,
-        ) -> List[Dict[str, Any]]:
-            history_block = self._build_history_block(past_events)
-    
-            prompt = f"""
-    Ти — редактор аварійного priority-pass для новинного Telegram-дайджесту.
-    
-    Цей запит містить ТІЛЬКИ пости, які адміністратор вручну додав у чергу.
-    Вони вже пройшли людський вибір і НЕ МОЖУТЬ бути відкинуті.
-    
-    ТВОЯ ЗАДАЧА:
-    1. Перетвори КОЖЕН наданий ID на подію.
-    2. Якщо два або більше ID описують ОДНУ Й ТУ САМУ реальну подію,
-       об'єднай їх в ОДИН event і помісти ВСІ такі ID у source_ids.
-    3. Не створюй два events для одного дубля тільки через різний канал,
-       фото, відео або інше формулювання.
-    4. Якщо це розвиток уже опублікованої історії — можеш позначити
-       is_history_repeat=true та оцінити history_update_strength,
-       але eligible_for_digest ЗАВЖДИ має бути true: це manual override.
-    5. Не вигадуй фактів. Використовуй лише текст постів.
-    6. importance, scale, public_interest, curiosity, practical_value та інші
-       оцінки виставляй чесно за змістом. Manual priority гарантує включення,
-       але не означає автоматично importance=100.
-    7. Визнач digest_role: "core" для головної важкої новини або "discovery"
-       для якісної цікавої/практичної події, яку органічно ставити в кінці випуску.
-       Для discovery також став is_discovery_candidate=true.
-    8. КОЖЕН ID із вхідного блоку повинен зустрітися РІВНО в одному event.source_ids.
-    
-    АРХІВ:
-    {history_block}
-    
-    ДОЗВОЛЕНІ category:
-    war, politics, economy, international, society, technology,
-    science, culture, other.
-    
-    ДОЗВОЛЕНІ event_type:
-    major_attack, battlefield_change, military_event, political_decision,
-    international_decision, economic_event, critical_infrastructure,
-    major_accident, major_crime, science_tech, social_event, culture_event,
-    routine_attack, routine_statement, minor_local_event, minor_accident,
-    alert_only, other.
-    
-    ВІДПОВІДЬ ТІЛЬКИ JSON:
-    {{
-      "events": [
-        {{
-          "event_id": "P1",
-          "source_ids": [7, 8],
-          "best_factual_source_id": 7,
-          "best_media_source_id": 8,
-          "eligible_for_digest": true,
-          "rejection_reason": "",
-          "digest_role": "core",
-          "is_discovery_candidate": false,
-          "event_type": "other",
-          "category": "other",
-          "importance": 70,
-          "scale": 60,
-          "reliability": 80,
-          "public_interest": 75,
-          "novelty": 80,
-          "curiosity": 75,
-          "practical_value": 40,
-          "media_quality": 80,
-          "national_relevance": 70,
-          "urgency": 80,
-          "is_history_repeat": false,
-          "history_update_strength": 0,
-          "headline_hint": "Короткий конкретний заголовок",
-          "key_facts": ["Факт 1", "Факт 2"],
-          "why_it_matters": "Коротко про значення події.",
-          "summary": "Стислий фактологічний опис."
-        }}
-      ]
-    }}
-    
-    MANUAL POSTS:
-    {posts_context}
-    """
-    
-            data = self._call_json_with_cascade(
-                prompt,
-                max_retries,
-                "PRIORITY_ANALYZER",
-                temperature=0.10,
-            )
-    
-            return (
-                data.get("events", [])
-                if (
-                    data
-                    and isinstance(data.get("events"), list)
-                )
-                else []
-            )
-    
-        def _valid_source_ids(
-            self,
-            source_ids: Any,
-            posts: List[Dict[str, Any]],
-        ) -> List[int]:
-            if not isinstance(source_ids, list):
                 return []
-    
-            result = []
-            seen = set()
-    
-            for source_id in source_ids:
-                if (
-                    isinstance(source_id, int)
-                    and 0 <= source_id < len(posts)
-                    and source_id not in seen
-                ):
-                    result.append(source_id)
-                    seen.add(source_id)
-    
-            return result
-    
-        def _find_matching_event_index(
-            self,
-            events: List[Dict[str, Any]],
-            candidate: Dict[str, Any],
-            posts: List[Dict[str, Any]],
-        ) -> Optional[int]:
-            candidate_ids = set(
-                self._valid_source_ids(
-                    candidate.get("source_ids"),
-                    posts,
-                )
+
+        synthetic = self._build_emergency_synthetic_events(posts)
+        if synthetic:
+            logger.error(
+                "EMERGENCY PYTHON FALLBACK: Gemini недоступний і для recovery. "
+                "Створено %s synthetic candidate(s); вони ще пройдуть "
+                "звичайні history/ranking gates.",
+                len(synthetic),
             )
-    
-            for idx, event in enumerate(events):
-                event_ids = set(
-                    self._valid_source_ids(
-                        event.get("source_ids"),
-                        posts,
-                    )
-                )
-    
-                if candidate_ids & event_ids:
-                    return idx
-    
-            for idx, event in enumerate(events):
-                if self._events_are_same(event, candidate, posts):
-                    return idx
-    
-            return None
-    
-        def _find_event_for_post(
-            self,
-            events: List[Dict[str, Any]],
-            source_id: int,
-            posts: List[Dict[str, Any]],
-        ) -> Optional[int]:
-            if not (0 <= source_id < len(posts)):
-                return None
-    
-            post_text = (posts[source_id].get("text") or "").strip()
-            if not post_text:
-                return None
-    
-            for idx, event in enumerate(events):
-                for ref_text in self._event_reference_texts(event, posts):
-                    if self._texts_same_event(post_text, ref_text):
-                        return idx
-    
-            return None
-    
-        def _events_are_same(
-            self,
-            left: Dict[str, Any],
-            right: Dict[str, Any],
-            posts: List[Dict[str, Any]],
-        ) -> bool:
-            # Якщо Telegram document_id однаковий, це фактично те саме медіа,
-            # навіть коли два канали переписали caption зовсім по-різному.
-            left_media_ids = self._event_media_document_ids(left, posts)
-            right_media_ids = self._event_media_document_ids(right, posts)
-            if left_media_ids and right_media_ids and (left_media_ids & right_media_ids):
-                return True
-    
-            left_texts = self._event_reference_texts(left, posts)
-            right_texts = self._event_reference_texts(right, posts)
-    
-            for left_text in left_texts[:8]:
-                for right_text in right_texts[:8]:
-                    if self._texts_same_event(left_text, right_text):
-                        return True
-    
-            # Для фізичних атак звичайний text-similarity часто слабкий: один канал
-            # пише коротко "момент прильоту", інший — повний список наслідків.
-            # Використовуємо вже наявний консервативний attack-anchor matcher, який
-            # вимагає конкретний спільний топонім/об'єкт/ціль, а не слово "удар".
-            for left_text in left_texts[:8]:
-                if not self._looks_like_attack_text(left_text):
-                    continue
-                for right_text in right_texts[:8]:
-                    if self._attack_same_story_anchor_match(left_text, right_text):
-                        return True
-    
-            return False
-    
-        def _event_media_document_ids(
-            self,
-            event: Dict[str, Any],
-            posts: List[Dict[str, Any]],
-        ) -> set:
-            result = set()
-            for source_id in self._valid_source_ids(event.get("source_ids"), posts):
-                value = posts[source_id].get("media_document_id")
-                if isinstance(value, int) and value:
-                    result.add(value)
-                elif isinstance(value, str) and value.strip():
-                    result.add(value.strip())
-            return result
-    
-        def _event_reference_texts(
-            self,
-            event: Dict[str, Any],
-            posts: List[Dict[str, Any]],
-        ) -> List[str]:
-            texts: List[str] = []
-    
-            for source_id in self._valid_source_ids(
-                event.get("source_ids"),
-                posts,
-            ):
-                text = (posts[source_id].get("text") or "").strip()
-                if text:
-                    texts.append(text)
-    
-            for field in [
-                "headline_hint",
-                "summary",
-                "why_it_matters",
-            ]:
-                value = event.get(field)
-                if isinstance(value, str) and value.strip():
-                    texts.append(value.strip())
-    
-            key_facts = event.get("key_facts")
-            if isinstance(key_facts, list):
-                facts_text = " ".join(
-                    str(item).strip()
-                    for item in key_facts[:6]
-                    if str(item).strip()
-                )
-                if facts_text:
-                    texts.append(facts_text)
-    
-            return texts
-    
-        @staticmethod
-        def _normalize_similarity_text(text: str) -> str:
-            text = str(text or "").lower()
-            text = re.sub(r"https?://\S+|t\.me/\S+", " ", text)
-            text = re.sub(r"<[^>]+>", " ", text)
-            text = re.sub(r"[^0-9a-zа-яіїєґёъыэ\s-]", " ", text)
-            text = re.sub(r"\s+", " ", text).strip()
-            return text
-    
-        def _texts_same_event(
-            self,
-            left: str,
-            right: str,
-        ) -> bool:
-            a = self._normalize_similarity_text(left)
-            b = self._normalize_similarity_text(right)
-    
-            if not a or not b:
-                return False
-    
-            if a == b:
-                return True
-    
-            shorter = min(len(a), len(b))
-            longer = max(len(a), len(b))
-    
-            if (
-                shorter >= 45
-                and (a in b or b in a)
-                and shorter / max(longer, 1) >= 0.55
-            ):
-                return True
-    
-            seq_ratio = SequenceMatcher(
-                None,
-                a[:1200],
-                b[:1200],
-            ).ratio()
-    
-            tokens_a = {
-                token
-                for token in re.findall(
-                    r"[0-9a-zа-яіїєґёъыэ-]{3,}",
-                    a,
-                )
-            }
-            tokens_b = {
-                token
-                for token in re.findall(
-                    r"[0-9a-zа-яіїєґёъыэ-]{3,}",
-                    b,
-                )
-            }
-    
-            if not tokens_a or not tokens_b:
-                return seq_ratio >= 0.88
-    
-            common = tokens_a & tokens_b
-            union = tokens_a | tokens_b
-    
-            jaccard = len(common) / max(len(union), 1)
-            overlap = len(common) / max(
-                min(len(tokens_a), len(tokens_b)),
-                1,
+        else:
+            logger.error(
+                "EMERGENCY PYTHON FALLBACK: не вдалося сформувати жодного "
+                "безпечного synthetic candidate."
             )
-    
-            if seq_ratio >= 0.82:
-                return True
-    
-            if (
-                len(common) >= 6
-                and overlap >= 0.58
-                and jaccard >= 0.40
-            ):
-                return True
-    
-            if (
-                len(common) >= 9
-                and overlap >= 0.54
-                and jaccard >= 0.34
-            ):
-                return True
-    
-            return False
-    
-        def _merge_events(
-            self,
-            base: Dict[str, Any],
-            incoming: Dict[str, Any],
-            posts: List[Dict[str, Any]],
-        ) -> Dict[str, Any]:
-            merged = dict(base)
-    
-            source_ids = self._valid_source_ids(
-                list(base.get("source_ids", []) or [])
-                + list(incoming.get("source_ids", []) or []),
-                posts,
-            )
-            merged["source_ids"] = source_ids
-    
-            # Основний Analyzer зазвичай має кращий широкий контекст, тому його
-            # поля лишаємо. Recovery заповнює лише порожні місця.
-            for field in [
-                "headline_hint",
-                "summary",
-                "why_it_matters",
-                "event_type",
-                "category",
-                "digest_role",
-                "is_discovery_candidate",
-                "best_factual_source_id",
-                "best_media_source_id",
-            ]:
-                current = merged.get(field)
-                incoming_value = incoming.get(field)
-                if (
-                    (current is None or current == "" or current == [])
-                    and incoming_value not in (None, "", [])
-                ):
-                    merged[field] = incoming_value
-    
-            base_facts = merged.get("key_facts")
-            incoming_facts = incoming.get("key_facts")
-            if isinstance(base_facts, list) or isinstance(incoming_facts, list):
-                facts = []
-                seen = set()
-                for item in (
-                    (base_facts if isinstance(base_facts, list) else [])
-                    + (
-                        incoming_facts
-                        if isinstance(incoming_facts, list)
-                        else []
-                    )
-                ):
-                    value = str(item).strip()
-                    key = value.lower()
-                    if value and key not in seen:
-                        facts.append(value)
-                        seen.add(key)
-                merged["key_facts"] = facts[:8]
-    
-            # Не стираємо history-state під час recovery/merge. Раніше тут
-            # eligible_for_digest безумовно ставав True, через що discovery-pass
-            # міг випадково "оживити" подію, яку Analyzer уже визнав повтором.
-            history_repeat = bool(
-                base.get("is_history_repeat", False)
-                or incoming.get("is_history_repeat", False)
-            )
-            history_hard_duplicate = bool(
-                base.get("history_hard_duplicate", False)
-                or incoming.get("history_hard_duplicate", False)
-            )
-            history_update = max(
-                self._safe_score(base.get("history_update_strength")),
-                self._safe_score(incoming.get("history_update_strength")),
-            )
-            merged["is_history_repeat"] = history_repeat
-            merged["history_hard_duplicate"] = history_hard_duplicate
-            merged["history_update_strength"] = history_update
-            # Якщо до вже перевіреної події домерджився НОВИЙ recovery-event,
-            # semantic review треба виконати ще раз уже на розширеному наборі фактів.
-            merged["history_semantic_reviewed"] = bool(
-                base.get("history_semantic_reviewed", False)
-                and incoming.get("history_semantic_reviewed", False)
-            )
-    
-            priority_source_ids = [
-                source_id
-                for source_id in source_ids
-                if bool(posts[source_id].get("is_priority"))
+
+        return synthetic
+
+    def _analyze_emergency_events(
+        self,
+        posts_context: str,
+        past_events: Optional[
+            Union[
+                List[str],
+                List[Dict[str, str]],
             ]
-            has_priority = bool(priority_source_ids)
-            merged["manual_merge_verified"] = (
-                len(priority_source_ids) <= 1
-                or self._priority_group_is_verified_duplicate(
-                    priority_source_ids,
-                    posts,
-                )
+        ],
+        max_retries: int,
+    ) -> Optional[List[Dict[str, Any]]]:
+        history_block = self._build_history_block(past_events)
+
+        prompt = f"""
+Ти — аварійний редактор українського Telegram-дайджесту.
+
+Основний Analyzer технічно не зміг повернути валідний JSON. Зараз у тебе
+КОРОТШИЙ контекст. Знайди максимум {self.EMERGENCY_ANALYZER_MAX_EVENTS}
+найсильніших САМОСТІЙНИХ подій останніх 4 годин.
+
+Правила:
+- не вигадуй фактів;
+- одна реальна подія = один event;
+- об'єднуй дублікати різних каналів;
+- не бери тривоги, рух БпЛА, чутки, дрібний кримінал і побутовий шум;
+- сильна атака, важливе рішення, велика аварія/злочин, значуща економічна,
+  міжнародна, технологічна або практично корисна подія може бути eligible;
+- для атак не склеюй різні удари без спільної конкретної локації/цілі/хвилі;
+- якщо та сама подія вже є в архіві, став is_history_repeat=true;
+- повтор без справді значущого розвитку став eligible_for_digest=false;
+- поверни КРАЩЕ 1-3 сильні події, ніж слабкі заповнювачі;
+- response має бути одним компактним JSON object без Markdown.
+
+АРХІВ:
+{history_block}
+
+ВІДПОВІДЬ ТІЛЬКИ JSON:
+{{
+  "events": [
+    {{
+      "event_id": "ER1",
+      "source_ids": [12],
+      "best_factual_source_id": 12,
+      "best_media_source_id": 12,
+      "eligible_for_digest": true,
+      "rejection_reason": "",
+      "digest_role": "core",
+      "is_discovery_candidate": false,
+      "event_type": "other",
+      "category": "other",
+      "importance": 75,
+      "scale": 65,
+      "reliability": 80,
+      "public_interest": 75,
+      "novelty": 80,
+      "curiosity": 65,
+      "practical_value": 40,
+      "media_quality": 70,
+      "national_relevance": 70,
+      "urgency": 80,
+      "is_history_repeat": false,
+      "history_update_strength": 0,
+      "headline_hint": "Короткий конкретний заголовок",
+      "key_facts": ["Факт 1", "Факт 2"],
+      "why_it_matters": "Коротко.",
+      "summary": "Стислий фактологічний опис."
+    }}
+  ]
+}}
+
+TELEGRAM POSTS:
+{posts_context}
+"""
+
+        data = self._call_json_with_cascade(
+            prompt,
+            max_retries,
+            "EMERGENCY_ANALYZER",
+            temperature=0.08,
+        )
+
+        if data is None:
+            return None
+
+        events = data.get("events")
+        return events if isinstance(events, list) else []
+
+    def _build_emergency_synthetic_events(
+        self,
+        posts: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """
+        Остання страховка без LLM.
+
+        Вона не публікує сирі пости напряму: лише створює до трьох candidate
+        events. Далі їх обов'язково перевіряють current dedup, history guard,
+        semantic review (якщо API ожив), ranking та Editor/fallback.
+        """
+        now_utc = datetime.now(timezone.utc)
+        candidates: List[tuple] = []
+
+        for source_id, post in enumerate(posts):
+            text = str(post.get("text") or "").strip()
+            if not text or post.get("is_priority"):
+                # Manual має власну абсолютну priority-recovery.
+                continue
+
+            normalized = self._normalize_similarity_text(text)
+            if len(normalized) < 35:
+                continue
+
+            # Не підтягуємо очевидний оперативний шум у аварійний випуск.
+            noise_markers = (
+                "повітряна тривога",
+                "відбій тривоги",
+                "рух бпла",
+                "рух шахед",
+                "загроза баліст",
+                "загроза застосування",
             )
-    
-            if has_priority:
-                merged["eligible_for_digest"] = True
-                merged["rejection_reason"] = ""
-            elif (
-                history_repeat
-                and history_update < self.HISTORY_SIGNIFICANT_UPDATE_MIN
+            if any(marker in normalized for marker in noise_markers):
+                continue
+
+            views = int(post.get("views") or 0)
+            forwards = int(post.get("forwards") or 0)
+            replies = int(post.get("replies") or 0)
+            username = (
+                str(post.get("channel_username") or "")
+                .replace("@", "")
+                .strip()
+            )
+
+            score = (
+                min(math.log10(max(views, 1)) * 4.0, 26.0)
+                + min(math.log10(max(forwards, 1)) * 3.0, 12.0)
+                + min(math.log10(max(replies, 1)) * 2.0, 8.0)
+            ) * self._get_source_multiplier(username)
+
+            if post.get("has_video"):
+                score += 5.0
+            elif post.get("has_media"):
+                score += 2.5
+
+            post_date = post.get("date")
+            if isinstance(post_date, datetime):
+                if post_date.tzinfo is None:
+                    post_date = post_date.replace(tzinfo=timezone.utc)
+                age_minutes = max(
+                    0.0,
+                    (now_utc - post_date.astimezone(timezone.utc)).total_seconds()
+                    / 60.0,
+                )
+                score += max(0.0, 8.0 * (1.0 - min(age_minutes, 240.0) / 240.0))
+
+            # Сильні factual-маркери піднімають кандидата, але не гарантують
+            # публікацію: справжній quality gate іде пізніше.
+            strong_markers = (
+                "загин", "поран", "зруйн", "знищ", "влуч", "масован",
+                "ухвал", "схвал", "підпис", "санкц", "млрд", "мільярд",
+                "евакуац", "затрим", "підозр", "вирок", "контракт",
+                "запуст", "відкрив", "вперше", "рекорд",
+            )
+            score += min(
+                sum(1 for marker in strong_markers if marker in normalized) * 3.0,
+                15.0,
+            )
+
+            candidates.append((score, source_id, text))
+
+        candidates.sort(key=lambda item: item[0], reverse=True)
+
+        selected_ids: List[int] = []
+        for _, source_id, text in candidates:
+            if any(
+                self._texts_same_event(
+                    text,
+                    str(posts[other_id].get("text") or ""),
+                )
+                for other_id in selected_ids
             ):
-                merged["eligible_for_digest"] = False
-                merged["rejection_reason"] = (
-                    str(
-                        base.get("rejection_reason")
-                        or incoming.get("rejection_reason")
-                        or "Повтор уже опублікованої події без значущого розвитку."
-                    ).strip()
+                continue
+
+            selected_ids.append(source_id)
+            if len(selected_ids) >= self.EMERGENCY_SYNTHETIC_MAX_EVENTS:
+                break
+
+        result: List[Dict[str, Any]] = []
+        for sequence, source_id in enumerate(selected_ids, start=1):
+            event = self._build_synthetic_priority_event(
+                [source_id],
+                posts,
+                sequence,
+            )
+            event["event_id"] = f"ER_SYNTH_{sequence}"
+            event["eligible_for_digest"] = True
+            event["rejection_reason"] = ""
+            # Не маскуємо fallback під manual.
+            event["emergency_synthetic"] = True
+            result.append(event)
+
+        return result
+
+    def _ensure_direct_impact_video_events(
+        self,
+        events: List[Dict[str, Any]],
+        posts: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """
+        Recovery для short video-first ударів, які Analyzer міг не повернути.
+
+        Це НЕ auto-publish: synthetic event далі проходить dedup, history,
+        semantic review, ranking, Editor і FINAL_FACT_CHECK. Максимум кілька
+        найсильніших missing-постів, щоб воєнні відео не забили весь дайджест.
+        """
+        result = [dict(ev) for ev in (events or []) if isinstance(ev, dict)]
+        covered = {
+            source_id
+            for ev in result
+            for source_id in self._valid_source_ids(ev.get("source_ids"), posts)
+        }
+
+        candidates = []
+        now_utc = datetime.now(timezone.utc)
+        for source_id, post in enumerate(posts):
+            if source_id in covered or post.get("is_priority"):
+                continue
+            if not self._is_direct_impact_video_post(post):
+                continue
+
+            views = int(post.get("views") or 0)
+            forwards = int(post.get("forwards") or 0)
+            username = str(post.get("channel_username") or "").replace("@", "").strip()
+            score = (
+                min(math.log10(max(views, 1)) * 3.0, 18.0)
+                + min(math.log10(max(forwards, 1)) * 2.0, 8.0)
+            ) * self._get_source_multiplier(username)
+
+            post_date = post.get("date")
+            if isinstance(post_date, datetime):
+                if post_date.tzinfo is None:
+                    post_date = post_date.replace(tzinfo=timezone.utc)
+                age_minutes = max(
+                    0.0,
+                    (now_utc - post_date.astimezone(timezone.utc)).total_seconds() / 60.0,
                 )
-            else:
-                merged["eligible_for_digest"] = bool(
-                    base.get("eligible_for_digest", False)
-                    or incoming.get("eligible_for_digest", False)
-                )
-                if merged["eligible_for_digest"]:
-                    merged["rejection_reason"] = ""
-                else:
-                    merged["rejection_reason"] = str(
-                        base.get("rejection_reason")
-                        or incoming.get("rejection_reason")
-                        or ""
-                    ).strip()
-    
-            return merged
-    
-        def _unique_event_id(
-            self,
-            preferred: str,
-            events: List[Dict[str, Any]],
-        ) -> str:
-            preferred = re.sub(
-                r"[^A-Za-z0-9_-]+",
-                "_",
-                preferred or "P_RECOVER",
-            ).strip("_") or "P_RECOVER"
-    
-            existing = {
-                str(ev.get("event_id") or "")
-                for ev in events
-            }
-    
-            if preferred not in existing:
-                return preferred
-    
-            counter = 2
-            while f"{preferred}_{counter}" in existing:
-                counter += 1
-    
-            return f"{preferred}_{counter}"
-    
-        def _group_priority_ids_by_similarity(
-            self,
-            source_ids: List[int],
-            posts: List[Dict[str, Any]],
-        ) -> List[List[int]]:
+                score += max(0.0, 8.0 * (1.0 - min(age_minutes, 240.0) / 240.0))
+
+            candidates.append((score, source_id))
+
+        candidates.sort(reverse=True)
+        added = 0
+        for _, source_id in candidates[: self.DIRECT_IMPACT_VIDEO_RECOVERY_MAX]:
+            event = self._build_direct_impact_video_event(source_id, posts)
+            event["event_id"] = self._unique_event_id(
+                str(event.get("event_id") or f"IMPACT_VIDEO_{source_id}"),
+                result,
+            )
+            result.append(event)
+            added += 1
+
+        if added:
+            logger.info(
+                "Direct-impact-video recovery: додано %s missing candidate(s) до history/ranking pipeline.",
+                added,
+            )
+        return result
+
+    def _build_direct_impact_video_event(
+        self,
+        source_id: int,
+        posts: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        post = posts[source_id]
+        source_text = str(post.get("text") or "").strip()
+        sentences = self._extract_sentences(source_text)
+        if not sentences and source_text:
+            sentences = [source_text]
+
+        headline = self._priority_headline_from_text(source_text) or "Кадри наслідків удару"
+        summary_parts = [
+            self._ensure_sentence_end(sentence)
+            for sentence in sentences[:2]
+            if sentence.strip()
+        ]
+        summary = " ".join(summary_parts).strip()
+        key_facts = [
+            self._ensure_sentence_end(sentence)
+            for sentence in sentences[:4]
+            if sentence.strip()
+        ]
+
+        return {
+            "event_id": f"IMPACT_VIDEO_{source_id}",
+            "source_ids": [source_id],
+            "best_factual_source_id": source_id,
+            "best_media_source_id": source_id,
+            "eligible_for_digest": True,
+            "rejection_reason": "",
+            "digest_role": "core",
+            "is_discovery_candidate": False,
+            "event_type": "routine_attack",
+            "category": "war",
+            # Консервативні оцінки: recovery лише повертає кандидата в гру.
+            # Він не повинен автоматично обігнати сильні національні події.
+            "importance": 62,
+            "scale": 55,
+            "reliability": 72,
+            "public_interest": 78,
+            "novelty": 72,
+            "curiosity": 70,
+            "practical_value": 30,
+            "media_quality": 88,
+            "national_relevance": 66,
+            "urgency": 84,
+            "is_history_repeat": False,
+            "history_update_strength": 0,
+            "headline_hint": headline,
+            "key_facts": key_facts,
+            "why_it_matters": "Прямі кадри конкретного удару або його безпосередніх наслідків.",
+            "summary": summary,
+            "direct_impact_video": True,
+        }
+
+    def _get_priority_post_ids(
+        self,
+        posts: List[Dict[str, Any]],
+    ) -> List[int]:
+        return [
+            idx
+            for idx, post in enumerate(posts)
+            if (
+                bool(post.get("is_priority"))
+                and bool((post.get("text") or "").strip())
+            )
+        ]
+
+    def _priority_source_ids_for_event(
+        self,
+        event: Dict[str, Any],
+        posts: List[Dict[str, Any]],
+    ) -> List[int]:
+        priority_ids = set(self._get_priority_post_ids(posts))
+        return [
+            source_id
+            for source_id in self._valid_source_ids(event.get("source_ids"), posts)
+            if source_id in priority_ids
+        ]
+
+    def _priority_posts_definitely_same_event(
+        self,
+        left_id: int,
+        right_id: int,
+        posts: List[Dict[str, Any]],
+    ) -> bool:
+        """
+        Дуже строгий manual-to-manual matcher.
+
+        Для ручних постів false merge гірший за зайвий дубль: адміністратор уже
+        свідомо вибрав кожен матеріал. Тому склеюємо їх лише при майже явній
+        тотожності тексту/події; generic attack similarity тут недостатня.
+        """
+        if left_id == right_id:
+            return True
+        if not (0 <= left_id < len(posts) and 0 <= right_id < len(posts)):
+            return False
+
+        left = self._normalize_similarity_text(posts[left_id].get("text") or "")
+        right = self._normalize_similarity_text(posts[right_id].get("text") or "")
+        if not left or not right:
+            return False
+        if left == right:
+            return True
+
+        # Різні явно названі обласні центри для фізичних атак = різні події.
+        if self._looks_like_attack_text(left) and self._looks_like_attack_text(right):
+            left_centers = self._regional_center_names(left)
+            right_centers = self._regional_center_names(right)
+            if left_centers and right_centers and left_centers.isdisjoint(right_centers):
+                return False
+
+        shorter = min(len(left), len(right))
+        longer = max(len(left), len(right))
+        if shorter >= 35 and (left in right or right in left):
+            if shorter / max(longer, 1) >= 0.78:
+                return True
+
+        seq = SequenceMatcher(None, left[:1400], right[:1400]).ratio()
+        tokens_left = set(re.findall(r"[0-9a-zа-яіїєґёъыэ-]{3,}", left))
+        tokens_right = set(re.findall(r"[0-9a-zа-яіїєґёъыэ-]{3,}", right))
+        if not tokens_left or not tokens_right:
+            return seq >= 0.92
+
+        common = tokens_left & tokens_right
+        overlap = len(common) / max(min(len(tokens_left), len(tokens_right)), 1)
+        jaccard = len(common) / max(len(tokens_left | tokens_right), 1)
+        return (
+            seq >= 0.88
+            and len(common) >= 5
+            and overlap >= 0.70
+            and jaccard >= 0.52
+        )
+
+    @staticmethod
+    def _regional_center_names(text: str) -> set:
+        t = NewsSummarizer._normalize_similarity_text(text)
+        aliases = {
+            "kyiv": ("київ", "києві", "києва", "києву", "києвом", "київськ"),
+            "vinnytsia": ("вінниця", "вінниці", "вінницьк"),
+            "lutsk": ("луцьк", "луцьку", "луцька"),
+            "dnipro": ("дніпро", "дніпрі", "дніпра"),
+            "donetsk": ("донецьк", "донецьку", "донецька"),
+            "zhytomyr": ("житомир", "житомирі", "житомира"),
+            "uzhhorod": ("ужгород", "ужгороді", "ужгорода"),
+            "zaporizhzhia": ("запоріжжя", "запоріжжі", "запорізьк"),
+            "ivano-frankivsk": ("івано-франківськ", "івано-франківську"),
+            "kropyvnytskyi": ("кропивницький", "кропивницькому"),
+            "luhansk": ("луганськ", "луганську", "луганська"),
+            "lviv": ("львів", "львові", "львова", "львову", "львівськ"),
+            "mykolaiv": ("миколаїв", "миколаєві", "миколаєва"),
+            "odesa": ("одеса", "одесі", "одесу", "одеськ"),
+            "poltava": ("полтава", "полтаві", "полтаву", "полтавськ"),
+            "rivne": ("рівне", "рівному", "рівненськ"),
+            "sumy": ("суми", "сумах", "сумськ"),
+            "ternopil": ("тернопіль", "тернополі", "тернопільськ"),
+            "kharkiv": ("харків", "харкові", "харкова", "харкову", "харківськ"),
+            "kherson": ("херсон", "херсоні", "херсона", "херсонськ"),
+            "khmelnytskyi": ("хмельницький", "хмельницькому"),
+            "cherkasy": ("черкаси", "черкасах", "черкаськ"),
+            "chernivtsi": ("чернівці", "чернівцях", "чернівецьк"),
+            "chernihiv": ("чернігів", "чернігові", "чернігова", "чернігівськ"),
+        }
+        return {
+            name
+            for name, variants in aliases.items()
+            if any(variant in t for variant in variants)
+        }
+
+    def _priority_group_is_verified_duplicate(
+        self,
+        source_ids: List[int],
+        posts: List[Dict[str, Any]],
+    ) -> bool:
+        if len(source_ids) <= 1:
+            return True
+        anchor = source_ids[0]
+        return all(
+            self._priority_posts_definitely_same_event(anchor, other, posts)
+            for other in source_ids[1:]
+        )
+
+    def _should_keep_priority_events_separate(
+        self,
+        left: Dict[str, Any],
+        right: Dict[str, Any],
+        posts: List[Dict[str, Any]],
+    ) -> bool:
+        left_ids = self._priority_source_ids_for_event(left, posts)
+        right_ids = self._priority_source_ids_for_event(right, posts)
+        if not left_ids or not right_ids:
+            return False
+        if set(left_ids) & set(right_ids):
+            return False
+
+        # Дозволяємо merge лише якщо існує чітка manual-to-manual тотожність.
+        return not any(
+            self._priority_posts_definitely_same_event(a, b, posts)
+            for a in left_ids
+            for b in right_ids
+        )
+
+    def _separate_distinct_priority_events(
+        self,
+        events: List[Dict[str, Any]],
+        posts: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        result: List[Dict[str, Any]] = []
+        split_count = 0
+
+        for raw_event in events or []:
+            if not isinstance(raw_event, dict):
+                continue
+            event = dict(raw_event)
+            priority_ids = self._priority_source_ids_for_event(event, posts)
+            if len(priority_ids) <= 1:
+                event["manual_merge_verified"] = True
+                result.append(event)
+                continue
+
             groups: List[List[int]] = []
-    
-            for source_id in source_ids:
-                text = (posts[source_id].get("text") or "").strip()
+            for source_id in priority_ids:
                 placed = False
-    
                 for group in groups:
                     if any(
-                        self._texts_same_event(
-                            text,
-                            posts[other_id].get("text") or "",
-                        )
-                        for other_id in group
+                        self._priority_posts_definitely_same_event(source_id, other, posts)
+                        for other in group
                     ):
                         group.append(source_id)
                         placed = True
                         break
-    
                 if not placed:
                     groups.append([source_id])
-    
-            return groups
-    
-        def _build_synthetic_priority_event(
-            self,
-            source_ids: List[int],
-            posts: List[Dict[str, Any]],
-            sequence: int,
-        ) -> Dict[str, Any]:
-            source_ids = self._valid_source_ids(source_ids, posts)
-            if not source_ids:
-                raise ValueError("Synthetic priority event without source_ids")
-    
-            # Для тексту беремо найінформативніший manual-post, а для публікації
-            # ranking пізніше окремо вибере найкращий factual/media source.
-            text_source_id = max(
-                source_ids,
-                key=lambda source_id: len(
-                    posts[source_id].get("text") or ""
-                ),
+
+            if len(groups) == 1:
+                event["manual_merge_verified"] = True
+                result.append(event)
+                continue
+
+            split_count += len(groups) - 1
+            logger.warning(
+                "Manual separation: event_id=%s містив %s різних manual-постів; "
+                "розділяємо на %s priority-event(s), щоб жоден не загубився.",
+                event.get("event_id"),
+                len(priority_ids),
+                len(groups),
             )
-            source_text = (
-                posts[text_source_id].get("text") or ""
-            ).strip()
-    
-            sentences = self._extract_sentences(source_text)
-            if not sentences and source_text:
-                sentences = [source_text]
-    
-            headline = self._priority_headline_from_text(source_text)
-            summary_sentences = [
-                self._ensure_sentence_end(sentence)
-                for sentence in sentences[:2]
-                if sentence.strip()
-            ]
-            summary = " ".join(summary_sentences).strip()
-            if not summary:
-                summary = self._ensure_sentence_end(
-                    source_text[:400].strip()
+
+            for group_number, group in enumerate(groups, start=1):
+                synthetic = self._build_synthetic_priority_event(
+                    group,
+                    posts,
+                    group_number,
                 )
-    
-            key_facts = [
-                self._ensure_sentence_end(sentence)
-                for sentence in sentences[:5]
-                if sentence.strip()
+                synthetic["event_id"] = self._unique_event_id(
+                    f"{event.get('event_id') or 'P'}_MANUAL_{group_number}",
+                    result,
+                )
+                synthetic["manual_merge_verified"] = (
+                    len(group) <= 1
+                    or self._priority_group_is_verified_duplicate(group, posts)
+                )
+                result.append(synthetic)
+
+        if split_count:
+            logger.info(
+                "Manual separation: відновлено %s окремих manual-event(s).",
+                split_count,
+            )
+        return result
+
+    def _covered_priority_ids(
+        self,
+        events: List[Dict[str, Any]],
+        posts: List[Dict[str, Any]],
+    ) -> set:
+        priority_ids = set(self._get_priority_post_ids(posts))
+        covered = set()
+
+        for ev in events:
+            for source_id in ev.get("source_ids", []) or []:
+                if (
+                    isinstance(source_id, int)
+                    and source_id in priority_ids
+                ):
+                    covered.add(source_id)
+
+        return covered
+
+    def _ensure_priority_events(
+        self,
+        events: List[Dict[str, Any]],
+        posts: List[Dict[str, Any]],
+        past_events: Optional[
+            Union[
+                List[str],
+                List[Dict[str, str]],
             ]
-    
-            category, event_type = self._infer_priority_category_and_type(
-                source_text
-            )
-    
-            has_video = any(
-                posts[source_id].get("has_video")
-                for source_id in source_ids
-            )
-            has_media = any(
-                posts[source_id].get("has_media")
-                for source_id in source_ids
-            )
-            manual_media_source = self._manual_locked_media_source(
-                source_ids,
+        ],
+        max_retries: int,
+    ) -> List[Dict[str, Any]]:
+        priority_ids = self._get_priority_post_ids(posts)
+        if not priority_ids:
+            return events
+
+        result: List[Dict[str, Any]] = []
+        for ev in events or []:
+            if not isinstance(ev, dict):
+                continue
+
+            ev_copy = dict(ev)
+            ev_copy["source_ids"] = self._valid_source_ids(
+                ev_copy.get("source_ids"),
                 posts,
-                text_source_id,
             )
-    
-            return {
-                "event_id": f"P_SYNTH_{sequence}",
-                "source_ids": source_ids,
-                "best_factual_source_id": text_source_id,
-                "best_media_source_id": manual_media_source,
-                "manual_media_locked": manual_media_source is not None,
-                "manual_media_source_id": manual_media_source,
-                "eligible_for_digest": True,
-                "rejection_reason": "",
-                "digest_role": (
-                    "discovery"
-                    if category in {"technology", "science", "culture"}
-                    else "core"
-                ),
-                "is_discovery_candidate": (
-                    category in {"technology", "science", "culture"}
-                ),
-                "event_type": event_type,
-                "category": category,
-                "importance": 72,
-                "scale": 60,
-                "reliability": 78,
-                "public_interest": 75,
-                "novelty": 85,
-                "curiosity": 78,
-                "practical_value": 45,
-                "media_quality": (
-                    88
-                    if has_video
-                    else (75 if has_media else 35)
-                ),
-                "national_relevance": 68,
-                "urgency": 85,
-                "is_history_repeat": False,
-                "history_update_strength": 0,
-                "manual_merge_verified": (
-                    len(source_ids) <= 1
-                    or self._priority_group_is_verified_duplicate(source_ids, posts)
-                ),
-                "headline_hint": headline,
-                "key_facts": key_facts,
-                "why_it_matters": "",
-                "summary": summary,
-            }
-    
-        def _priority_headline_from_text(
-            self,
-            text: str,
-        ) -> str:
-            clean = re.sub(r"https?://\S+|t\.me/\S+", " ", text or "")
-            clean = re.sub(r"<[^>]+>", " ", clean)
-            clean = re.sub(r"\s+", " ", clean).strip()
-    
-            if not clean:
-                return "Пріоритетна подія"
-    
-            first_sentence = re.split(r"(?<=[.!?])\s+", clean)[0]
-            first_sentence = first_sentence.strip(" -–—:;,.!?")
-    
-            # Забираємо частину декоративних символів на початку, але не
-            # переписуємо сам зміст.
-            first_sentence = re.sub(
-                r"^[^0-9A-Za-zА-Яа-яІіЇїЄєҐґ]+",
-                "",
-                first_sentence,
-            ).strip()
-    
-            if len(first_sentence) > 110:
-                first_sentence = self._truncate_plain_text(
-                    first_sentence,
-                    110,
-                )
-    
-            return first_sentence or "Пріоритетна подія"
-    
-        @staticmethod
-        def _truncate_plain_text(
-            text: str,
-            max_chars: int,
-        ) -> str:
-            if len(text) <= max_chars:
-                return text.strip()
-    
-            candidate = text[:max_chars].rstrip()
-            last_space = candidate.rfind(" ")
-            if last_space >= int(max_chars * 0.65):
-                candidate = candidate[:last_space]
-    
-            return candidate.rstrip(" ,;:-") + "…"
-    
-        @staticmethod
-        def _infer_priority_category_and_type(
-            text: str,
-        ) -> tuple:
-            t = str(text or "").lower()
-    
-            if any(
-                key in t
-                for key in [
-                    "обстріл", "атака", "ракет", "дрон", "бпла",
-                    "фронт", "зсу", "окуп", "військ", "ппо",
-                    "бойов", "удар", "сбу", "гур", "розвід",
-                ]
-            ):
-                event_type = (
-                    "major_attack"
-                    if any(
-                        key in t
-                        for key in [
-                            "обстріл", "атака", "ракет", "дрон",
-                            "бпла", "влуч", "удар",
-                        ]
+            result.append(ev_copy)
+
+        covered = self._covered_priority_ids(result, posts)
+        missing = [
+            source_id
+            for source_id in priority_ids
+            if source_id not in covered
+        ]
+
+        if not missing:
+            logger.info(
+                "Priority-check: Analyzer покрив усі %s manual-пости.",
+                len(priority_ids),
+            )
+            return result
+
+        logger.warning(
+            "Priority-check: Analyzer пропустив %s з %s manual-постів: %s. "
+            "Запускаємо окремий priority-pass.",
+            len(missing),
+            len(priority_ids),
+            missing,
+        )
+
+        # Аналізуємо ВСІ priority-пости разом, а не лише missing.
+        # Це дає моделі шанс правильно склеїти два ручні дублі в одну подію.
+        priority_context = self._build_posts_context(
+            posts,
+            only_ids=priority_ids,
+            max_chars=self.PRIORITY_RECOVERY_MAX_CHARS,
+        )
+
+        recovered_events: List[Dict[str, Any]] = []
+        if priority_context:
+            recovered_events = self._analyze_priority_events(
+                priority_context,
+                past_events,
+                max_retries,
+            )
+
+        if recovered_events:
+            logger.info(
+                "Priority-pass повернув %s подій.",
+                len(recovered_events),
+            )
+
+            for recovered in recovered_events:
+                if not isinstance(recovered, dict):
+                    continue
+
+                recovered = dict(recovered)
+                recovered_ids = [
+                    source_id
+                    for source_id in self._valid_source_ids(
+                        recovered.get("source_ids"),
+                        posts,
                     )
-                    else "military_event"
+                    if source_id in priority_ids
+                ]
+
+                if not recovered_ids:
+                    continue
+
+                recovered["source_ids"] = recovered_ids
+                recovered["eligible_for_digest"] = True
+                recovered["rejection_reason"] = ""
+
+                match_idx = self._find_matching_event_index(
+                    result,
+                    recovered,
+                    posts,
                 )
-                return "war", event_type
-    
-            if any(
-                key in t
-                for key in [
-                    "дбр", "прокурат", "підозр", "затрим", "вбив",
-                    "стрілянин", "злочин", "поліці",
-                ]
-            ):
-                return "society", "major_crime"
-    
-            if any(
-                key in t
-                for key in [
-                    "верховн", "рада", "кабмін", "уряд", "президент",
-                    "зеленськ", "міністр", "закон", "постанова",
-                    "вибор", "депутат",
-                ]
-            ):
-                return "politics", "political_decision"
-    
-            if any(
-                key in t
-                for key in [
-                    "сша", "євросоюз", "нато", "польщ", "німеч",
-                    "франц", "британ", "трамп", "європ", "китай",
-                    "япон", "канада", "румун", "угорщ",
-                ]
-            ):
-                return "international", "international_decision"
-    
-            if any(
-                key in t
-                for key in [
-                    "грн", "долар", "євро", "банк", "бюджет", "подат",
-                    "тариф", "економ", "ринок", "компан", "завод",
-                    "виробництв", "контракт", "зарплат", "пенсі",
-                ]
-            ):
-                return "economy", "economic_event"
-    
-            if any(
-                key in t
-                for key in [
-                    "штучн", "інтелект", "нейромереж", "ai ", "gpt",
-                    "технолог", "стартап", "робот", "кібер", "додаток",
-                    "смартфон", "комп'ют", "чип", "процесор",
-                ]
-            ):
-                return "technology", "science_tech"
-    
-            if any(
-                key in t
-                for key in [
-                    "вчен", "дослід", "науков", "відкрит", "медицин",
-                    "лікуван", "біолог", "космос", "фізик", "хімі",
-                ]
-            ):
-                return "science", "science_tech"
-    
-            if any(
-                key in t
-                for key in [
-                    "фільм", "музик", "культур", "театр", "музей",
-                    "книг", "премі", "фестив",
-                ]
-            ):
-                return "culture", "culture_event"
-    
-            return "society", "social_event"
-    
-        @staticmethod
-        def _event_text_bundle(ev: Dict[str, Any]) -> str:
-            parts = [
-                str(ev.get("headline_hint") or "").strip(),
-                str(ev.get("summary") or "").strip(),
-                str(ev.get("why_it_matters") or "").strip(),
-            ]
-            facts = ev.get("key_facts")
-            if isinstance(facts, list):
-                parts.extend(
-                    str(item).strip()
-                    for item in facts[:8]
-                    if str(item).strip()
-                )
-            return " ".join(part for part in parts if part)
-    
-        @staticmethod
-        def _looks_like_attack_text(text: str) -> bool:
-            t = NewsSummarizer._normalize_similarity_text(text)
-    
-            # "кібератака" не є фізичним ударом. Раніше substring "атак"
-            # заводив Claude/Anthropic та інші cyber-історії в attack-matcher.
-            cyber_only = any(
-                marker in t
-                for marker in ("кібератак", "cyberattack", "кібершпиг", "хакер")
+
+                if match_idx is not None:
+                    result[match_idx] = self._merge_events(
+                        result[match_idx],
+                        recovered,
+                        posts,
+                    )
+                else:
+                    recovered["event_id"] = self._unique_event_id(
+                        str(recovered.get("event_id") or "P_RECOVER"),
+                        result,
+                    )
+                    result.append(recovered)
+
+        # Після LLM recovery пробуємо приклеїти ще не покритий manual-post
+        # до вже наявної події суто за текстовою схожістю.
+        covered = self._covered_priority_ids(result, posts)
+        still_missing = [
+            source_id
+            for source_id in priority_ids
+            if source_id not in covered
+        ]
+
+        for source_id in list(still_missing):
+            match_idx = self._find_event_for_post(
+                result,
+                source_id,
+                posts,
             )
-            physical_markers = (
-                "обстр", " удар", "удар ", "дрон", "бпла",
+            if match_idx is None:
+                continue
+
+            merged_ids = self._valid_source_ids(
+                list(result[match_idx].get("source_ids", []))
+                + [source_id],
+                posts,
+            )
+            result[match_idx]["source_ids"] = merged_ids
+            result[match_idx]["eligible_for_digest"] = True
+
+        # Абсолютна гарантія: якщо моделі не спрацювали або знову щось
+        # не повернули, Python сам створює priority-event із сирого поста.
+        covered = self._covered_priority_ids(result, posts)
+        still_missing = [
+            source_id
+            for source_id in priority_ids
+            if source_id not in covered
+        ]
+
+        if still_missing:
+            groups = self._group_priority_ids_by_similarity(
+                still_missing,
+                posts,
+            )
+
+            for group_number, source_ids in enumerate(
+                groups,
+                start=1,
+            ):
+                synthetic = self._build_synthetic_priority_event(
+                    source_ids,
+                    posts,
+                    group_number,
+                )
+
+                match_idx = self._find_matching_event_index(
+                    result,
+                    synthetic,
+                    posts,
+                )
+
+                if match_idx is not None:
+                    result[match_idx] = self._merge_events(
+                        result[match_idx],
+                        synthetic,
+                        posts,
+                    )
+                else:
+                    synthetic["event_id"] = self._unique_event_id(
+                        str(synthetic.get("event_id") or "P_SYNTH"),
+                        result,
+                    )
+                    result.append(synthetic)
+
+        final_covered = self._covered_priority_ids(result, posts)
+        final_missing = [
+            source_id
+            for source_id in priority_ids
+            if source_id not in final_covered
+        ]
+
+        if final_missing:
+            # Сюди код практично не повинен доходити. Лог залишаємо,
+            # щоб будь-яку структурну помилку було видно одразу.
+            logger.error(
+                "CRITICAL priority guarantee failed for source_ids=%s",
+                final_missing,
+            )
+        else:
+            logger.info(
+                "Priority guarantee: усі %s manual-пости присутні "
+                "у подіях після Analyzer.",
+                len(priority_ids),
+            )
+
+        return result
+
+    def _analyze_priority_events(
+        self,
+        posts_context: str,
+        past_events: Optional[
+            Union[
+                List[str],
+                List[Dict[str, str]],
+            ]
+        ],
+        max_retries: int,
+    ) -> List[Dict[str, Any]]:
+        history_block = self._build_history_block(past_events)
+
+        prompt = f"""
+Ти — редактор аварійного priority-pass для новинного Telegram-дайджесту.
+
+Цей запит містить ТІЛЬКИ пости, які адміністратор вручну додав у чергу.
+Вони вже пройшли людський вибір і НЕ МОЖУТЬ бути відкинуті.
+
+ТВОЯ ЗАДАЧА:
+1. Перетвори КОЖЕН наданий ID на подію.
+2. Якщо два або більше ID описують ОДНУ Й ТУ САМУ реальну подію,
+   об'єднай їх в ОДИН event і помісти ВСІ такі ID у source_ids.
+3. Не створюй два events для одного дубля тільки через різний канал,
+   фото, відео або інше формулювання.
+4. Якщо це розвиток уже опублікованої історії — можеш позначити
+   is_history_repeat=true та оцінити history_update_strength,
+   але eligible_for_digest ЗАВЖДИ має бути true: це manual override.
+5. Не вигадуй фактів. Використовуй лише текст постів.
+6. importance, scale, public_interest, curiosity, practical_value та інші
+   оцінки виставляй чесно за змістом. Manual priority гарантує включення,
+   але не означає автоматично importance=100.
+7. Визнач digest_role: "core" для головної важкої новини або "discovery"
+   для якісної цікавої/практичної події, яку органічно ставити в кінці випуску.
+   Для discovery також став is_discovery_candidate=true.
+8. КОЖЕН ID із вхідного блоку повинен зустрітися РІВНО в одному event.source_ids.
+
+АРХІВ:
+{history_block}
+
+ДОЗВОЛЕНІ category:
+war, politics, economy, international, society, technology,
+science, culture, other.
+
+ДОЗВОЛЕНІ event_type:
+major_attack, battlefield_change, military_event, political_decision,
+international_decision, economic_event, critical_infrastructure,
+major_accident, major_crime, science_tech, social_event, culture_event,
+routine_attack, routine_statement, minor_local_event, minor_accident,
+alert_only, other.
+
+ВІДПОВІДЬ ТІЛЬКИ JSON:
+{{
+  "events": [
+    {{
+      "event_id": "P1",
+      "source_ids": [7, 8],
+      "best_factual_source_id": 7,
+      "best_media_source_id": 8,
+      "eligible_for_digest": true,
+      "rejection_reason": "",
+      "digest_role": "core",
+      "is_discovery_candidate": false,
+      "event_type": "other",
+      "category": "other",
+      "importance": 70,
+      "scale": 60,
+      "reliability": 80,
+      "public_interest": 75,
+      "novelty": 80,
+      "curiosity": 75,
+      "practical_value": 40,
+      "media_quality": 80,
+      "national_relevance": 70,
+      "urgency": 80,
+      "is_history_repeat": false,
+      "history_update_strength": 0,
+      "headline_hint": "Короткий конкретний заголовок",
+      "key_facts": ["Факт 1", "Факт 2"],
+      "why_it_matters": "Коротко про значення події.",
+      "summary": "Стислий фактологічний опис."
+    }}
+  ]
+}}
+
+MANUAL POSTS:
+{posts_context}
+"""
+
+        data = self._call_json_with_cascade(
+            prompt,
+            max_retries,
+            "PRIORITY_ANALYZER",
+            temperature=0.10,
+        )
+
+        return (
+            data.get("events", [])
+            if (
+                data
+                and isinstance(data.get("events"), list)
+            )
+            else []
+        )
+
+    def _valid_source_ids(
+        self,
+        source_ids: Any,
+        posts: List[Dict[str, Any]],
+    ) -> List[int]:
+        if not isinstance(source_ids, list):
+            return []
+
+        result = []
+        seen = set()
+
+        for source_id in source_ids:
+            if (
+                isinstance(source_id, int)
+                and 0 <= source_id < len(posts)
+                and source_id not in seen
+            ):
+                result.append(source_id)
+                seen.add(source_id)
+
+        return result
+
+    def _find_matching_event_index(
+        self,
+        events: List[Dict[str, Any]],
+        candidate: Dict[str, Any],
+        posts: List[Dict[str, Any]],
+    ) -> Optional[int]:
+        candidate_ids = set(
+            self._valid_source_ids(
+                candidate.get("source_ids"),
+                posts,
+            )
+        )
+
+        for idx, event in enumerate(events):
+            event_ids = set(
+                self._valid_source_ids(
+                    event.get("source_ids"),
+                    posts,
+                )
+            )
+
+            if candidate_ids & event_ids:
+                return idx
+
+        for idx, event in enumerate(events):
+            if self._events_are_same(event, candidate, posts):
+                return idx
+
+        return None
+
+    def _find_event_for_post(
+        self,
+        events: List[Dict[str, Any]],
+        source_id: int,
+        posts: List[Dict[str, Any]],
+    ) -> Optional[int]:
+        if not (0 <= source_id < len(posts)):
+            return None
+
+        post_text = (posts[source_id].get("text") or "").strip()
+        if not post_text:
+            return None
+
+        for idx, event in enumerate(events):
+            for ref_text in self._event_reference_texts(event, posts):
+                if self._texts_same_event(post_text, ref_text):
+                    return idx
+
+        return None
+
+    def _events_are_same(
+        self,
+        left: Dict[str, Any],
+        right: Dict[str, Any],
+        posts: List[Dict[str, Any]],
+    ) -> bool:
+        # Якщо Telegram document_id однаковий, це фактично те саме медіа,
+        # навіть коли два канали переписали caption зовсім по-різному.
+        left_media_ids = self._event_media_document_ids(left, posts)
+        right_media_ids = self._event_media_document_ids(right, posts)
+        if left_media_ids and right_media_ids and (left_media_ids & right_media_ids):
+            return True
+
+        left_texts = self._event_reference_texts(left, posts)
+        right_texts = self._event_reference_texts(right, posts)
+
+        for left_text in left_texts[:8]:
+            for right_text in right_texts[:8]:
+                if self._texts_same_event(left_text, right_text):
+                    return True
+
+        # Для фізичних атак звичайний text-similarity часто слабкий: один канал
+        # пише коротко "момент прильоту", інший — повний список наслідків.
+        # Використовуємо вже наявний консервативний attack-anchor matcher, який
+        # вимагає конкретний спільний топонім/об'єкт/ціль, а не слово "удар".
+        for left_text in left_texts[:8]:
+            if not self._looks_like_attack_text(left_text):
+                continue
+            for right_text in right_texts[:8]:
+                if self._attack_same_story_anchor_match(left_text, right_text):
+                    return True
+
+        return False
+
+    def _event_media_document_ids(
+        self,
+        event: Dict[str, Any],
+        posts: List[Dict[str, Any]],
+    ) -> set:
+        result = set()
+        for source_id in self._valid_source_ids(event.get("source_ids"), posts):
+            value = posts[source_id].get("media_document_id")
+            if isinstance(value, int) and value:
+                result.add(value)
+            elif isinstance(value, str) and value.strip():
+                result.add(value.strip())
+        return result
+
+    def _event_reference_texts(
+        self,
+        event: Dict[str, Any],
+        posts: List[Dict[str, Any]],
+    ) -> List[str]:
+        texts: List[str] = []
+
+        for source_id in self._valid_source_ids(
+            event.get("source_ids"),
+            posts,
+        ):
+            text = (posts[source_id].get("text") or "").strip()
+            if text:
+                texts.append(text)
+
+        for field in [
+            "headline_hint",
+            "summary",
+            "why_it_matters",
+        ]:
+            value = event.get(field)
+            if isinstance(value, str) and value.strip():
+                texts.append(value.strip())
+
+        key_facts = event.get("key_facts")
+        if isinstance(key_facts, list):
+            facts_text = " ".join(
+                str(item).strip()
+                for item in key_facts[:6]
+                if str(item).strip()
+            )
+            if facts_text:
+                texts.append(facts_text)
+
+        return texts
+
+    @staticmethod
+    def _normalize_similarity_text(text: str) -> str:
+        text = str(text or "").lower()
+        text = re.sub(r"https?://\S+|t\.me/\S+", " ", text)
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = re.sub(r"[^0-9a-zа-яіїєґёъыэ\s-]", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
+
+    def _texts_same_event(
+        self,
+        left: str,
+        right: str,
+    ) -> bool:
+        a = self._normalize_similarity_text(left)
+        b = self._normalize_similarity_text(right)
+
+        if not a or not b:
+            return False
+
+        if a == b:
+            return True
+
+        shorter = min(len(a), len(b))
+        longer = max(len(a), len(b))
+
+        if (
+            shorter >= 45
+            and (a in b or b in a)
+            and shorter / max(longer, 1) >= 0.55
+        ):
+            return True
+
+        seq_ratio = SequenceMatcher(
+            None,
+            a[:1200],
+            b[:1200],
+        ).ratio()
+
+        tokens_a = {
+            token
+            for token in re.findall(
+                r"[0-9a-zа-яіїєґёъыэ-]{3,}",
+                a,
+            )
+        }
+        tokens_b = {
+            token
+            for token in re.findall(
+                r"[0-9a-zа-яіїєґёъыэ-]{3,}",
+                b,
+            )
+        }
+
+        if not tokens_a or not tokens_b:
+            return seq_ratio >= 0.88
+
+        common = tokens_a & tokens_b
+        union = tokens_a | tokens_b
+
+        jaccard = len(common) / max(len(union), 1)
+        overlap = len(common) / max(
+            min(len(tokens_a), len(tokens_b)),
+            1,
+        )
+
+        if seq_ratio >= 0.82:
+            return True
+
+        if (
+            len(common) >= 6
+            and overlap >= 0.58
+            and jaccard >= 0.40
+        ):
+            return True
+
+        if (
+            len(common) >= 9
+            and overlap >= 0.54
+            and jaccard >= 0.34
+        ):
+            return True
+
+        return False
+
+    def _merge_events(
+        self,
+        base: Dict[str, Any],
+        incoming: Dict[str, Any],
+        posts: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        merged = dict(base)
+
+        source_ids = self._valid_source_ids(
+            list(base.get("source_ids", []) or [])
+            + list(incoming.get("source_ids", []) or []),
+            posts,
+        )
+        merged["source_ids"] = source_ids
+
+        # Основний Analyzer зазвичай має кращий широкий контекст, тому його
+        # поля лишаємо. Recovery заповнює лише порожні місця.
+        for field in [
+            "headline_hint",
+            "summary",
+            "why_it_matters",
+            "event_type",
+            "category",
+            "digest_role",
+            "is_discovery_candidate",
+            "best_factual_source_id",
+            "best_media_source_id",
+        ]:
+            current = merged.get(field)
+            incoming_value = incoming.get(field)
+            if (
+                (current is None or current == "" or current == [])
+                and incoming_value not in (None, "", [])
+            ):
+                merged[field] = incoming_value
+
+        base_facts = merged.get("key_facts")
+        incoming_facts = incoming.get("key_facts")
+        if isinstance(base_facts, list) or isinstance(incoming_facts, list):
+            facts = []
+            seen = set()
+            for item in (
+                (base_facts if isinstance(base_facts, list) else [])
+                + (
+                    incoming_facts
+                    if isinstance(incoming_facts, list)
+                    else []
+                )
+            ):
+                value = str(item).strip()
+                key = value.lower()
+                if value and key not in seen:
+                    facts.append(value)
+                    seen.add(key)
+            merged["key_facts"] = facts[:8]
+
+        # Не стираємо history-state під час recovery/merge. Раніше тут
+        # eligible_for_digest безумовно ставав True, через що discovery-pass
+        # міг випадково "оживити" подію, яку Analyzer уже визнав повтором.
+        history_repeat = bool(
+            base.get("is_history_repeat", False)
+            or incoming.get("is_history_repeat", False)
+        )
+        history_hard_duplicate = bool(
+            base.get("history_hard_duplicate", False)
+            or incoming.get("history_hard_duplicate", False)
+        )
+        history_update = max(
+            self._safe_score(base.get("history_update_strength")),
+            self._safe_score(incoming.get("history_update_strength")),
+        )
+        merged["is_history_repeat"] = history_repeat
+        merged["history_hard_duplicate"] = history_hard_duplicate
+        merged["history_update_strength"] = history_update
+        # Якщо до вже перевіреної події домерджився НОВИЙ recovery-event,
+        # semantic review треба виконати ще раз уже на розширеному наборі фактів.
+        merged["history_semantic_reviewed"] = bool(
+            base.get("history_semantic_reviewed", False)
+            and incoming.get("history_semantic_reviewed", False)
+        )
+
+        priority_source_ids = [
+            source_id
+            for source_id in source_ids
+            if bool(posts[source_id].get("is_priority"))
+        ]
+        has_priority = bool(priority_source_ids)
+        merged["manual_merge_verified"] = (
+            len(priority_source_ids) <= 1
+            or self._priority_group_is_verified_duplicate(
+                priority_source_ids,
+                posts,
+            )
+        )
+
+        if has_priority:
+            merged["eligible_for_digest"] = True
+            merged["rejection_reason"] = ""
+        elif (
+            history_repeat
+            and history_update < self.HISTORY_SIGNIFICANT_UPDATE_MIN
+        ):
+            merged["eligible_for_digest"] = False
+            merged["rejection_reason"] = (
+                str(
+                    base.get("rejection_reason")
+                    or incoming.get("rejection_reason")
+                    or "Повтор уже опублікованої події без значущого розвитку."
+                ).strip()
+            )
+        else:
+            merged["eligible_for_digest"] = bool(
+                base.get("eligible_for_digest", False)
+                or incoming.get("eligible_for_digest", False)
+            )
+            if merged["eligible_for_digest"]:
+                merged["rejection_reason"] = ""
+            else:
+                merged["rejection_reason"] = str(
+                    base.get("rejection_reason")
+                    or incoming.get("rejection_reason")
+                    or ""
+                ).strip()
+
+        return merged
+
+    def _unique_event_id(
+        self,
+        preferred: str,
+        events: List[Dict[str, Any]],
+    ) -> str:
+        preferred = re.sub(
+            r"[^A-Za-z0-9_-]+",
+            "_",
+            preferred or "P_RECOVER",
+        ).strip("_") or "P_RECOVER"
+
+        existing = {
+            str(ev.get("event_id") or "")
+            for ev in events
+        }
+
+        if preferred not in existing:
+            return preferred
+
+        counter = 2
+        while f"{preferred}_{counter}" in existing:
+            counter += 1
+
+        return f"{preferred}_{counter}"
+
+    def _group_priority_ids_by_similarity(
+        self,
+        source_ids: List[int],
+        posts: List[Dict[str, Any]],
+    ) -> List[List[int]]:
+        groups: List[List[int]] = []
+
+        for source_id in source_ids:
+            text = (posts[source_id].get("text") or "").strip()
+            placed = False
+
+            for group in groups:
+                if any(
+                    self._texts_same_event(
+                        text,
+                        posts[other_id].get("text") or "",
+                    )
+                    for other_id in group
+                ):
+                    group.append(source_id)
+                    placed = True
+                    break
+
+            if not placed:
+                groups.append([source_id])
+
+        return groups
+
+    def _build_synthetic_priority_event(
+        self,
+        source_ids: List[int],
+        posts: List[Dict[str, Any]],
+        sequence: int,
+    ) -> Dict[str, Any]:
+        source_ids = self._valid_source_ids(source_ids, posts)
+        if not source_ids:
+            raise ValueError("Synthetic priority event without source_ids")
+
+        # Для тексту беремо найінформативніший manual-post, а для публікації
+        # ranking пізніше окремо вибере найкращий factual/media source.
+        text_source_id = max(
+            source_ids,
+            key=lambda source_id: len(
+                posts[source_id].get("text") or ""
+            ),
+        )
+        source_text = (
+            posts[text_source_id].get("text") or ""
+        ).strip()
+
+        sentences = self._extract_sentences(source_text)
+        if not sentences and source_text:
+            sentences = [source_text]
+
+        headline = self._priority_headline_from_text(source_text)
+        summary_sentences = [
+            self._ensure_sentence_end(sentence)
+            for sentence in sentences[:2]
+            if sentence.strip()
+        ]
+        summary = " ".join(summary_sentences).strip()
+        if not summary:
+            summary = self._ensure_sentence_end(
+                source_text[:400].strip()
+            )
+
+        key_facts = [
+            self._ensure_sentence_end(sentence)
+            for sentence in sentences[:5]
+            if sentence.strip()
+        ]
+
+        category, event_type = self._infer_priority_category_and_type(
+            source_text
+        )
+
+        has_video = any(
+            posts[source_id].get("has_video")
+            for source_id in source_ids
+        )
+        has_media = any(
+            posts[source_id].get("has_media")
+            for source_id in source_ids
+        )
+        manual_media_source = self._manual_locked_media_source(
+            source_ids,
+            posts,
+            text_source_id,
+        )
+
+        return {
+            "event_id": f"P_SYNTH_{sequence}",
+            "source_ids": source_ids,
+            "best_factual_source_id": text_source_id,
+            "best_media_source_id": manual_media_source,
+            "manual_media_locked": manual_media_source is not None,
+            "manual_media_source_id": manual_media_source,
+            "eligible_for_digest": True,
+            "rejection_reason": "",
+            "digest_role": (
+                "discovery"
+                if category in {"technology", "science", "culture"}
+                else "core"
+            ),
+            "is_discovery_candidate": (
+                category in {"technology", "science", "culture"}
+            ),
+            "event_type": event_type,
+            "category": category,
+            "importance": 72,
+            "scale": 60,
+            "reliability": 78,
+            "public_interest": 75,
+            "novelty": 85,
+            "curiosity": 78,
+            "practical_value": 45,
+            "media_quality": (
+                88
+                if has_video
+                else (75 if has_media else 35)
+            ),
+            "national_relevance": 68,
+            "urgency": 85,
+            "is_history_repeat": False,
+            "history_update_strength": 0,
+            "manual_merge_verified": (
+                len(source_ids) <= 1
+                or self._priority_group_is_verified_duplicate(source_ids, posts)
+            ),
+            "headline_hint": headline,
+            "key_facts": key_facts,
+            "why_it_matters": "",
+            "summary": summary,
+        }
+
+    def _priority_headline_from_text(
+        self,
+        text: str,
+    ) -> str:
+        clean = re.sub(r"https?://\S+|t\.me/\S+", " ", text or "")
+        clean = re.sub(r"<[^>]+>", " ", clean)
+        clean = re.sub(r"\s+", " ", clean).strip()
+
+        if not clean:
+            return "Пріоритетна подія"
+
+        first_sentence = re.split(r"(?<=[.!?])\s+", clean)[0]
+        first_sentence = first_sentence.strip(" -–—:;,.!?")
+
+        # Забираємо частину декоративних символів на початку, але не
+        # переписуємо сам зміст.
+        first_sentence = re.sub(
+            r"^[^0-9A-Za-zА-Яа-яІіЇїЄєҐґ]+",
+            "",
+            first_sentence,
+        ).strip()
+
+        if len(first_sentence) > 110:
+            first_sentence = self._truncate_plain_text(
+                first_sentence,
+                110,
+            )
+
+        return first_sentence or "Пріоритетна подія"
+
+    @staticmethod
+    def _truncate_plain_text(
+        text: str,
+        max_chars: int,
+    ) -> str:
+        if len(text) <= max_chars:
+            return text.strip()
+
+        candidate = text[:max_chars].rstrip()
+        last_space = candidate.rfind(" ")
+        if last_space >= int(max_chars * 0.65):
+            candidate = candidate[:last_space]
+
+        return candidate.rstrip(" ,;:-") + "…"
+
+    @staticmethod
+    def _infer_priority_category_and_type(
+        text: str,
+    ) -> tuple:
+        t = str(text or "").lower()
+
+        if any(
+            key in t
+            for key in [
+                "обстріл", "атака", "ракет", "дрон", "бпла",
+                "фронт", "зсу", "окуп", "військ", "ппо",
+                "бойов", "удар", "сбу", "гур", "розвід",
+            ]
+        ):
+            event_type = (
+                "major_attack"
+                if any(
+                    key in t
+                    for key in [
+                        "обстріл", "атака", "ракет", "дрон",
+                        "бпла", "влуч", "удар",
+                    ]
+                )
+                else "military_event"
+            )
+            return "war", event_type
+
+        if any(
+            key in t
+            for key in [
+                "дбр", "прокурат", "підозр", "затрим", "вбив",
+                "стрілянин", "злочин", "поліці",
+            ]
+        ):
+            return "society", "major_crime"
+
+        if any(
+            key in t
+            for key in [
+                "верховн", "рада", "кабмін", "уряд", "президент",
+                "зеленськ", "міністр", "закон", "постанова",
+                "вибор", "депутат",
+            ]
+        ):
+            return "politics", "political_decision"
+
+        if any(
+            key in t
+            for key in [
+                "сша", "євросоюз", "нато", "польщ", "німеч",
+                "франц", "британ", "трамп", "європ", "китай",
+                "япон", "канада", "румун", "угорщ",
+            ]
+        ):
+            return "international", "international_decision"
+
+        if any(
+            key in t
+            for key in [
+                "грн", "долар", "євро", "банк", "бюджет", "подат",
+                "тариф", "економ", "ринок", "компан", "завод",
+                "виробництв", "контракт", "зарплат", "пенсі",
+            ]
+        ):
+            return "economy", "economic_event"
+
+        if any(
+            key in t
+            for key in [
+                "штучн", "інтелект", "нейромереж", "ai ", "gpt",
+                "технолог", "стартап", "робот", "кібер", "додаток",
+                "смартфон", "комп'ют", "чип", "процесор",
+            ]
+        ):
+            return "technology", "science_tech"
+
+        if any(
+            key in t
+            for key in [
+                "вчен", "дослід", "науков", "відкрит", "медицин",
+                "лікуван", "біолог", "космос", "фізик", "хімі",
+            ]
+        ):
+            return "science", "science_tech"
+
+        if any(
+            key in t
+            for key in [
+                "фільм", "музик", "культур", "театр", "музей",
+                "книг", "премі", "фестив",
+            ]
+        ):
+            return "culture", "culture_event"
+
+        return "society", "social_event"
+
+    @staticmethod
+    def _event_text_bundle(ev: Dict[str, Any]) -> str:
+        parts = [
+            str(ev.get("headline_hint") or "").strip(),
+            str(ev.get("summary") or "").strip(),
+            str(ev.get("why_it_matters") or "").strip(),
+        ]
+        facts = ev.get("key_facts")
+        if isinstance(facts, list):
+            parts.extend(
+                str(item).strip()
+                for item in facts[:8]
+                if str(item).strip()
+            )
+        return " ".join(part for part in parts if part)
+
+    @staticmethod
+    def _looks_like_attack_text(text: str) -> bool:
+        t = NewsSummarizer._normalize_similarity_text(text)
+
+        # "кібератака" не є фізичним ударом. Раніше substring "атак"
+        # заводив Claude/Anthropic та інші cyber-історії в attack-matcher.
+        cyber_only = any(
+            marker in t
+            for marker in ("кібератак", "cyberattack", "кібершпиг", "хакер")
+        )
+        physical_markers = (
+            "обстр", " удар", "удар ", "дрон", "бпла",
+            "ракет", "влуч", "вибух", "шахед",
+        )
+        if cyber_only and not any(marker in t for marker in physical_markers):
+            return False
+
+        return any(
+            stem in t
+            for stem in (
+                "обстр", "атак", "удар", "дрон", "бпла",
                 "ракет", "влуч", "вибух", "шахед",
             )
-            if cyber_only and not any(marker in t for marker in physical_markers):
-                return False
-    
-            return any(
-                stem in t
-                for stem in (
-                    "обстр", "атак", "удар", "дрон", "бпла",
-                    "ракет", "влуч", "вибух", "шахед",
-                )
-            )
-    
-        def _event_is_physical_attack(self, ev: Dict[str, Any]) -> bool:
-            category = str(ev.get("category") or "").strip().lower()
-            event_type = str(ev.get("event_type") or "").strip().lower()
-            attack_types = {
-                "major_attack",
-                "routine_attack",
-                "military_event",
-                "critical_infrastructure",
-            }
-            if category != "war" and event_type not in attack_types:
-                return False
-            return self._looks_like_attack_text(self._event_text_bundle(ev))
-    
-        @staticmethod
-        def _extract_casualty_counts(text: str) -> Dict[str, int]:
-            """Грубо витягує числа загиблих/поранених із короткого опису."""
-            normalized = NewsSummarizer._normalize_similarity_text(text)
-            tokens = re.findall(r"[0-9а-яіїєґa-z'-]+", normalized)
-    
-            word_numbers = {
-                "один": 1, "одна": 1, "одну": 1, "одного": 1,
-                "два": 2, "дві": 2, "двоє": 2, "двох": 2,
-                "три": 3, "троє": 3, "трьох": 3,
-                "чотири": 4, "четверо": 4, "чотирьох": 4,
-                "п'ять": 5, "пять": 5, "п'ятеро": 5, "пятеро": 5,
-                "шість": 6, "шестеро": 6,
-                "сім": 7, "семеро": 7,
-                "вісім": 8, "восьмеро": 8,
-                "дев'ять": 9, "девять": 9, "дев'ятеро": 9,
-                "десять": 10, "десятеро": 10,
-            }
-    
-            def token_number(token: str) -> Optional[int]:
-                if token.isdigit():
-                    try:
-                        value = int(token)
-                    except ValueError:
-                        return None
-                    return value if 0 <= value <= 500 else None
-                return word_numbers.get(token)
-    
-            result = {"dead": 0, "wounded": 0}
-            for idx, token in enumerate(tokens):
-                if any(stem in token for stem in ("загин", "жертв")):
-                    kind = "dead"
-                elif any(stem in token for stem in ("поран", "постраж")):
-                    kind = "wounded"
-                else:
-                    continue
-    
-                candidates = []
-                for pos in range(max(0, idx - 4), min(len(tokens), idx + 5)):
-                    number = token_number(tokens[pos])
-                    if number is not None:
-                        candidates.append((abs(pos - idx), number))
-    
-                if candidates:
-                    candidates.sort(key=lambda item: item[0])
-                    result[kind] = max(result[kind], candidates[0][1])
-    
-            return result
-    
-        @staticmethod
-        def _strong_attack_signal_set(text: str) -> set:
-            t = NewsSummarizer._normalize_similarity_text(text)
-            signals = {
-                "mass_attack": ("масован", "комбінован"),
-                "critical": ("критичн", "стратегічн"),
-                "energy": ("енергет", "підстанц", "електростанц", " тес ", " гес "),
-                "oil": ("нпз", "нафтоперероб", "нафтобаз"),
-                "military_target": ("аеродром", "військов", "склад боєприпас"),
-                "transport": ("порт", "залізнич", "пункт пропуску", "мост"),
-                "shutdown": ("зупинено роботу", "зупинив роботу", "припинив роботу", "припинено роботу"),
-                "blackout": ("знеструм", "без світла", "відключен"),
-                "evacuation": ("евакуац",),
-                "destroyed": ("зруйнован", "знищен"),
-                "large_fire": ("масштабн пожеж", "велика пожеж"),
-            }
-            found = set()
-            padded = f" {t} "
-            for name, stems in signals.items():
-                if any(stem in padded for stem in stems):
-                    found.add(name)
-            return found
-    
-        def _has_strong_attack_consequence(self, text: str) -> bool:
-            casualties = self._extract_casualty_counts(text)
-            if casualties["dead"] > 0:
-                return True
-            if casualties["wounded"] >= 8:
-                return True
-            return bool(self._strong_attack_signal_set(text))
-    
-        @staticmethod
-        def _looks_like_air_defense_summary_text(text: str) -> bool:
-            """Чи схожий текст саме на агреговане статистичне зведення ППО."""
-            t = NewsSummarizer._normalize_similarity_text(text)
-            if not t:
-                return False
-    
-            defense_markers = (
-                "ппо", "повітряні сили", "протиповітрян",
-                "повітряних ціл", "повітряні цілі",
-            )
-            weapon_markers = (
-                "бпла", "дрон", "шахед", "ракет",
-                "засоб ураж", "повітрян ціл",
-            )
-            result_markers = (
-                "збито", "збили", "знищено", "подавлено",
-                "знешкоджено", "перехоплено", "відбила атаку",
-                "відбили атаку", "знищили", "подавили",
-            )
-    
-            return (
-                any(marker in t for marker in defense_markers)
-                and any(marker in t for marker in weapon_markers)
-                and any(marker in t for marker in result_markers)
-                and bool(re.search(r"\b\d{1,4}\b", t))
-            )
-    
-        def _is_air_defense_summary_event(
-            self,
-            ev: Dict[str, Any],
-            posts: List[Dict[str, Any]],
-        ) -> bool:
-            text = self._event_source_text_bundle(ev, posts)
-            if not self._looks_like_air_defense_summary_text(text):
-                return False
-    
-            # Великий самостійний наслідок — уже окрема новина, а не просто зведення.
-            if self._has_strong_attack_consequence(text):
-                return False
-            if self._has_strategic_attack_context(ev, posts):
-                return False
+        )
+
+    def _event_is_physical_attack(self, ev: Dict[str, Any]) -> bool:
+        category = str(ev.get("category") or "").strip().lower()
+        event_type = str(ev.get("event_type") or "").strip().lower()
+        attack_types = {
+            "major_attack",
+            "routine_attack",
+            "military_event",
+            "critical_infrastructure",
+        }
+        if category != "war" and event_type not in attack_types:
+            return False
+        return self._looks_like_attack_text(self._event_text_bundle(ev))
+
+    @staticmethod
+    def _extract_casualty_counts(text: str) -> Dict[str, int]:
+        """Грубо витягує числа загиблих/поранених із короткого опису."""
+        normalized = NewsSummarizer._normalize_similarity_text(text)
+        tokens = re.findall(r"[0-9а-яіїєґa-z'-]+", normalized)
+
+        word_numbers = {
+            "один": 1, "одна": 1, "одну": 1, "одного": 1,
+            "два": 2, "дві": 2, "двоє": 2, "двох": 2,
+            "три": 3, "троє": 3, "трьох": 3,
+            "чотири": 4, "четверо": 4, "чотирьох": 4,
+            "п'ять": 5, "пять": 5, "п'ятеро": 5, "пятеро": 5,
+            "шість": 6, "шестеро": 6,
+            "сім": 7, "семеро": 7,
+            "вісім": 8, "восьмеро": 8,
+            "дев'ять": 9, "девять": 9, "дев'ятеро": 9,
+            "десять": 10, "десятеро": 10,
+        }
+
+        def token_number(token: str) -> Optional[int]:
+            if token.isdigit():
+                try:
+                    value = int(token)
+                except ValueError:
+                    return None
+                return value if 0 <= value <= 500 else None
+            return word_numbers.get(token)
+
+        result = {"dead": 0, "wounded": 0}
+        for idx, token in enumerate(tokens):
+            if any(stem in token for stem in ("загин", "жертв")):
+                kind = "dead"
+            elif any(stem in token for stem in ("поран", "постраж")):
+                kind = "wounded"
+            else:
+                continue
+
+            candidates = []
+            for pos in range(max(0, idx - 4), min(len(tokens), idx + 5)):
+                number = token_number(tokens[pos])
+                if number is not None:
+                    candidates.append((abs(pos - idx), number))
+
+            if candidates:
+                candidates.sort(key=lambda item: item[0])
+                result[kind] = max(result[kind], candidates[0][1])
+
+        return result
+
+    @staticmethod
+    def _strong_attack_signal_set(text: str) -> set:
+        t = NewsSummarizer._normalize_similarity_text(text)
+        signals = {
+            "mass_attack": ("масован", "комбінован"),
+            "critical": ("критичн", "стратегічн"),
+            "energy": ("енергет", "підстанц", "електростанц", " тес ", " гес "),
+            "oil": ("нпз", "нафтоперероб", "нафтобаз"),
+            "military_target": ("аеродром", "військов", "склад боєприпас"),
+            "transport": ("порт", "залізнич", "пункт пропуску", "мост"),
+            "shutdown": ("зупинено роботу", "зупинив роботу", "припинив роботу", "припинено роботу"),
+            "blackout": ("знеструм", "без світла", "відключен"),
+            "evacuation": ("евакуац",),
+            "destroyed": ("зруйнован", "знищен"),
+            "large_fire": ("масштабн пожеж", "велика пожеж"),
+        }
+        found = set()
+        padded = f" {t} "
+        for name, stems in signals.items():
+            if any(stem in padded for stem in stems):
+                found.add(name)
+        return found
+
+    def _has_strong_attack_consequence(self, text: str) -> bool:
+        casualties = self._extract_casualty_counts(text)
+        if casualties["dead"] > 0:
             return True
-    
-        def _is_recent_air_defense_summary_duplicate(
-            self,
-            event: Dict[str, Any],
-            posts: List[Dict[str, Any]],
-            history: Dict[str, str],
-        ) -> bool:
-            """Добова редакційна квота: максимум одне агреговане зведення ППО."""
-            age_hours = self._history_age_hours(history)
-            if (
-                age_hours is None
-                or age_hours > self.DAILY_AIR_DEFENSE_SUMMARY_LOCK_HOURS
-            ):
-                return False
-    
-            if not self._is_air_defense_summary_event(event, posts):
-                return False
-    
-            history_text = " ".join(
-                value
-                for value in [
-                    str(history.get("title") or ""),
-                    str(history.get("summary") or ""),
-                ]
-                if value
-            )
-            return self._looks_like_air_defense_summary_text(history_text)
-    
-        @staticmethod
-        def _strategic_geopolitical_signal(text: str) -> bool:
-            """
-            Консервативний сигнал геополітичної ваги БЕЗ прив'язки до жертв.
-    
-            Важливо не зробити винятком кожну згадку Польщі/НАТО. Тому для
-            звичайного випадку вимагаємо одночасно:
-            1) високопоставлену особу / офіційну делегацію;
-            2) міжнародний або прикордонний контекст;
-            3) ознаку прямої присутності/ризику під час інциденту.
-    
-            Окремо пропускаємо явний факт порушення/ризику на території НАТО.
-            """
-            t = NewsSummarizer._normalize_similarity_text(text)
-            if not t:
-                return False
-    
-            high_profile = (
-                "президент", "прем єр", "прем'єр", "премєр",
-                "канцлер", "глава уряду", "керівник держав",
-                "міністр", "радник канцлер", "радники канцлер",
-                "радник президент", "радники президент",
-                "офіційн делегац", "урядов делегац",
-                "дипломатичн делегац", "європейськ лідер",
-                "світов лідер", "високопосадов",
-            )
-            international_context = (
-                "нато", "єс", "євросоюз", "польщ", "румун",
-                "словач", "угорщ", "литв", "латві", "естон",
-                "кордон", "прикордон", "міжнародн потяг",
-                "міжнародн поїзд", "делегац", "дипломатичн маршрут",
-            )
-            direct_risk = (
-                "під час атак", "на момент атак", "у момент атак",
-                "під час удар", "на момент удар", "у момент удар",
-                "перебував", "перебували", "знаходився", "знаходилися",
-                "був у потяз", "були у потяз", "був у поїзд", "були у поїзд",
-                "біля кордон", "поблизу кордон", "поруч",
-                "у зоні ризик", "на борту",
-            )
-    
-            has_high_profile = any(marker in t for marker in high_profile)
-            has_international = any(
-                marker in t for marker in international_context
-            )
-            has_direct_risk = any(marker in t for marker in direct_risk)
-    
-            if has_high_profile and has_international and has_direct_risk:
-                return True
-    
-            # Сильний окремий сигнал потенційної міждержавної ескалації.
-            nato_escalation = (
-                ("нато" in t or "польщ" in t or "румун" in t)
-                and any(
-                    marker in t
-                    for marker in (
-                        "перетнув кордон", "перетнули кордон",
-                        "повітрян простір", "залетів", "залетіли",
-                        "впав на територ", "влучив на територ",
-                        "удар по територ", "атака на територ",
-                    )
+        if casualties["wounded"] >= 8:
+            return True
+        return bool(self._strong_attack_signal_set(text))
+
+    @staticmethod
+    def _looks_like_air_defense_summary_text(text: str) -> bool:
+        """Чи схожий текст саме на агреговане статистичне зведення ППО."""
+        t = NewsSummarizer._normalize_similarity_text(text)
+        if not t:
+            return False
+
+        defense_markers = (
+            "ппо", "повітряні сили", "протиповітрян",
+            "повітряних ціл", "повітряні цілі",
+        )
+        weapon_markers = (
+            "бпла", "дрон", "шахед", "ракет",
+            "засоб ураж", "повітрян ціл",
+        )
+        result_markers = (
+            "збито", "збили", "знищено", "подавлено",
+            "знешкоджено", "перехоплено", "відбила атаку",
+            "відбили атаку", "знищили", "подавили",
+        )
+
+        return (
+            any(marker in t for marker in defense_markers)
+            and any(marker in t for marker in weapon_markers)
+            and any(marker in t for marker in result_markers)
+            and bool(re.search(r"\b\d{1,4}\b", t))
+        )
+
+    def _is_air_defense_summary_event(
+        self,
+        ev: Dict[str, Any],
+        posts: List[Dict[str, Any]],
+    ) -> bool:
+        text = self._event_source_text_bundle(ev, posts)
+        if not self._looks_like_air_defense_summary_text(text):
+            return False
+
+        # Великий самостійний наслідок — уже окрема новина, а не просто зведення.
+        if self._has_strong_attack_consequence(text):
+            return False
+        if self._has_strategic_attack_context(ev, posts):
+            return False
+        return True
+
+    def _is_recent_air_defense_summary_duplicate(
+        self,
+        event: Dict[str, Any],
+        posts: List[Dict[str, Any]],
+        history: Dict[str, str],
+    ) -> bool:
+        """Добова редакційна квота: максимум одне агреговане зведення ППО."""
+        age_hours = self._history_age_hours(history)
+        if (
+            age_hours is None
+            or age_hours > self.DAILY_AIR_DEFENSE_SUMMARY_LOCK_HOURS
+        ):
+            return False
+
+        if not self._is_air_defense_summary_event(event, posts):
+            return False
+
+        history_text = " ".join(
+            value
+            for value in [
+                str(history.get("title") or ""),
+                str(history.get("summary") or ""),
+            ]
+            if value
+        )
+        return self._looks_like_air_defense_summary_text(history_text)
+
+    @staticmethod
+    def _strategic_geopolitical_signal(text: str) -> bool:
+        """
+        Консервативний сигнал геополітичної ваги БЕЗ прив'язки до жертв.
+
+        Важливо не зробити винятком кожну згадку Польщі/НАТО. Тому для
+        звичайного випадку вимагаємо одночасно:
+        1) високопоставлену особу / офіційну делегацію;
+        2) міжнародний або прикордонний контекст;
+        3) ознаку прямої присутності/ризику під час інциденту.
+
+        Окремо пропускаємо явний факт порушення/ризику на території НАТО.
+        """
+        t = NewsSummarizer._normalize_similarity_text(text)
+        if not t:
+            return False
+
+        high_profile = (
+            "президент", "прем єр", "прем'єр", "премєр",
+            "канцлер", "глава уряду", "керівник держав",
+            "міністр", "радник канцлер", "радники канцлер",
+            "радник президент", "радники президент",
+            "офіційн делегац", "урядов делегац",
+            "дипломатичн делегац", "європейськ лідер",
+            "світов лідер", "високопосадов",
+        )
+        international_context = (
+            "нато", "єс", "євросоюз", "польщ", "румун",
+            "словач", "угорщ", "литв", "латві", "естон",
+            "кордон", "прикордон", "міжнародн потяг",
+            "міжнародн поїзд", "делегац", "дипломатичн маршрут",
+        )
+        direct_risk = (
+            "під час атак", "на момент атак", "у момент атак",
+            "під час удар", "на момент удар", "у момент удар",
+            "перебував", "перебували", "знаходився", "знаходилися",
+            "був у потяз", "були у потяз", "був у поїзд", "були у поїзд",
+            "біля кордон", "поблизу кордон", "поруч",
+            "у зоні ризик", "на борту",
+        )
+
+        has_high_profile = any(marker in t for marker in high_profile)
+        has_international = any(
+            marker in t for marker in international_context
+        )
+        has_direct_risk = any(marker in t for marker in direct_risk)
+
+        if has_high_profile and has_international and has_direct_risk:
+            return True
+
+        # Сильний окремий сигнал потенційної міждержавної ескалації.
+        nato_escalation = (
+            ("нато" in t or "польщ" in t or "румун" in t)
+            and any(
+                marker in t
+                for marker in (
+                    "перетнув кордон", "перетнули кордон",
+                    "повітрян простір", "залетів", "залетіли",
+                    "впав на територ", "влучив на територ",
+                    "удар по територ", "атака на територ",
                 )
             )
-            return nato_escalation
-    
-        def _event_source_text_bundle(
-            self,
-            ev: Dict[str, Any],
-            posts: List[Dict[str, Any]],
-        ) -> str:
-            chunks = [self._event_text_bundle(ev)]
-            for source_id in self._valid_source_ids(ev.get("source_ids"), posts)[:6]:
-                text = str(posts[source_id].get("text") or "").strip()
-                if text:
-                    chunks.append(text[:1800])
-            return " ".join(chunk for chunk in chunks if chunk)
-    
-        def _has_strategic_attack_context(
-            self,
-            ev: Dict[str, Any],
-            posts: List[Dict[str, Any]],
-        ) -> bool:
-            text = self._event_source_text_bundle(ev, posts)
-            if not self._looks_like_attack_text(text):
-                return False
-            return self._strategic_geopolitical_signal(text)
-    
-        @staticmethod
-        def _regional_center_signal(text: str) -> bool:
-            """Консервативний matcher Києва та обласних центрів України."""
-            return bool(NewsSummarizer._regional_center_names(text))
-    
-        @staticmethod
-        def _notable_attack_target_signal(text: str) -> bool:
-            t = NewsSummarizer._normalize_similarity_text(text)
-            if not t:
-                return False
-            markers = (
-                "завод", "підприємств", "виробництв", "нпз", "нафтоперероб",
-                "нафтобаз", "електростан", "підстанц", "тес ", "гес ", "аес ",
-                "порт", "термінал", "аеропорт", "вокзал", "депо", "залізниц",
-                "логіст", "склад", "дата-центр", "дата центр", "бізнес-центр",
-                "бізнес центр", "торговельн", "торговий центр", "тц ",
-                "мост", "елеватор", "енергетич", "інфраструктур",
-            )
-            padded = f" {t} "
-            return any(marker in padded for marker in markers)
-    
-        @staticmethod
-        def _direct_impact_text_signal(text: str) -> bool:
-            t = NewsSummarizer._normalize_similarity_text(text)
-            if not t:
-                return False
-    
-            strong = (
-                "влуч", "приліт", "прильот", "атакував ", "атакували ",
-                "зруйн", "руйнув", "пошкод", "пожеж", "горить", "палає",
-                "наслідк", "стовп диму", "дим над ", "димить",
-            )
-            if any(marker in t for marker in strong):
-                return True
-    
-            # Для "удар/удару" потрібна конкретика кадрів або цілі; одне слово
-            # "удар" у переказі новини саме по собі ще не робить її video-first.
-            if "удар" in t and any(
-                marker in t
-                for marker in ("відео", "кадри", "момент", " по ")
-            ):
-                return True
-    
-            # Саме слово "вибух" занадто широке. Беремо його лише коли caption
-            # прямо каже, що це кадри/момент конкретного інциденту.
-            return (
-                "вибух" in t
-                and any(marker in t for marker in ("відео", "кадри", "момент"))
-            )
-    
-        def _is_direct_impact_video_post(
-            self,
-            post: Dict[str, Any],
-        ) -> bool:
-            if not bool(post.get("has_video")):
-                return False
-    
-            text = str(post.get("text") or "").strip()
-            if not text or not self._looks_like_attack_text(text):
-                return False
-            if not self._direct_impact_text_signal(text):
-                return False
-    
-            # Вимагаємо або велике місто-центр, або конкретну помітну ціль.
-            return (
-                self._regional_center_signal(text)
-                or self._notable_attack_target_signal(text)
-            )
-    
-        def _is_direct_impact_video_event(
-            self,
-            ev: Dict[str, Any],
-            posts: List[Dict[str, Any]],
-        ) -> bool:
-            return any(
-                self._is_direct_impact_video_post(posts[source_id])
-                for source_id in self._valid_source_ids(ev.get("source_ids"), posts)
-            )
-    
-        def _is_low_value_attack_event(
-            self,
-            ev: Dict[str, Any],
-            posts: List[Dict[str, Any]],
-        ) -> bool:
-            """
-            Python-gate для рутинних атак, незалежний від event_type LLM.
-    
-            1-3 поранених + локальні пошкодження без загиблих, критичного /
-            стратегічного об'єкта, масштабних руйнувань або сильних кадрів
-            не повинні займати слот у короткому загальнонаціональному дайджесті.
-            """
-            if str(ev.get("category") or "") != "war":
-                return False
-    
-            text = self._event_source_text_bundle(ev, posts)
-            if not self._looks_like_attack_text(text):
-                return False
-    
-            # Геополітично чутлива атака не є "low-value" лише через 0 жертв.
-            # Напр., міжнародний потяг із політиками світового рівня біля
-            # польського кордону під час російської атаки.
-            if self._has_strategic_attack_context(ev, posts):
-                return False
-    
-            # Коротке video-first повідомлення з конкретним влучанням/наслідками
-            # у Києві, обласному центрі або по помітній цілі не є low-value лише
-            # через відсутність великої кількості тексту/жертв. Фінальний Vision
-            # все одно перевірить відповідність самого медіа тексту.
-            if self._is_direct_impact_video_event(ev, posts):
-                return False
-    
-            if self._has_strong_attack_consequence(text):
-                return False
-    
-            casualties = self._extract_casualty_counts(text)
-            wounded = casualties["wounded"]
-    
-            src_ids = self._valid_source_ids(ev.get("source_ids"), posts)
-            has_video = any(posts[s].get("has_video") for s in src_ids)
-            has_media = any(posts[s].get("has_media") for s in src_ids)
-            media_quality = self._safe_score(ev.get("media_quality"))
-    
-            # Сильні реальні кадри можуть зробити подію самостійно вагомою,
-            # але звичайна картинка/ілюстрація — ні.
-            if has_video and media_quality >= 82:
-                return False
-            if has_media and media_quality >= 92:
-                return False
-    
-            if 0 < wounded <= 3:
-                return True
-    
-            # Якщо кількість жертв не витягнулась, все одно прибираємо типову
-            # локальну атаку, коли сама модель дала дуже низьку цікавість/користь
-            # і немає жодного сильного наслідку.
-            return (
-                self._safe_score(ev.get("curiosity")) < 50
-                and self._safe_score(ev.get("practical_value")) < 50
-                and self._safe_score(ev.get("scale")) < 75
-                and media_quality < 75
-            )
-    
-        @staticmethod
-        def _concrete_numbers(text: str) -> set:
-            normalized = NewsSummarizer._normalize_similarity_text(text)
-            return set(re.findall(r"\b\d+(?:[.,]\d+)?\b", normalized))
-    
-        @staticmethod
-        def _looks_like_decision_story_text(text: str) -> bool:
-            """
-            Чи схожий текст на одноразову policy/legislative історію:
-            закон, санкційний пакет, угоду, мита/податки, постанову тощо.
-    
-            Це лише класифікатор для 24h dedup-lock, не оцінка важливості.
-            """
-            t = NewsSummarizer._normalize_similarity_text(text)
-            if not t:
-                return False
-    
-            markers = (
-                "законопро", "закон ", " закон", "санкц", "угод", "догов",
-                "постан", "ратифік", "ухвал", "схвал", "проголос", "затверд",
-                "підпис", "набув чинності", "набула чинності", "вступив у силу",
-                "мит ", " мито", "тариф", "подат", "акциз", "ветув", "вето",
-            )
-            return any(marker in f" {t} " for marker in markers)
-    
-        @staticmethod
-        def _decision_family_signature(text: str) -> set:
-            """
-            Тематичні сім'ї рішень. Вони потрібні, щоб "закон про шахрайські
-            кол-центри" не став hard-duplicate для "санкційного пакета США".
-            """
-            t = NewsSummarizer._normalize_similarity_text(text)
-            padded = f" {t} "
-    
-            families = {
-                "sanctions": (
-                    "санкц", "заморожен актив", "тіньов флот",
-                ),
-                "tariffs": (
-                    " мито", "мит ", "тариф",
-                ),
-                "taxes": (
-                    "подат", "пдв", "акциз",
-                ),
-                "agreement": (
-                    "угод", "догов", "меморанд", "ратифік",
-                ),
-                "aid_finance": (
-                    "допомог", "грант", "кредит", "фінансув",
-                ),
-                "visa_migration": (
-                    "віз", "міграц", "біжен", "перетин кордон",
-                ),
-                "regulation": (
-                    "законопро", " закон ", "постан", "регулюв", "правил",
-                ),
-            }
-    
-            found = set()
-            for family, needles in families.items():
-                if any(needle in padded for needle in needles):
-                    found.add(family)
-            return found
-    
-        @staticmethod
-        def _decision_geo_signature(text: str) -> set:
-            """
-            Канонічні геополітичні/інституційні якорі для policy-story.
-    
-            Тут, на відміну від загального entity matcher, США/РФ тощо корисні:
-            санкції США проти РФ та український закон — не одна історія.
-            """
-            t = NewsSummarizer._normalize_similarity_text(text)
-            padded = f" {t} "
-    
-            aliases = {
-                "usa": (
-                    " сша ", "америк", "конгрес", "палата представників",
-                    "сенат", "білий дім", "трамп",
-                ),
-                "russia": (
-                    " росі", " рф ", "москв",
-                ),
-                "iran": (
-                    "іран",
-                ),
-                "ukraine": (
-                    " украї", "верховна рада", "верховної ради",
-                    "кабмін", "зеленськ",
-                ),
-                "eu": (
-                    " єс ", "євросоюз", "європейськ союз",
-                ),
-                "uk": (
-                    "британ", "лондон",
-                ),
-                "china": (
-                    "китай", "пекін",
-                ),
-                "poland": (
-                    "польщ", "варшав",
-                ),
-            }
-    
-            found = set()
-            for name, needles in aliases.items():
-                if any(needle in padded for needle in needles):
-                    found.add(name)
-            return found
-    
-        def _same_decision_story(
-            self,
-            current_text: str,
-            history_text: str,
-        ) -> bool:
-            """
-            Консервативний matcher саме для законів/санкцій/угод.
-    
-            Навмисно суворіший за загальний semantic_anchor: hard-lock на 24h
-            не повинен склеїти два різні закони лише через слова "ухвалив закон".
-            """
-            if not (
-                self._looks_like_decision_story_text(current_text)
-                and self._looks_like_decision_story_text(history_text)
-            ):
-                return False
-    
-            current_families = self._decision_family_signature(current_text)
-            history_families = self._decision_family_signature(history_text)
-            shared_families = current_families & history_families
-            if not shared_families:
-                return False
-    
-            # 24h hard-lock лише для справді процедурної policy-story.
-            # Самих слів "податок/тариф/санкції/закон" недостатньо:
-            # на обох сторонах має бути визначуваний юридичний/процедурний статус.
-            current_status = self._decision_status_signature(current_text)
-            history_status = self._decision_status_signature(history_text)
-            if not current_status or not history_status:
-                return False
-    
-            stats = self._history_similarity_stats(current_text, history_text)
-            shared_geo = (
-                self._decision_geo_signature(current_text)
-                & self._decision_geo_signature(history_text)
-            )
-            shared_entities = (
-                self._entity_signature(current_text)
-                & self._entity_signature(history_text)
-            )
-            shared_story = (
-                self._story_signature(current_text)
-                & self._story_signature(history_text)
-            )
-    
-            # Для санкцій/мит/податків конкретна policy-family + той самий
-            # геополітичний контекст — сильний якір навіть при переписаному тексті.
-            strong_policy_families = {
-                "sanctions",
-                "tariffs",
-                "taxes",
-                "agreement",
-                "visa_migration",
-            }
-            if shared_families & strong_policy_families:
-                if (
-                    len(shared_geo) >= 1
-                    and stats["common"] >= 3
-                    and (
-                        stats["overlap"] >= 0.18
-                        or stats["jaccard"] >= 0.10
-                        or stats["seq"] >= 0.32
-                        or len(shared_story) >= 3
-                    )
-                ):
-                    return True
-    
-                if (
-                    stats["common"] >= 7
-                    and (
-                        stats["overlap"] >= 0.34
-                        or stats["jaccard"] >= 0.20
-                        or stats["seq"] >= 0.58
-                    )
-                ):
-                    return True
-    
-            # Для загального "закон/постанова/регулювання" вимоги вищі,
-            # щоб не змішувати різні рішення одного парламенту/уряду.
+        )
+        return nato_escalation
+
+    def _event_source_text_bundle(
+        self,
+        ev: Dict[str, Any],
+        posts: List[Dict[str, Any]],
+    ) -> str:
+        chunks = [self._event_text_bundle(ev)]
+        for source_id in self._valid_source_ids(ev.get("source_ids"), posts)[:6]:
+            text = str(posts[source_id].get("text") or "").strip()
+            if text:
+                chunks.append(text[:1800])
+        return " ".join(chunk for chunk in chunks if chunk)
+
+    def _has_strategic_attack_context(
+        self,
+        ev: Dict[str, Any],
+        posts: List[Dict[str, Any]],
+    ) -> bool:
+        text = self._event_source_text_bundle(ev, posts)
+        if not self._looks_like_attack_text(text):
+            return False
+        return self._strategic_geopolitical_signal(text)
+
+    @staticmethod
+    def _regional_center_signal(text: str) -> bool:
+        """Консервативний matcher Києва та обласних центрів України."""
+        return bool(NewsSummarizer._regional_center_names(text))
+
+    @staticmethod
+    def _notable_attack_target_signal(text: str) -> bool:
+        t = NewsSummarizer._normalize_similarity_text(text)
+        if not t:
+            return False
+        markers = (
+            "завод", "підприємств", "виробництв", "нпз", "нафтоперероб",
+            "нафтобаз", "електростан", "підстанц", "тес ", "гес ", "аес ",
+            "порт", "термінал", "аеропорт", "вокзал", "депо", "залізниц",
+            "логіст", "склад", "дата-центр", "дата центр", "бізнес-центр",
+            "бізнес центр", "торговельн", "торговий центр", "тц ",
+            "мост", "елеватор", "енергетич", "інфраструктур",
+        )
+        padded = f" {t} "
+        return any(marker in padded for marker in markers)
+
+    @staticmethod
+    def _direct_impact_text_signal(text: str) -> bool:
+        t = NewsSummarizer._normalize_similarity_text(text)
+        if not t:
+            return False
+
+        strong = (
+            "влуч", "приліт", "прильот", "атакував ", "атакували ",
+            "зруйн", "руйнув", "пошкод", "пожеж", "горить", "палає",
+            "наслідк", "стовп диму", "дим над ", "димить",
+        )
+        if any(marker in t for marker in strong):
+            return True
+
+        # Для "удар/удару" потрібна конкретика кадрів або цілі; одне слово
+        # "удар" у переказі новини саме по собі ще не робить її video-first.
+        if "удар" in t and any(
+            marker in t
+            for marker in ("відео", "кадри", "момент", " по ")
+        ):
+            return True
+
+        # Саме слово "вибух" занадто широке. Беремо його лише коли caption
+        # прямо каже, що це кадри/момент конкретного інциденту.
+        return (
+            "вибух" in t
+            and any(marker in t for marker in ("відео", "кадри", "момент"))
+        )
+
+    def _is_direct_impact_video_post(
+        self,
+        post: Dict[str, Any],
+    ) -> bool:
+        if not bool(post.get("has_video")):
+            return False
+
+        text = str(post.get("text") or "").strip()
+        if not text or not self._looks_like_attack_text(text):
+            return False
+        if not self._direct_impact_text_signal(text):
+            return False
+
+        # Вимагаємо або велике місто-центр, або конкретну помітну ціль.
+        return (
+            self._regional_center_signal(text)
+            or self._notable_attack_target_signal(text)
+        )
+
+    def _is_direct_impact_video_event(
+        self,
+        ev: Dict[str, Any],
+        posts: List[Dict[str, Any]],
+    ) -> bool:
+        return any(
+            self._is_direct_impact_video_post(posts[source_id])
+            for source_id in self._valid_source_ids(ev.get("source_ids"), posts)
+        )
+
+    def _is_low_value_attack_event(
+        self,
+        ev: Dict[str, Any],
+        posts: List[Dict[str, Any]],
+    ) -> bool:
+        """
+        Python-gate для рутинних атак, незалежний від event_type LLM.
+
+        1-3 поранених + локальні пошкодження без загиблих, критичного /
+        стратегічного об'єкта, масштабних руйнувань або сильних кадрів
+        не повинні займати слот у короткому загальнонаціональному дайджесті.
+        """
+        if str(ev.get("category") or "") != "war":
+            return False
+
+        text = self._event_source_text_bundle(ev, posts)
+        if not self._looks_like_attack_text(text):
+            return False
+
+        # Геополітично чутлива атака не є "low-value" лише через 0 жертв.
+        # Напр., міжнародний потяг із політиками світового рівня біля
+        # польського кордону під час російської атаки.
+        if self._has_strategic_attack_context(ev, posts):
+            return False
+
+        # Коротке video-first повідомлення з конкретним влучанням/наслідками
+        # у Києві, обласному центрі або по помітній цілі не є low-value лише
+        # через відсутність великої кількості тексту/жертв. Фінальний Vision
+        # все одно перевірить відповідність самого медіа тексту.
+        if self._is_direct_impact_video_event(ev, posts):
+            return False
+
+        if self._has_strong_attack_consequence(text):
+            return False
+
+        casualties = self._extract_casualty_counts(text)
+        wounded = casualties["wounded"]
+
+        src_ids = self._valid_source_ids(ev.get("source_ids"), posts)
+        has_video = any(posts[s].get("has_video") for s in src_ids)
+        has_media = any(posts[s].get("has_media") for s in src_ids)
+        media_quality = self._safe_score(ev.get("media_quality"))
+
+        # Сильні реальні кадри можуть зробити подію самостійно вагомою,
+        # але звичайна картинка/ілюстрація — ні.
+        if has_video and media_quality >= 82:
+            return False
+        if has_media and media_quality >= 92:
+            return False
+
+        if 0 < wounded <= 3:
+            return True
+
+        # Якщо кількість жертв не витягнулась, все одно прибираємо типову
+        # локальну атаку, коли сама модель дала дуже низьку цікавість/користь
+        # і немає жодного сильного наслідку.
+        return (
+            self._safe_score(ev.get("curiosity")) < 50
+            and self._safe_score(ev.get("practical_value")) < 50
+            and self._safe_score(ev.get("scale")) < 75
+            and media_quality < 75
+        )
+
+    @staticmethod
+    def _concrete_numbers(text: str) -> set:
+        normalized = NewsSummarizer._normalize_similarity_text(text)
+        return set(re.findall(r"\b\d+(?:[.,]\d+)?\b", normalized))
+
+    @staticmethod
+    def _looks_like_decision_story_text(text: str) -> bool:
+        """
+        Чи схожий текст на одноразову policy/legislative історію:
+        закон, санкційний пакет, угоду, мита/податки, постанову тощо.
+
+        Це лише класифікатор для 24h dedup-lock, не оцінка важливості.
+        """
+        t = NewsSummarizer._normalize_similarity_text(text)
+        if not t:
+            return False
+
+        markers = (
+            "законопро", "закон ", " закон", "санкц", "угод", "догов",
+            "постан", "ратифік", "ухвал", "схвал", "проголос", "затверд",
+            "підпис", "набув чинності", "набула чинності", "вступив у силу",
+            "мит ", " мито", "тариф", "подат", "акциз", "ветув", "вето",
+        )
+        return any(marker in f" {t} " for marker in markers)
+
+    @staticmethod
+    def _decision_family_signature(text: str) -> set:
+        """
+        Тематичні сім'ї рішень. Вони потрібні, щоб "закон про шахрайські
+        кол-центри" не став hard-duplicate для "санкційного пакета США".
+        """
+        t = NewsSummarizer._normalize_similarity_text(text)
+        padded = f" {t} "
+
+        families = {
+            "sanctions": (
+                "санкц", "заморожен актив", "тіньов флот",
+            ),
+            "tariffs": (
+                " мито", "мит ", "тариф",
+            ),
+            "taxes": (
+                "подат", "пдв", "акциз",
+            ),
+            "agreement": (
+                "угод", "догов", "меморанд", "ратифік",
+            ),
+            "aid_finance": (
+                "допомог", "грант", "кредит", "фінансув",
+            ),
+            "visa_migration": (
+                "віз", "міграц", "біжен", "перетин кордон",
+            ),
+            "regulation": (
+                "законопро", " закон ", "постан", "регулюв", "правил",
+            ),
+        }
+
+        found = set()
+        for family, needles in families.items():
+            if any(needle in padded for needle in needles):
+                found.add(family)
+        return found
+
+    @staticmethod
+    def _decision_geo_signature(text: str) -> set:
+        """
+        Канонічні геополітичні/інституційні якорі для policy-story.
+
+        Тут, на відміну від загального entity matcher, США/РФ тощо корисні:
+        санкції США проти РФ та український закон — не одна історія.
+        """
+        t = NewsSummarizer._normalize_similarity_text(text)
+        padded = f" {t} "
+
+        aliases = {
+            "usa": (
+                " сша ", "америк", "конгрес", "палата представників",
+                "сенат", "білий дім", "трамп",
+            ),
+            "russia": (
+                " росі", " рф ", "москв",
+            ),
+            "iran": (
+                "іран",
+            ),
+            "ukraine": (
+                " украї", "верховна рада", "верховної ради",
+                "кабмін", "зеленськ",
+            ),
+            "eu": (
+                " єс ", "євросоюз", "європейськ союз",
+            ),
+            "uk": (
+                "британ", "лондон",
+            ),
+            "china": (
+                "китай", "пекін",
+            ),
+            "poland": (
+                "польщ", "варшав",
+            ),
+        }
+
+        found = set()
+        for name, needles in aliases.items():
+            if any(needle in padded for needle in needles):
+                found.add(name)
+        return found
+
+    def _same_decision_story(
+        self,
+        current_text: str,
+        history_text: str,
+    ) -> bool:
+        """
+        Консервативний matcher саме для законів/санкцій/угод.
+
+        Навмисно суворіший за загальний semantic_anchor: hard-lock на 24h
+        не повинен склеїти два різні закони лише через слова "ухвалив закон".
+        """
+        if not (
+            self._looks_like_decision_story_text(current_text)
+            and self._looks_like_decision_story_text(history_text)
+        ):
+            return False
+
+        current_families = self._decision_family_signature(current_text)
+        history_families = self._decision_family_signature(history_text)
+        shared_families = current_families & history_families
+        if not shared_families:
+            return False
+
+        # 24h hard-lock лише для справді процедурної policy-story.
+        # Самих слів "податок/тариф/санкції/закон" недостатньо:
+        # на обох сторонах має бути визначуваний юридичний/процедурний статус.
+        current_status = self._decision_status_signature(current_text)
+        history_status = self._decision_status_signature(history_text)
+        if not current_status or not history_status:
+            return False
+
+        stats = self._history_similarity_stats(current_text, history_text)
+        shared_geo = (
+            self._decision_geo_signature(current_text)
+            & self._decision_geo_signature(history_text)
+        )
+        shared_entities = (
+            self._entity_signature(current_text)
+            & self._entity_signature(history_text)
+        )
+        shared_story = (
+            self._story_signature(current_text)
+            & self._story_signature(history_text)
+        )
+
+        # Для санкцій/мит/податків конкретна policy-family + той самий
+        # геополітичний контекст — сильний якір навіть при переписаному тексті.
+        strong_policy_families = {
+            "sanctions",
+            "tariffs",
+            "taxes",
+            "agreement",
+            "visa_migration",
+        }
+        if shared_families & strong_policy_families:
             if (
-                len(shared_entities) >= 1
-                and stats["common"] >= 6
+                len(shared_geo) >= 1
+                and stats["common"] >= 3
+                and (
+                    stats["overlap"] >= 0.18
+                    or stats["jaccard"] >= 0.10
+                    or stats["seq"] >= 0.32
+                    or len(shared_story) >= 3
+                )
+            ):
+                return True
+
+            if (
+                stats["common"] >= 7
                 and (
                     stats["overlap"] >= 0.34
                     or stats["jaccard"] >= 0.20
@@ -4295,2233 +4282,1961 @@
                 )
             ):
                 return True
-    
-            if (
-                len(shared_geo) >= 1
-                and len(shared_story) >= 5
-                and stats["common"] >= 6
-                and (
-                    stats["overlap"] >= 0.38
-                    or stats["jaccard"] >= 0.22
-                    or stats["seq"] >= 0.62
-                )
-            ):
-                return True
-    
-            if (
-                stats["seq"] >= 0.76
-                and stats["common"] >= 6
-                and stats["overlap"] >= 0.55
-            ):
-                return True
-    
+
+        # Для загального "закон/постанова/регулювання" вимоги вищі,
+        # щоб не змішувати різні рішення одного парламенту/уряду.
+        if (
+            len(shared_entities) >= 1
+            and stats["common"] >= 6
+            and (
+                stats["overlap"] >= 0.34
+                or stats["jaccard"] >= 0.20
+                or stats["seq"] >= 0.58
+            )
+        ):
+            return True
+
+        if (
+            len(shared_geo) >= 1
+            and len(shared_story) >= 5
+            and stats["common"] >= 6
+            and (
+                stats["overlap"] >= 0.38
+                or stats["jaccard"] >= 0.22
+                or stats["seq"] >= 0.62
+            )
+        ):
+            return True
+
+        if (
+            stats["seq"] >= 0.76
+            and stats["common"] >= 6
+            and stats["overlap"] >= 0.55
+        ):
+            return True
+
+        return False
+
+    @staticmethod
+    def _decision_status_signature(text: str) -> set:
+        """
+        Юридичний/процедурний статус без хибного "signed".
+
+        Критично: "готовий підписати", "передадуть на підпис",
+        "очікує підпису", "підпише" та "готують підписання" НЕ означають,
+        що документ уже підписаний.
+        """
+        t = NewsSummarizer._normalize_similarity_text(text)
+        if not t:
+            return set()
+
+        found = set()
+
+        if any(
+            marker in t
+            for marker in (
+                "запропон", "зареєстр", "внесли законопро",
+                "внесено законопро", "представив законопро",
+                "представили законопро", "підготували законопро",
+            )
+        ):
+            found.add("proposed")
+
+        if any(
+            marker in t
+            for marker in (
+                "ухвал", "схвал", "проголос", "затверд", "ратифік",
+            )
+        ):
+            found.add("approved")
+
+        if any(
+            marker in t
+            for marker in (
+                "на підпис", "готовий підписати", "готова підписати",
+                "готові підписати", "має підписати", "має намір підпис",
+                "планує підпис", "підпише", "очікує підпис",
+                "чекає підпис", "готують підписання", "передадуть на підпис",
+                "передали на підпис", "скерували на підпис",
+                "направили на підпис",
+            )
+        ):
+            found.add("awaiting_signature")
+
+        actual_signed_patterns = (
+            r"\bпідписав\b",
+            r"\bпідписала\b",
+            r"\bпідписали\b",
+            r"\bпідписано\b",
+            r"\bпідписаний\b",
+            r"\bпідписана\b",
+            r"\bвідбулося підписання\b",
+            r"\bуклали угоду\b",
+            r"\bугоду укладено\b",
+            r"\bдоговір підписано\b",
+        )
+        if any(re.search(pattern, t) for pattern in actual_signed_patterns):
+            found.add("signed")
+
+        if any(
+            marker in t
+            for marker in (
+                "набув чинності", "набула чинності", "набуло чинності",
+                "вступив у силу", "вступила у силу", "вступило у силу",
+                "почав діяти", "почала діяти", "почало діяти",
+            )
+        ):
+            found.add("effective")
+
+        # Фактичне введення санкцій/мит/обмежень — це вже інший статус,
+        # на відміну від "закон дозволяє запровадити" або "може ввести".
+        implementation_patterns = (
+            r"\bзапровадили санкц",
+            r"\bзапровадив санкц",
+            r"\bзапровадила санкц",
+            r"\bввели санкц",
+            r"\bввів санкц",
+            r"\bввела санкц",
+            r"\bзастосували санкц",
+            r"\bсанкції набули чинності\b",
+            r"\bмита набули чинності\b",
+            r"\bпочали стягувати мито\b",
+        )
+        if any(re.search(pattern, t) for pattern in implementation_patterns):
+            found.add("implemented")
+
+        if any(
+            marker in t
+            for marker in (
+                "ветував", "ветувала", "наклав вето", "відхилив",
+                "відхилила", "не підтримав законопро", "провалив голосування",
+            )
+        ):
+            found.add("blocked")
+
+        return found
+
+    def _decision_has_meaningful_status_progression(
+        self,
+        current_text: str,
+        previous_text: str,
+    ) -> bool:
+        """
+        Що дозволяє повтор decision-story протягом 24 годин.
+
+        Дозволяємо лише реальну зміну статусу, а не новий заголовок:
+        proposal -> approved; approved -> ACTUALLY signed;
+        signed -> effective; фактичне введення санкцій/вето.
+        """
+        current = self._decision_status_signature(current_text)
+        previous = self._decision_status_signature(previous_text)
+
+        if "blocked" in current and "blocked" not in previous:
+            return True
+
+        if "effective" in current and "effective" not in previous:
+            return True
+
+        if "implemented" in current and "implemented" not in previous:
+            return True
+
+        if "signed" in current and "signed" not in previous:
+            return True
+
+        previous_finalish = {
+            "approved",
+            "signed",
+            "effective",
+            "implemented",
+            "blocked",
+        }
+        if (
+            "approved" in current
+            and "approved" not in previous
+            and not (previous & previous_finalish)
+        ):
+            return True
+
+        # awaiting_signature — НЕ матеріальний апдейт. Так само додаткове
+        # голосування/формулювання після вже зафіксованого approved.
+        return False
+
+    def _is_recent_decision_story_duplicate(
+        self,
+        event: Dict[str, Any],
+        posts: List[Dict[str, Any]],
+        history: Dict[str, str],
+    ) -> bool:
+        """
+        Добовий hard-lock для тієї самої policy-story.
+
+        Приклад: "Конгрес ухвалив пакет санкцій" і через 8 годин
+        "Білий дім готовий підписати той самий пакет" — одна історія.
+        Повтор дозволяється лише при фактичному новому юридичному статусі.
+        """
+        age_hours = self._history_age_hours(history)
+        if (
+            age_hours is None
+            or age_hours > self.DAILY_DECISION_STORY_LOCK_HOURS
+        ):
             return False
-    
-        @staticmethod
-        def _decision_status_signature(text: str) -> set:
-            """
-            Юридичний/процедурний статус без хибного "signed".
-    
-            Критично: "готовий підписати", "передадуть на підпис",
-            "очікує підпису", "підпише" та "готують підписання" НЕ означають,
-            що документ уже підписаний.
-            """
-            t = NewsSummarizer._normalize_similarity_text(text)
-            if not t:
-                return set()
-    
-            found = set()
-    
-            if any(
-                marker in t
-                for marker in (
-                    "запропон", "зареєстр", "внесли законопро",
-                    "внесено законопро", "представив законопро",
-                    "представили законопро", "підготували законопро",
-                )
-            ):
-                found.add("proposed")
-    
-            if any(
-                marker in t
-                for marker in (
-                    "ухвал", "схвал", "проголос", "затверд", "ратифік",
-                )
-            ):
-                found.add("approved")
-    
-            if any(
-                marker in t
-                for marker in (
-                    "на підпис", "готовий підписати", "готова підписати",
-                    "готові підписати", "має підписати", "має намір підпис",
-                    "планує підпис", "підпише", "очікує підпис",
-                    "чекає підпис", "готують підписання", "передадуть на підпис",
-                    "передали на підпис", "скерували на підпис",
-                    "направили на підпис",
-                )
-            ):
-                found.add("awaiting_signature")
-    
-            actual_signed_patterns = (
-                r"\bпідписав\b",
-                r"\bпідписала\b",
-                r"\bпідписали\b",
-                r"\bпідписано\b",
-                r"\bпідписаний\b",
-                r"\bпідписана\b",
-                r"\bвідбулося підписання\b",
-                r"\bуклали угоду\b",
-                r"\bугоду укладено\b",
-                r"\bдоговір підписано\b",
-            )
-            if any(re.search(pattern, t) for pattern in actual_signed_patterns):
-                found.add("signed")
-    
-            if any(
-                marker in t
-                for marker in (
-                    "набув чинності", "набула чинності", "набуло чинності",
-                    "вступив у силу", "вступила у силу", "вступило у силу",
-                    "почав діяти", "почала діяти", "почало діяти",
-                )
-            ):
-                found.add("effective")
-    
-            # Фактичне введення санкцій/мит/обмежень — це вже інший статус,
-            # на відміну від "закон дозволяє запровадити" або "може ввести".
-            implementation_patterns = (
-                r"\bзапровадили санкц",
-                r"\bзапровадив санкц",
-                r"\bзапровадила санкц",
-                r"\bввели санкц",
-                r"\bввів санкц",
-                r"\bввела санкц",
-                r"\bзастосували санкц",
-                r"\bсанкції набули чинності\b",
-                r"\bмита набули чинності\b",
-                r"\bпочали стягувати мито\b",
-            )
-            if any(re.search(pattern, t) for pattern in implementation_patterns):
-                found.add("implemented")
-    
-            if any(
-                marker in t
-                for marker in (
-                    "ветував", "ветувала", "наклав вето", "відхилив",
-                    "відхилила", "не підтримав законопро", "провалив голосування",
-                )
-            ):
-                found.add("blocked")
-    
-            return found
-    
-        def _decision_has_meaningful_status_progression(
-            self,
-            current_text: str,
-            previous_text: str,
-        ) -> bool:
-            """
-            Що дозволяє повтор decision-story протягом 24 годин.
-    
-            Дозволяємо лише реальну зміну статусу, а не новий заголовок:
-            proposal -> approved; approved -> ACTUALLY signed;
-            signed -> effective; фактичне введення санкцій/вето.
-            """
-            current = self._decision_status_signature(current_text)
-            previous = self._decision_status_signature(previous_text)
-    
-            if "blocked" in current and "blocked" not in previous:
-                return True
-    
-            if "effective" in current and "effective" not in previous:
-                return True
-    
-            if "implemented" in current and "implemented" not in previous:
-                return True
-    
-            if "signed" in current and "signed" not in previous:
-                return True
-    
-            previous_finalish = {
-                "approved",
-                "signed",
-                "effective",
-                "implemented",
-                "blocked",
-            }
-            if (
-                "approved" in current
-                and "approved" not in previous
-                and not (previous & previous_finalish)
-            ):
-                return True
-    
-            # awaiting_signature — НЕ матеріальний апдейт. Так само додаткове
-            # голосування/формулювання після вже зафіксованого approved.
+
+        current_text = self._event_source_text_bundle(event, posts)
+        history_text = " ".join(
+            value
+            for value in [
+                str(history.get("title") or ""),
+                str(history.get("summary") or ""),
+            ]
+            if value
+        )
+
+        if not self._same_decision_story(current_text, history_text):
             return False
-    
-        def _is_recent_decision_story_duplicate(
-            self,
-            event: Dict[str, Any],
-            posts: List[Dict[str, Any]],
-            history: Dict[str, str],
-        ) -> bool:
-            """
-            Добовий hard-lock для тієї самої policy-story.
-    
-            Приклад: "Конгрес ухвалив пакет санкцій" і через 8 годин
-            "Білий дім готовий підписати той самий пакет" — одна історія.
-            Повтор дозволяється лише при фактичному новому юридичному статусі.
-            """
-            age_hours = self._history_age_hours(history)
-            if (
-                age_hours is None
-                or age_hours > self.DAILY_DECISION_STORY_LOCK_HOURS
-            ):
-                return False
-    
-            current_text = self._event_source_text_bundle(event, posts)
-            history_text = " ".join(
-                value
-                for value in [
-                    str(history.get("title") or ""),
-                    str(history.get("summary") or ""),
-                ]
-                if value
+
+        if self._decision_has_meaningful_status_progression(
+            current_text,
+            history_text,
+        ):
+            return False
+
+        return True
+
+    @staticmethod
+    def _status_transition_signature(text: str) -> set:
+        """
+        Матеріальні переходи стану, а не просто нові подробиці.
+
+        Для "signed" використовуємо точні форми фактичного підписання.
+        "Готовий підписати"/"передадуть на підпис" не є новим статусом.
+        """
+        t = NewsSummarizer._normalize_similarity_text(text)
+        groups = {
+            "approved": ("ухвал", "затверд", "проголос", "ратифік"),
+            "effective": (
+                "набув чинності", "набула чинності",
+                "вступив у силу", "почало діяти",
+            ),
+            "launched": (
+                "запуст", "відкрив", "почав роботу", "розпочав виробниц",
+            ),
+            "completed": (
+                "заверш", "закінч", "досягнуто домовлен",
+            ),
+            "confirmed": (
+                "офіційно підтверд", "підтвердив результат",
+                "підтверджено результат",
+            ),
+            "sanctioned": (
+                "запровадили санкц", "ввели санкц", "зняли санкц",
+            ),
+            "legal_result": (
+                "вирок", "засуд", "арешт", "затрим", "оголосили підозр",
+            ),
+            "operational_result": (
+                "знищено", "уражено", "виведено з ладу", "зупинено роботу",
+            ),
+        }
+
+        found = set()
+        for name, needles in groups.items():
+            if any(needle in t for needle in needles):
+                found.add(name)
+
+        actual_signed_patterns = (
+            r"\bпідписав\b",
+            r"\bпідписала\b",
+            r"\bпідписали\b",
+            r"\bпідписано\b",
+            r"\bпідписаний\b",
+            r"\bпідписана\b",
+            r"\bвідбулося підписання\b",
+            r"\bуклали угоду\b",
+            r"\bугоду укладено\b",
+            r"\bконтракт укладено\b",
+        )
+        if any(re.search(pattern, t) for pattern in actual_signed_patterns):
+            found.add("signed")
+
+        return found
+
+    def _non_attack_material_update(
+        self,
+        current_text: str,
+        previous_text: str,
+    ) -> bool:
+        """
+        Для звітів/технологій/політики додатковий опис не є апдейтом.
+        Потрібна конкретна зміна стану, результат або нова значуща цифра.
+        """
+        if not previous_text.strip():
+            # Якщо в БД старий запис без summary, не блокуємо справжній update
+            # лише через нестачу історичного контексту — але нижче все одно
+            # потрібні високі novelty/importance від Analyzer/reviewer.
+            return True
+
+        current_status = self._status_transition_signature(current_text)
+        previous_status = self._status_transition_signature(previous_text)
+        if current_status - previous_status:
+            return True
+
+        current_numbers = self._concrete_numbers(current_text)
+        previous_numbers = self._concrete_numbers(previous_text)
+        new_numbers = current_numbers - previous_numbers
+        if new_numbers:
+            # Нові цифри самі по собі не завжди матеріальні, але в парі з
+            # новою конкретною сутністю/результатом це вже сильний сигнал.
+            current_entities = self._entity_signature(current_text)
+            previous_entities = self._entity_signature(previous_text)
+            if current_entities - previous_entities:
+                return True
+
+            quantitative_markers = (
+                "загиб", "поран", "постраж", "млрд", "млн", "%",
+                "відсот", "голос", "місц", "країн", "систем", "одиниц",
+                "контракт", "тариф", "подат", "ставк",
             )
-    
-            if not self._same_decision_story(current_text, history_text):
-                return False
-    
-            if self._decision_has_meaningful_status_progression(
+            current_norm = self._normalize_similarity_text(current_text)
+            if any(marker in current_norm for marker in quantitative_markers):
+                return True
+
+        return False
+
+    def _repeat_update_is_substantial(self, ev: Dict[str, Any]) -> bool:
+        """Чи достатньо сильний апдейт, щоб вдруге показати стару історію."""
+        update = self._safe_score(ev.get("history_update_strength"))
+        if update < self.HISTORY_SIGNIFICANT_UPDATE_MIN:
+            return False
+
+        current_text = self._event_text_bundle(ev)
+        previous_text = " ".join(
+            value
+            for value in [
+                str(ev.get("history_match_title") or ""),
+                str(ev.get("history_match_summary") or ""),
+            ]
+            if value
+        )
+
+        # Для законів/санкцій/угод у межах 24 годин reviewer не може
+        # самостійно "намалювати" material update. Потрібен фактичний
+        # перехід статусу: proposal->approved, actual signed/effective тощо.
+        matched_at = str(ev.get("history_match_published_at") or "").strip()
+        decision_age_hours: Optional[float] = None
+        if matched_at:
+            decision_age_hours = self._history_age_hours({
+                "published_at": matched_at,
+            })
+
+        if (
+            decision_age_hours is not None
+            and decision_age_hours <= self.DAILY_DECISION_STORY_LOCK_HOURS
+            and self._looks_like_decision_story_text(current_text)
+            and self._looks_like_decision_story_text(previous_text)
+            and self._same_decision_story(current_text, previous_text)
+            and not self._decision_has_meaningful_status_progression(
                 current_text,
-                history_text,
-            ):
-                return False
-    
-            return True
-    
-        @staticmethod
-        def _status_transition_signature(text: str) -> set:
-            """
-            Матеріальні переходи стану, а не просто нові подробиці.
-    
-            Для "signed" використовуємо точні форми фактичного підписання.
-            "Готовий підписати"/"передадуть на підпис" не є новим статусом.
-            """
-            t = NewsSummarizer._normalize_similarity_text(text)
-            groups = {
-                "approved": ("ухвал", "затверд", "проголос", "ратифік"),
-                "effective": (
-                    "набув чинності", "набула чинності",
-                    "вступив у силу", "почало діяти",
-                ),
-                "launched": (
-                    "запуст", "відкрив", "почав роботу", "розпочав виробниц",
-                ),
-                "completed": (
-                    "заверш", "закінч", "досягнуто домовлен",
-                ),
-                "confirmed": (
-                    "офіційно підтверд", "підтвердив результат",
-                    "підтверджено результат",
-                ),
-                "sanctioned": (
-                    "запровадили санкц", "ввели санкц", "зняли санкц",
-                ),
-                "legal_result": (
-                    "вирок", "засуд", "арешт", "затрим", "оголосили підозр",
-                ),
-                "operational_result": (
-                    "знищено", "уражено", "виведено з ладу", "зупинено роботу",
-                ),
-            }
-    
-            found = set()
-            for name, needles in groups.items():
-                if any(needle in t for needle in needles):
-                    found.add(name)
-    
-            actual_signed_patterns = (
-                r"\bпідписав\b",
-                r"\bпідписала\b",
-                r"\bпідписали\b",
-                r"\bпідписано\b",
-                r"\bпідписаний\b",
-                r"\bпідписана\b",
-                r"\bвідбулося підписання\b",
-                r"\bуклали угоду\b",
-                r"\bугоду укладено\b",
-                r"\bконтракт укладено\b",
+                previous_text,
             )
-            if any(re.search(pattern, t) for pattern in actual_signed_patterns):
-                found.add("signed")
-    
-            return found
-    
-        def _non_attack_material_update(
-            self,
-            current_text: str,
-            previous_text: str,
-        ) -> bool:
-            """
-            Для звітів/технологій/політики додатковий опис не є апдейтом.
-            Потрібна конкретна зміна стану, результат або нова значуща цифра.
-            """
-            if not previous_text.strip():
-                # Якщо в БД старий запис без summary, не блокуємо справжній update
-                # лише через нестачу історичного контексту — але нижче все одно
-                # потрібні високі novelty/importance від Analyzer/reviewer.
-                return True
-    
-            current_status = self._status_transition_signature(current_text)
-            previous_status = self._status_transition_signature(previous_text)
-            if current_status - previous_status:
-                return True
-    
-            current_numbers = self._concrete_numbers(current_text)
-            previous_numbers = self._concrete_numbers(previous_text)
-            new_numbers = current_numbers - previous_numbers
-            if new_numbers:
-                # Нові цифри самі по собі не завжди матеріальні, але в парі з
-                # новою конкретною сутністю/результатом це вже сильний сигнал.
-                current_entities = self._entity_signature(current_text)
-                previous_entities = self._entity_signature(previous_text)
-                if current_entities - previous_entities:
-                    return True
-    
-                quantitative_markers = (
-                    "загиб", "поран", "постраж", "млрд", "млн", "%",
-                    "відсот", "голос", "місц", "країн", "систем", "одиниц",
-                    "контракт", "тариф", "подат", "ставк",
-                )
-                current_norm = self._normalize_similarity_text(current_text)
-                if any(marker in current_norm for marker in quantitative_markers):
-                    return True
-    
+        ):
             return False
-    
-        def _repeat_update_is_substantial(self, ev: Dict[str, Any]) -> bool:
-            """Чи достатньо сильний апдейт, щоб вдруге показати стару історію."""
-            update = self._safe_score(ev.get("history_update_strength"))
-            if update < self.HISTORY_SIGNIFICANT_UPDATE_MIN:
-                return False
-    
-            current_text = self._event_text_bundle(ev)
-            previous_text = " ".join(
-                value
-                for value in [
-                    str(ev.get("history_match_title") or ""),
-                    str(ev.get("history_match_summary") or ""),
+
+        # Якщо semantic-review прямо сказав, що це лише інший кут/деталі,
+        # жодні високі LLM-оцінки з попереднього Analyzer не повинні оживити дубль.
+        if ev.get("history_material_update") is False:
+            return False
+
+        category = str(ev.get("category") or "")
+        if category == "war" and self._looks_like_attack_text(current_text):
+            current_casualties = self._extract_casualty_counts(current_text)
+            previous_casualties = self._extract_casualty_counts(previous_text)
+
+            if current_casualties["dead"] > previous_casualties["dead"]:
+                return True
+
+            wounded_delta = (
+                current_casualties["wounded"]
+                - previous_casualties["wounded"]
+            )
+            if current_casualties["wounded"] >= 8 and wounded_delta >= 5:
+                return True
+
+            new_signals = (
+                self._strong_attack_signal_set(current_text)
+                - self._strong_attack_signal_set(previous_text)
+            )
+            if new_signals:
+                return True
+
+            return False
+
+        reviewer_confirmed_material = (
+            ev.get("history_material_update") is True
+        )
+
+        # Якщо спеціальний semantic-review уже підтвердив матеріальний update,
+        # його рішення можна використати як semantic evidence. Інакше Python
+        # вимагає конкретний transition/результат/нову значущу цифру.
+        if (
+            not reviewer_confirmed_material
+            and not self._non_attack_material_update(
+                current_text,
+                previous_text,
+            )
+        ):
+            return False
+
+        return (
+            self._safe_score(ev.get("novelty")) >= 72
+            and self._safe_score(ev.get("importance")) >= 68
+            and (
+                self._safe_score(ev.get("scale")) >= 65
+                or self._safe_score(ev.get("national_relevance")) >= 70
+                or self._safe_score(ev.get("urgency")) >= 82
+                or self._safe_score(ev.get("practical_value")) >= 78
+                or self._safe_score(ev.get("public_interest")) >= 78
+            )
+        )
+
+    def _is_low_value_russia_discovery_event(
+        self,
+        ev: Dict[str, Any],
+        posts: List[Dict[str, Any]],
+        digest_role: str,
+        importance: float,
+        national_relevance: float,
+        practical_value: float,
+    ) -> bool:
+        """
+        Редакційний фільтр саме для soft/discovery-контенту про РФ.
+
+        Не блокуємо важливі події, пов'язані з війною, санкціями,
+        військовою промисловістю, економікою, енергетикою чи дипломатією.
+        Мета — не заповнювати український дайджест побутовими trivia на кшталт
+        "найбільше котів у домівках" або локальних туристичних фактів.
+        """
+        if not self.FILTER_LOW_VALUE_RUSSIA_DISCOVERY:
+            return False
+        if digest_role != "discovery":
+            return False
+        if ev.get("is_priority"):
+            return False
+
+        text = self._normalize_similarity_text(
+            self._event_source_text_bundle(ev, posts)
+        )
+        if not text:
+            return False
+
+        russia_markers = (
+            "росія", "росії", "російськ", "росіян", " рф ",
+            "москва", "московськ", "петербург", "санкт петербург",
+            "сибір", "урал", "краснояр", "новосибір",
+            "екатеринбург", "казань",
+        )
+        padded = f" {text} "
+        if not any(marker in padded for marker in russia_markers):
+            return False
+
+        hard_relevance_markers = (
+            "україн", "зсу", "сбу", "гур", "окуп", "фронт",
+            "військ", "збро", "дрон", "бпла", "ракет", "нпз",
+            "нафтоперероб", "нафтобаз", "енергет", "газ", "нафт",
+            "санкц", "експорт", "імпорт", "рубл", "бюджет",
+            "мобіліз", "оборон", "кремл", "путін", "переговор",
+            "дипломат", "нато", "євросоюз", " єс ", "сша",
+            "спецслужб", "кібер", "полон", "депорт", "кордон",
+            "вибух", "атак", "удар",
+        )
+        if any(marker in padded for marker in hard_relevance_markers):
+            return False
+
+        if importance >= 78 or national_relevance >= 65 or practical_value >= 80:
+            return False
+
+        return True
+
+    def _is_low_value_soft_discovery_event(
+        self,
+        ev: Dict[str, Any],
+        posts: List[Dict[str, Any]],
+        digest_role: str,
+        category: str,
+        importance: float,
+        national_relevance: float,
+        practical_value: float,
+    ) -> bool:
+        """
+        Відсікає очевидний lifestyle/viral filler, не забороняючи саму тему.
+
+        Наприклад, Tinder/Bumble можуть бути нормальною новиною при витоку
+        даних, регуляторному рішенні, великій угоді чи дослідженні. Але приватна
+        історія побачення або вірусний курйоз без ширшої цінності не повинні
+        займати один із 1-3 discovery-слотів.
+        """
+        if digest_role != "discovery" or ev.get("is_priority"):
+            return False
+
+        # Сильна змістовна вага сама по собі є достатнім запобіжником.
+        if (
+            importance >= 74
+            or national_relevance >= 68
+            or practical_value >= 76
+        ):
+            return False
+
+        text = self._normalize_similarity_text(
+            self._event_source_text_bundle(ev, posts)
+        )
+        if not text:
+            return False
+
+        padded = f" {text} "
+
+        soft_markers = (
+            "tinder", "bumble", "badoo", "дейтин", "побаченн",
+            "знайомств", "стосунк", "романтичн", "весілл", "кохан",
+            "селебріті", "знаменит", "інфлюенсер", "блогер", "тіктокер",
+            "tiktok", "тікток", "мем ", "вірусн", "курйоз",
+            "гороскоп", "астролог", "лайфхак",
+        )
+
+        if not any(marker in padded for marker in soft_markers):
+            return False
+
+        substantive_markers = (
+            # Наука / перевірюване дослідження.
+            "дослідж", "вчен", "науков", "університет", "клінічн",
+            "випробуван", "метааналіз", "науковий журнал",
+            # Правила / безпека / великий вплив платформи.
+            "закон", "регулятор", "регуляц", "заборон", "штраф", "суд ",
+            "витік дан", "персональн дан", "кібератак", "кібербезпек",
+            "масштабн збій", "мільйон користувач", "млн користувач",
+            # Бізнес / виробництво / досягнення.
+            "угода", "контракт", "інвест", "придбал", "ринок",
+            "виробництв", "винахід", "відкрит", "патент", "рекорд",
+            "нагород", "премі", "вперше",
+        )
+
+        if any(marker in padded for marker in substantive_markers):
+            return False
+
+        # Для lifestyle-маркерів без змістовної опори curiosity не рятує.
+        return category in {
+            "society", "culture", "technology", "other", "international"
+        }
+
+    def _rank_events(
+        self,
+        events: List[Dict[str, Any]],
+        posts: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        ranked = []
+
+        rejected = {
+            "no_sources": 0,
+            "ineligible": 0,
+            "hard_reject": 0,
+            "history_repeat": 0,
+            "low_value": 0,
+        }
+
+        for ev in events:
+            try:
+                src_ids = [
+                    s
+                    for s in ev.get("source_ids", [])
+                    if (
+                        isinstance(s, int)
+                        and 0 <= s < len(posts)
+                    )
                 ]
-                if value
-            )
-    
-            # Для законів/санкцій/угод у межах 24 годин reviewer не може
-            # самостійно "намалювати" material update. Потрібен фактичний
-            # перехід статусу: proposal->approved, actual signed/effective тощо.
-            matched_at = str(ev.get("history_match_published_at") or "").strip()
-            decision_age_hours: Optional[float] = None
-            if matched_at:
-                decision_age_hours = self._history_age_hours({
-                    "published_at": matched_at,
-                })
-    
-            if (
-                decision_age_hours is not None
-                and decision_age_hours <= self.DAILY_DECISION_STORY_LOCK_HOURS
-                and self._looks_like_decision_story_text(current_text)
-                and self._looks_like_decision_story_text(previous_text)
-                and self._same_decision_story(current_text, previous_text)
-                and not self._decision_has_meaningful_status_progression(
-                    current_text,
-                    previous_text,
+
+                if not src_ids:
+                    rejected["no_sources"] += 1
+                    continue
+
+                is_priority = any(
+                    posts[s].get("is_priority")
+                    for s in src_ids
                 )
-            ):
-                return False
-    
-            # Якщо semantic-review прямо сказав, що це лише інший кут/деталі,
-            # жодні високі LLM-оцінки з попереднього Analyzer не повинні оживити дубль.
-            if ev.get("history_material_update") is False:
-                return False
-    
-            category = str(ev.get("category") or "")
-            if category == "war" and self._looks_like_attack_text(current_text):
-                current_casualties = self._extract_casualty_counts(current_text)
-                previous_casualties = self._extract_casualty_counts(previous_text)
-    
-                if current_casualties["dead"] > previous_casualties["dead"]:
-                    return True
-    
-                wounded_delta = (
-                    current_casualties["wounded"]
-                    - previous_casualties["wounded"]
+
+                eligible = bool(
+                    ev.get("eligible_for_digest", False)
                 )
-                if current_casualties["wounded"] >= 8 and wounded_delta >= 5:
-                    return True
-    
-                new_signals = (
-                    self._strong_attack_signal_set(current_text)
-                    - self._strong_attack_signal_set(previous_text)
+
+                event_type = str(
+                    ev.get("event_type") or "other"
                 )
-                if new_signals:
-                    return True
-    
-                return False
-    
-            reviewer_confirmed_material = (
-                ev.get("history_material_update") is True
-            )
-    
-            # Якщо спеціальний semantic-review уже підтвердив матеріальний update,
-            # його рішення можна використати як semantic evidence. Інакше Python
-            # вимагає конкретний transition/результат/нову значущу цифру.
-            if (
-                not reviewer_confirmed_material
-                and not self._non_attack_material_update(
-                    current_text,
-                    previous_text,
+
+                is_history_repeat = bool(
+                    ev.get("is_history_repeat", False)
                 )
-            ):
-                return False
-    
-            return (
-                self._safe_score(ev.get("novelty")) >= 72
-                and self._safe_score(ev.get("importance")) >= 68
-                and (
-                    self._safe_score(ev.get("scale")) >= 65
-                    or self._safe_score(ev.get("national_relevance")) >= 70
-                    or self._safe_score(ev.get("urgency")) >= 82
-                    or self._safe_score(ev.get("practical_value")) >= 78
-                    or self._safe_score(ev.get("public_interest")) >= 78
+                history_hard_duplicate = bool(
+                    ev.get("history_hard_duplicate", False)
                 )
-            )
-    
-        def _is_low_value_russia_discovery_event(
-            self,
-            ev: Dict[str, Any],
-            posts: List[Dict[str, Any]],
-            digest_role: str,
-            importance: float,
-            national_relevance: float,
-            practical_value: float,
-        ) -> bool:
-            """
-            Редакційний фільтр саме для soft/discovery-контенту про РФ.
-    
-            Не блокуємо важливі події, пов'язані з війною, санкціями,
-            військовою промисловістю, економікою, енергетикою чи дипломатією.
-            Мета — не заповнювати український дайджест побутовими trivia на кшталт
-            "найбільше котів у домівках" або локальних туристичних фактів.
-            """
-            if not self.FILTER_LOW_VALUE_RUSSIA_DISCOVERY:
-                return False
-            if digest_role != "discovery":
-                return False
-            if ev.get("is_priority"):
-                return False
-    
-            text = self._normalize_similarity_text(
-                self._event_source_text_bundle(ev, posts)
-            )
-            if not text:
-                return False
-    
-            russia_markers = (
-                "росія", "росії", "російськ", "росіян", " рф ",
-                "москва", "московськ", "петербург", "санкт петербург",
-                "сибір", "урал", "краснояр", "новосибір",
-                "екатеринбург", "казань",
-            )
-            padded = f" {text} "
-            if not any(marker in padded for marker in russia_markers):
-                return False
-    
-            hard_relevance_markers = (
-                "україн", "зсу", "сбу", "гур", "окуп", "фронт",
-                "військ", "збро", "дрон", "бпла", "ракет", "нпз",
-                "нафтоперероб", "нафтобаз", "енергет", "газ", "нафт",
-                "санкц", "експорт", "імпорт", "рубл", "бюджет",
-                "мобіліз", "оборон", "кремл", "путін", "переговор",
-                "дипломат", "нато", "євросоюз", " єс ", "сша",
-                "спецслужб", "кібер", "полон", "депорт", "кордон",
-                "вибух", "атак", "удар",
-            )
-            if any(marker in padded for marker in hard_relevance_markers):
-                return False
-    
-            if importance >= 78 or national_relevance >= 65 or practical_value >= 80:
-                return False
-    
-            return True
-    
-        def _is_low_value_soft_discovery_event(
-            self,
-            ev: Dict[str, Any],
-            posts: List[Dict[str, Any]],
-            digest_role: str,
-            category: str,
-            importance: float,
-            national_relevance: float,
-            practical_value: float,
-        ) -> bool:
-            """
-            Відсікає очевидний lifestyle/viral filler, не забороняючи саму тему.
-    
-            Наприклад, Tinder/Bumble можуть бути нормальною новиною при витоку
-            даних, регуляторному рішенні, великій угоді чи дослідженні. Але приватна
-            історія побачення або вірусний курйоз без ширшої цінності не повинні
-            займати один із 1-3 discovery-слотів.
-            """
-            if digest_role != "discovery" or ev.get("is_priority"):
-                return False
-    
-            # Сильна змістовна вага сама по собі є достатнім запобіжником.
-            if (
-                importance >= 74
-                or national_relevance >= 68
-                or practical_value >= 76
-            ):
-                return False
-    
-            text = self._normalize_similarity_text(
-                self._event_source_text_bundle(ev, posts)
-            )
-            if not text:
-                return False
-    
-            padded = f" {text} "
-    
-            soft_markers = (
-                "tinder", "bumble", "badoo", "дейтин", "побаченн",
-                "знайомств", "стосунк", "романтичн", "весілл", "кохан",
-                "селебріті", "знаменит", "інфлюенсер", "блогер", "тіктокер",
-                "tiktok", "тікток", "мем ", "вірусн", "курйоз",
-                "гороскоп", "астролог", "лайфхак",
-            )
-    
-            if not any(marker in padded for marker in soft_markers):
-                return False
-    
-            substantive_markers = (
-                # Наука / перевірюване дослідження.
-                "дослідж", "вчен", "науков", "університет", "клінічн",
-                "випробуван", "метааналіз", "науковий журнал",
-                # Правила / безпека / великий вплив платформи.
-                "закон", "регулятор", "регуляц", "заборон", "штраф", "суд ",
-                "витік дан", "персональн дан", "кібератак", "кібербезпек",
-                "масштабн збій", "мільйон користувач", "млн користувач",
-                # Бізнес / виробництво / досягнення.
-                "угода", "контракт", "інвест", "придбал", "ринок",
-                "виробництв", "винахід", "відкрит", "патент", "рекорд",
-                "нагород", "премі", "вперше",
-            )
-    
-            if any(marker in padded for marker in substantive_markers):
-                return False
-    
-            # Для lifestyle-маркерів без змістовної опори curiosity не рятує.
-            return category in {
-                "society", "culture", "technology", "other", "international"
-            }
-    
-        def _rank_events(
-            self,
-            events: List[Dict[str, Any]],
-            posts: List[Dict[str, Any]],
-        ) -> List[Dict[str, Any]]:
-            ranked = []
-    
-            rejected = {
-                "no_sources": 0,
-                "ineligible": 0,
-                "hard_reject": 0,
-                "history_repeat": 0,
-                "low_value": 0,
-            }
-    
-            for ev in events:
-                try:
-                    src_ids = [
-                        s
-                        for s in ev.get("source_ids", [])
-                        if (
-                            isinstance(s, int)
-                            and 0 <= s < len(posts)
+
+                history_update = self._safe_score(
+                    ev.get("history_update_strength")
+                )
+
+                strategic_attack_context = (
+                    self._has_strategic_attack_context(ev, posts)
+                )
+                direct_impact_video = (
+                    self._is_direct_impact_video_event(ev, posts)
+                )
+                daily_air_defense_locked = bool(
+                    ev.get("daily_air_defense_summary_locked", False)
+                )
+                daily_decision_story_locked = bool(
+                    ev.get("daily_decision_story_locked", False)
+                )
+
+                if not is_priority:
+                    if daily_air_defense_locked:
+                        rejected["history_repeat"] += 1
+                        logger.info(
+                            "Daily air-defense summary blocked for 24h: "
+                            "event_id=%s matched='%s'.",
+                            ev.get("event_id"),
+                            str(ev.get("history_match_title") or "")[:120],
                         )
-                    ]
-    
-                    if not src_ids:
-                        rejected["no_sources"] += 1
                         continue
-    
-                    is_priority = any(
-                        posts[s].get("is_priority")
-                        for s in src_ids
-                    )
-    
-                    eligible = bool(
-                        ev.get("eligible_for_digest", False)
-                    )
-    
-                    event_type = str(
-                        ev.get("event_type") or "other"
-                    )
-    
-                    is_history_repeat = bool(
-                        ev.get("is_history_repeat", False)
-                    )
-                    history_hard_duplicate = bool(
-                        ev.get("history_hard_duplicate", False)
-                    )
-    
-                    history_update = self._safe_score(
-                        ev.get("history_update_strength")
-                    )
-    
-                    strategic_attack_context = (
-                        self._has_strategic_attack_context(ev, posts)
-                    )
-                    direct_impact_video = (
-                        self._is_direct_impact_video_event(ev, posts)
-                    )
-                    daily_air_defense_locked = bool(
-                        ev.get("daily_air_defense_summary_locked", False)
-                    )
-                    daily_decision_story_locked = bool(
-                        ev.get("daily_decision_story_locked", False)
-                    )
-    
-                    if not is_priority:
-                        if daily_air_defense_locked:
-                            rejected["history_repeat"] += 1
-                            logger.info(
-                                "Daily air-defense summary blocked for 24h: "
-                                "event_id=%s matched='%s'.",
-                                ev.get("event_id"),
-                                str(ev.get("history_match_title") or "")[:120],
-                            )
+
+                    if daily_decision_story_locked:
+                        rejected["history_repeat"] += 1
+                        logger.info(
+                            "Decision story blocked for 24h: "
+                            "event_id=%s matched='%s'.",
+                            ev.get("event_id"),
+                            str(ev.get("history_match_title") or "")[:120],
+                        )
+                        continue
+
+                    if (
+                        history_hard_duplicate
+                        and not self._repeat_update_is_substantial(ev)
+                    ):
+                        rejected["history_repeat"] += 1
+                        logger.info(
+                            "History hard-block: event_id=%s matched='%s'.",
+                            ev.get("event_id"),
+                            str(ev.get("history_match_title") or "")[:120],
+                        )
+                        continue
+
+                    if (
+                        not eligible
+                        and not strategic_attack_context
+                        and not direct_impact_video
+                    ):
+                        rejected["ineligible"] += 1
+                        continue
+                    elif not eligible and strategic_attack_context:
+                        # Детермінована страховка: модель могла назвати атаку
+                        # "рутинною" лише через відсутність жертв. Якщо сирі
+                        # source-тексти містять сильний геополітичний контекст,
+                        # не втрачаємо подію до ранжування.
+                        eligible = True
+                        logger.info(
+                            "Strategic-context override: event_id=%s "
+                            "ineligible->eligible headline='%s'.",
+                            ev.get("event_id"),
+                            str(
+                                ev.get("headline_hint")
+                                or ev.get("summary")
+                                or ""
+                            )[:120],
+                        )
+                    elif not eligible and direct_impact_video:
+                        eligible = True
+                        logger.info(
+                            "Direct-impact-video override: event_id=%s "
+                            "ineligible->eligible headline='%s'.",
+                            ev.get("event_id"),
+                            str(
+                                ev.get("headline_hint")
+                                or ev.get("summary")
+                                or ""
+                            )[:120],
+                        )
+
+                    if event_type in HARD_REJECT_EVENT_TYPES:
+                        if direct_impact_video:
+                            # Caption/source already says this is a concrete
+                            # hit/aftermath video, so alert_only is an Analyzer
+                            # classification error. History gates above still apply.
+                            event_type = "major_attack"
+                        else:
+                            rejected["hard_reject"] += 1
                             continue
-    
-                        if daily_decision_story_locked:
-                            rejected["history_repeat"] += 1
-                            logger.info(
-                                "Decision story blocked for 24h: "
-                                "event_id=%s matched='%s'.",
-                                ev.get("event_id"),
-                                str(ev.get("history_match_title") or "")[:120],
-                            )
-                            continue
-    
-                        if (
-                            history_hard_duplicate
-                            and not self._repeat_update_is_substantial(ev)
-                        ):
-                            rejected["history_repeat"] += 1
-                            logger.info(
-                                "History hard-block: event_id=%s matched='%s'.",
-                                ev.get("event_id"),
-                                str(ev.get("history_match_title") or "")[:120],
-                            )
-                            continue
-    
-                        if (
-                            not eligible
-                            and not strategic_attack_context
-                            and not direct_impact_video
-                        ):
-                            rejected["ineligible"] += 1
-                            continue
-                        elif not eligible and strategic_attack_context:
-                            # Детермінована страховка: модель могла назвати атаку
-                            # "рутинною" лише через відсутність жертв. Якщо сирі
-                            # source-тексти містять сильний геополітичний контекст,
-                            # не втрачаємо подію до ранжування.
-                            eligible = True
-                            logger.info(
-                                "Strategic-context override: event_id=%s "
-                                "ineligible->eligible headline='%s'.",
-                                ev.get("event_id"),
-                                str(
-                                    ev.get("headline_hint")
-                                    or ev.get("summary")
-                                    or ""
-                                )[:120],
-                            )
-                        elif not eligible and direct_impact_video:
-                            eligible = True
-                            logger.info(
-                                "Direct-impact-video override: event_id=%s "
-                                "ineligible->eligible headline='%s'.",
-                                ev.get("event_id"),
-                                str(
-                                    ev.get("headline_hint")
-                                    or ev.get("summary")
-                                    or ""
-                                )[:120],
-                            )
-    
-                        if event_type in HARD_REJECT_EVENT_TYPES:
-                            if direct_impact_video:
-                                # Caption/source already says this is a concrete
-                                # hit/aftermath video, so alert_only is an Analyzer
-                                # classification error. History gates above still apply.
-                                event_type = "major_attack"
-                            else:
-                                rejected["hard_reject"] += 1
-                                continue
-    
-                        if (
-                            is_history_repeat
-                            and not self._repeat_update_is_substantial(ev)
-                        ):
-                            rejected["history_repeat"] += 1
-                            logger.info(
-                                "History update rejected: event_id=%s update=%.0f "
-                                "matched='%s'.",
-                                ev.get("event_id"),
-                                history_update,
-                                str(ev.get("history_match_title") or "")[:120],
-                            )
-                            continue
-    
-                        if self._is_low_value_attack_event(ev, posts):
-                            rejected["low_value"] += 1
-                            logger.info(
-                                "Low-value attack rejected: event_id=%s headline='%s'.",
-                                ev.get("event_id"),
-                                str(ev.get("headline_hint") or ev.get("summary") or "")[:120],
-                            )
-                            continue
-    
-                    imp = self._safe_score(ev.get("importance"))
-                    scale = self._safe_score(ev.get("scale"))
-                    rel = self._safe_score(ev.get("reliability"))
-                    pub = self._safe_score(ev.get("public_interest"))
-                    nov = self._safe_score(ev.get("novelty"))
-                    cur = self._safe_score(ev.get("curiosity"))
-                    practical = self._safe_score(
-                        ev.get("practical_value")
+
+                    if (
+                        is_history_repeat
+                        and not self._repeat_update_is_substantial(ev)
+                    ):
+                        rejected["history_repeat"] += 1
+                        logger.info(
+                            "History update rejected: event_id=%s update=%.0f "
+                            "matched='%s'.",
+                            ev.get("event_id"),
+                            history_update,
+                            str(ev.get("history_match_title") or "")[:120],
+                        )
+                        continue
+
+                    if self._is_low_value_attack_event(ev, posts):
+                        rejected["low_value"] += 1
+                        logger.info(
+                            "Low-value attack rejected: event_id=%s headline='%s'.",
+                            ev.get("event_id"),
+                            str(ev.get("headline_hint") or ev.get("summary") or "")[:120],
+                        )
+                        continue
+
+                imp = self._safe_score(ev.get("importance"))
+                scale = self._safe_score(ev.get("scale"))
+                rel = self._safe_score(ev.get("reliability"))
+                pub = self._safe_score(ev.get("public_interest"))
+                nov = self._safe_score(ev.get("novelty"))
+                cur = self._safe_score(ev.get("curiosity"))
+                practical = self._safe_score(
+                    ev.get("practical_value")
+                )
+                med = self._safe_score(ev.get("media_quality"))
+                national = self._safe_score(
+                    ev.get("national_relevance")
+                )
+                urgency = self._safe_score(ev.get("urgency"))
+
+                category = ev.get("category", "other")
+                if category not in self.ALLOWED_CATEGORIES:
+                    category = "other"
+
+                digest_role = self._resolve_digest_role(
+                    ev,
+                    event_type,
+                    category,
+                    imp,
+                    national,
+                    urgency,
+                    cur,
+                    practical,
+                    nov,
+                    pub,
+                )
+
+                if strategic_attack_context or direct_impact_video:
+                    digest_role = "core"
+
+                if (
+                    not is_priority
+                    and self._is_low_value_russia_discovery_event(
+                        ev, posts, digest_role, imp, national, practical
                     )
-                    med = self._safe_score(ev.get("media_quality"))
-                    national = self._safe_score(
-                        ev.get("national_relevance")
+                ):
+                    rejected["low_value"] += 1
+                    logger.info(
+                        "Russia soft-discovery rejected: event_id=%s headline='%s'.",
+                        ev.get("event_id"),
+                        str(ev.get("headline_hint") or ev.get("summary") or "")[:120],
                     )
-                    urgency = self._safe_score(ev.get("urgency"))
-    
-                    category = ev.get("category", "other")
-                    if category not in self.ALLOWED_CATEGORIES:
-                        category = "other"
-    
-                    digest_role = self._resolve_digest_role(
+                    continue
+
+                if (
+                    not is_priority
+                    and self._is_low_value_soft_discovery_event(
                         ev,
-                        event_type,
+                        posts,
+                        digest_role,
                         category,
                         imp,
                         national,
-                        urgency,
-                        cur,
                         practical,
-                        nov,
-                        pub,
                     )
-    
-                    if strategic_attack_context or direct_impact_video:
-                        digest_role = "core"
-    
-                    if (
-                        not is_priority
-                        and self._is_low_value_russia_discovery_event(
-                            ev, posts, digest_role, imp, national, practical
-                        )
-                    ):
-                        rejected["low_value"] += 1
-                        logger.info(
-                            "Russia soft-discovery rejected: event_id=%s headline='%s'.",
-                            ev.get("event_id"),
-                            str(ev.get("headline_hint") or ev.get("summary") or "")[:120],
-                        )
-                        continue
-    
-                    if (
-                        not is_priority
-                        and self._is_low_value_soft_discovery_event(
-                            ev,
-                            posts,
-                            digest_role,
-                            category,
-                            imp,
-                            national,
+                ):
+                    rejected["low_value"] += 1
+                    logger.info(
+                        "Soft discovery filler rejected: event_id=%s headline='%s'.",
+                        ev.get("event_id"),
+                        str(ev.get("headline_hint") or ev.get("summary") or "")[:120],
+                    )
+                    continue
+
+                discovery_qualified = (
+                    digest_role == "discovery"
+                    and (
+                        is_priority
+                        or self._discovery_quality(
+                            rel,
+                            nov,
+                            cur,
                             practical,
-                        )
-                    ):
-                        rejected["low_value"] += 1
-                        logger.info(
-                            "Soft discovery filler rejected: event_id=%s headline='%s'.",
-                            ev.get("event_id"),
-                            str(ev.get("headline_hint") or ev.get("summary") or "")[:120],
-                        )
-                        continue
-    
-                    discovery_qualified = (
-                        digest_role == "discovery"
-                        and (
-                            is_priority
-                            or self._discovery_quality(
-                                rel,
-                                nov,
-                                cur,
-                                practical,
-                                pub,
-                                category,
-                            )
+                            pub,
+                            category,
                         )
                     )
-    
-                    has_video = any(
-                        posts[s].get("has_video")
-                        for s in src_ids
-                    )
-    
-                    has_media = any(
-                        posts[s].get("has_media")
-                        for s in src_ids
-                    )
-    
-                    # Слабкі типи можуть пройти, якщо вони реально важливі,
-                    # дуже цікаві, корисні або мають сильний новий розвиток.
-                    if (
-                        not is_priority
-                        and event_type in LOW_VALUE_EVENT_TYPES
-                    ):
-                        hot_exception = (
-                            strategic_attack_context
-                            or direct_impact_video
-                            or imp >= 70
-                            or national >= 70
-                            or cur >= 82
-                            or practical >= 82
-                            or (
-                                urgency >= 75
-                                and imp >= 60
-                            )
-                            or (
-                                pub >= 70
-                                and nov >= 65
-                            )
-                            or (
-                                cur >= 75
-                                and nov >= 70
-                                and pub >= 60
-                            )
-                            or (
-                                practical >= 75
-                                and pub >= 60
-                            )
-                            or (
-                                med >= 80
-                                and imp >= 60
-                                and (has_video or has_media)
-                            )
-                            or (
-                                is_history_repeat
-                                and history_update >= self.HISTORY_SIGNIFICANT_UPDATE_MIN
-                            )
-                        )
-    
-                        if not hot_exception:
-                            rejected["low_value"] += 1
-                            continue
-    
-                    tier_mult = self._event_source_multiplier(
-                        src_ids,
-                        posts,
-                    )
-    
-                    # Важливість лишається головним фактором, але цікавість і
-                    # практична цінність достатньо сильні, щоб discovery не зникала.
-                    base_score = (
-                        imp * 0.24
-                        + scale * 0.10
-                        + rel * 0.16
-                        + pub * 0.10
-                        + nov * 0.08
-                        + cur * 0.10
-                        + practical * 0.06
-                        + national * 0.10
-                        + urgency * 0.04
-                        + med * 0.02
-                    )
-    
-                    score = base_score * tier_mult
-    
-                    score += min(len(src_ids) * 1.2, 6)
-    
-                    # Окремий редакційний бонус за геополітичний контекст.
-                    # Він не робить подію "важливою" з повітря: спрацьовує лише
-                    # за консервативним pattern із source-тексту.
-                    if strategic_attack_context:
-                        score += self.STRATEGIC_CONTEXT_RANK_BONUS
-    
-                    if direct_impact_video:
-                        # Помітний, але не домінуючий бонус: video-first удар має
-                        # пройти у вільний core-slot, але не витісняти очевидно
-                        # сильнішу національну подію при повному TOP-10.
-                        score += self.DIRECT_IMPACT_VIDEO_RANK_BONUS
-    
-                    meaningful_event = (
+                )
+
+                has_video = any(
+                    posts[s].get("has_video")
+                    for s in src_ids
+                )
+
+                has_media = any(
+                    posts[s].get("has_media")
+                    for s in src_ids
+                )
+
+                # Слабкі типи можуть пройти, якщо вони реально важливі,
+                # дуже цікаві, корисні або мають сильний новий розвиток.
+                if (
+                    not is_priority
+                    and event_type in LOW_VALUE_EVENT_TYPES
+                ):
+                    hot_exception = (
                         strategic_attack_context
                         or direct_impact_video
-                        or imp >= 60
-                        or national >= 60
-                        or pub >= 65
-                        or urgency >= 75
-                        or cur >= 75
-                        or practical >= 75
-                    )
-    
-                    if meaningful_event:
-                        if has_video:
-                            score += 5
-                        elif has_media:
-                            score += 2.5
-    
-                    if urgency >= 80 and nov >= 65:
-                        score += 4
-    
-                    if urgency >= 85 and imp >= 75:
-                        score += 4
-    
-                    if cur >= 85 and nov >= 70:
-                        score += 6
-                    elif cur >= 78 and nov >= 65:
-                        score += 3
-    
-                    if practical >= 85 and pub >= 65:
-                        score += 6
-                    elif practical >= 75 and pub >= 60:
-                        score += 3
-    
-                    if (
-                        event_type == "science_tech"
-                        and cur >= 70
-                        and nov >= 65
-                    ):
-                        score += 3
-    
-                    if (
-                        is_history_repeat
-                        and history_update >= self.HISTORY_SIGNIFICANT_UPDATE_MIN
-                    ):
-                        score += min(
-                            (history_update - self.HISTORY_SIGNIFICANT_UPDATE_MIN) * 0.10,
-                            2,
+                        or imp >= 70
+                        or national >= 70
+                        or cur >= 82
+                        or practical >= 82
+                        or (
+                            urgency >= 75
+                            and imp >= 60
                         )
-    
-                    if rel < 45:
-                        score -= 20
-                    elif rel < 60:
-                        score -= 8
-    
-                    if (
-                        national < 40
-                        and imp < 70
-                        and pub < 70
-                        and cur < 75
-                        and practical < 75
-                    ):
-                        score -= 10
-    
-                    if (
-                        not is_priority
-                        and event_type in LOW_VALUE_EVENT_TYPES
-                    ):
-                        score -= 4
-    
-                    # editorial_score — реальна редакційна сила БЕЗ manual boost.
-                    # Саме її використовуємо для природного порядку у випуску.
-                    editorial_score = round(score, 2)
-    
-                    if is_priority:
-                        score += 500
-    
-                    factual_source = self._select_factual_source(
-                        src_ids,
-                        posts,
-                        ev.get("best_factual_source_id"),
-                    )
-    
-                    media_source = self._select_media_source(
-                        src_ids,
-                        posts,
-                        ev,
-                        ev.get("best_media_source_id"),
-                    )
-    
-                    visual_media_required = bool(
-                        digest_role == "discovery"
-                        and self._is_visual_discovery_event(
-                            {**ev, "digest_role": digest_role, "source_ids": src_ids},
-                            posts,
+                        or (
+                            pub >= 70
+                            and nov >= 65
+                        )
+                        or (
+                            cur >= 75
+                            and nov >= 70
+                            and pub >= 60
+                        )
+                        or (
+                            practical >= 75
+                            and pub >= 60
+                        )
+                        or (
+                            med >= 80
+                            and imp >= 60
+                            and (has_video or has_media)
+                        )
+                        or (
+                            is_history_repeat
+                            and history_update >= self.HISTORY_SIGNIFICANT_UPDATE_MIN
                         )
                     )
-                    if (
-                        visual_media_required
-                        and not is_priority
-                        and media_source is None
-                    ):
+
+                    if not hot_exception:
                         rejected["low_value"] += 1
-                        logger.info(
-                            "Visual discovery rejected without publishable media: "
-                            "event_id=%s headline='%s'.",
-                            ev.get("event_id"),
-                            str(ev.get("headline_hint") or ev.get("summary") or "")[:120],
-                        )
                         continue
-    
-                    video_validation_needed = self._selected_video_needs_gemini(
-                        media_source,
+
+                tier_mult = self._event_source_multiplier(
+                    src_ids,
+                    posts,
+                )
+
+                # Важливість лишається головним фактором, але цікавість і
+                # практична цінність достатньо сильні, щоб discovery не зникала.
+                base_score = (
+                    imp * 0.24
+                    + scale * 0.10
+                    + rel * 0.16
+                    + pub * 0.10
+                    + nov * 0.08
+                    + cur * 0.10
+                    + practical * 0.06
+                    + national * 0.10
+                    + urgency * 0.04
+                    + med * 0.02
+                )
+
+                score = base_score * tier_mult
+
+                score += min(len(src_ids) * 1.2, 6)
+
+                # Окремий редакційний бонус за геополітичний контекст.
+                # Він не робить подію "важливою" з повітря: спрацьовує лише
+                # за консервативним pattern із source-тексту.
+                if strategic_attack_context:
+                    score += self.STRATEGIC_CONTEXT_RANK_BONUS
+
+                if direct_impact_video:
+                    # Помітний, але не домінуючий бонус: video-first удар має
+                    # пройти у вільний core-slot, але не витісняти очевидно
+                    # сильнішу національну подію при повному TOP-10.
+                    score += self.DIRECT_IMPACT_VIDEO_RANK_BONUS
+
+                meaningful_event = (
+                    strategic_attack_context
+                    or direct_impact_video
+                    or imp >= 60
+                    or national >= 60
+                    or pub >= 65
+                    or urgency >= 75
+                    or cur >= 75
+                    or practical >= 75
+                )
+
+                if meaningful_event:
+                    if has_video:
+                        score += 5
+                    elif has_media:
+                        score += 2.5
+
+                if urgency >= 80 and nov >= 65:
+                    score += 4
+
+                if urgency >= 85 and imp >= 75:
+                    score += 4
+
+                if cur >= 85 and nov >= 70:
+                    score += 6
+                elif cur >= 78 and nov >= 65:
+                    score += 3
+
+                if practical >= 85 and pub >= 65:
+                    score += 6
+                elif practical >= 75 and pub >= 60:
+                    score += 3
+
+                if (
+                    event_type == "science_tech"
+                    and cur >= 70
+                    and nov >= 65
+                ):
+                    score += 3
+
+                if (
+                    is_history_repeat
+                    and history_update >= self.HISTORY_SIGNIFICANT_UPDATE_MIN
+                ):
+                    score += min(
+                        (history_update - self.HISTORY_SIGNIFICANT_UPDATE_MIN) * 0.10,
+                        2,
+                    )
+
+                if rel < 45:
+                    score -= 20
+                elif rel < 60:
+                    score -= 8
+
+                if (
+                    national < 40
+                    and imp < 70
+                    and pub < 70
+                    and cur < 75
+                    and practical < 75
+                ):
+                    score -= 10
+
+                if (
+                    not is_priority
+                    and event_type in LOW_VALUE_EVENT_TYPES
+                ):
+                    score -= 4
+
+                # editorial_score — реальна редакційна сила БЕЗ manual boost.
+                # Саме її використовуємо для природного порядку у випуску.
+                editorial_score = round(score, 2)
+
+                if is_priority:
+                    score += 500
+
+                factual_source = self._select_factual_source(
+                    src_ids,
+                    posts,
+                    ev.get("best_factual_source_id"),
+                )
+
+                media_source = self._select_media_source(
+                    src_ids,
+                    posts,
+                    ev,
+                    ev.get("best_media_source_id"),
+                )
+
+                visual_media_required = bool(
+                    digest_role == "discovery"
+                    and self._is_visual_discovery_event(
+                        {**ev, "digest_role": digest_role, "source_ids": src_ids},
                         posts,
-                        {**ev, "best_factual_source_id": factual_source},
-                    )
-    
-                    publishing_source = (
-                        media_source
-                        if media_source is not None
-                        else factual_source
-                    )
-    
-                    manual_media_locked = bool(
-                        media_source is not None
-                        and posts[media_source].get("is_priority")
-                        and (
-                            posts[media_source].get("manual_media_path")
-                            or posts[media_source].get("manual_telegram_file_id")
-                            or posts[media_source].get("telegram_file_id")
-                        )
-                        and posts[media_source].get("manual_media_type") in {"photo", "video"}
-                    )
-    
-                    discovery_score = self._calculate_discovery_score(
-                        cur,
-                        nov,
-                        practical,
-                        pub,
-                        rel,
-                        med,
-                    )
-    
-                    ev_copy = dict(ev)
-                    ev_copy.update({
-                        "source_ids": src_ids,
-                        "best_factual_source_id": factual_source,
-                        "best_media_source_id": media_source,
-                        "best_source_id": publishing_source,
-                        "manual_media_locked": manual_media_locked,
-                        "manual_media_source_id": media_source if manual_media_locked else None,
-                        "video_validation_needed": video_validation_needed,
-                        "visual_media_required": visual_media_required,
-                        "is_priority": is_priority,
-                        "eligible_for_digest": True,
-                        "event_type": event_type,
-                        "category": category,
-                        "digest_role": digest_role,
-                        "is_discovery_candidate": (
-                            digest_role == "discovery"
-                        ),
-                        "discovery_qualified": discovery_qualified,
-                        "discovery_score": discovery_score,
-                        "has_video": has_video,
-                        "has_media": has_media,
-                        "is_history_repeat": is_history_repeat,
-                        "history_update_strength": history_update,
-                        "importance": imp,
-                        "scale": scale,
-                        "reliability": rel,
-                        "public_interest": pub,
-                        "novelty": nov,
-                        "curiosity": cur,
-                        "practical_value": practical,
-                        "media_quality": med,
-                        "national_relevance": national,
-                        "urgency": urgency,
-                        "strategic_attack_context": strategic_attack_context,
-                        "direct_impact_video": direct_impact_video,
-                        "editorial_score": editorial_score,
-                        "raw_score": round(score, 2),
-                    })
-    
-                    ranked.append(ev_copy)
-    
-                except Exception as e:
-                    logger.warning(
-                        "Помилка ranking події: "
-                        f"{e}"
-                    )
-    
-            logger.info(
-                "Ranking gate: "
-                f"ineligible={rejected['ineligible']}, "
-                f"history_repeat={rejected['history_repeat']}, "
-                f"hard_reject={rejected['hard_reject']}, "
-                f"low_value={rejected['low_value']}, "
-                f"no_sources={rejected['no_sources']}."
-            )
-    
-            ranked.sort(
-                key=lambda x: x.get("raw_score", 0),
-                reverse=True,
-            )
-    
-            # Баланс категорій: після 3-4 матеріалів однієї теми наступному стає
-            # трохи важче. Manual не караємо, бо воно вже обране адміністратором.
-            category_counts: Dict[str, int] = {}
-    
-            for ev in ranked:
-                if ev.get("is_priority"):
-                    ev["balanced_score"] = ev["raw_score"]
-                    continue
-    
-                category = ev["category"]
-                current = category_counts.get(category, 0)
-    
-                penalty = (
-                    12
-                    if current >= 4
-                    else (
-                        6
-                        if current >= 3
-                        else 0
                     )
                 )
-    
-                diversity_bonus = 0.0
-    
-                if ev.get("curiosity", 0) >= 82:
-                    diversity_bonus += 2.5
-    
-                if ev.get("practical_value", 0) >= 82:
-                    diversity_bonus += 2.5
-    
-                # Справжній discovery-кандидат отримує маленький бонус доступу до
-                # candidate pool. Квоту у фіналі все одно контролює окремий mix.
                 if (
-                    ev.get("digest_role") == "discovery"
-                    and ev.get("discovery_qualified")
+                    visual_media_required
+                    and not is_priority
+                    and media_source is None
                 ):
-                    diversity_bonus += 2.0
-    
-                ev["balanced_score"] = round(
-                    ev["raw_score"]
-                    - penalty
-                    + diversity_bonus,
-                    2,
+                    rejected["low_value"] += 1
+                    logger.info(
+                        "Visual discovery rejected without publishable media: "
+                        "event_id=%s headline='%s'.",
+                        ev.get("event_id"),
+                        str(ev.get("headline_hint") or ev.get("summary") or "")[:120],
+                    )
+                    continue
+
+                video_validation_needed = self._selected_video_needs_gemini(
+                    media_source,
+                    posts,
+                    {**ev, "best_factual_source_id": factual_source},
                 )
-    
-                category_counts[category] = current + 1
-    
-            ranked.sort(
-                key=lambda x: x.get("balanced_score", 0),
-                reverse=True,
-            )
-    
-            return ranked
-    
-        def _fact_check_final_news(
-            self,
-            news: List[Dict[str, Any]],
-            ranked_events: List[Dict[str, Any]],
-            posts: List[Dict[str, Any]],
-            max_retries: int,
-        ) -> List[Dict[str, Any]]:
-            """Фінальний factual/editorial pass одним batch-запитом."""
-            stats = {
-                "enabled": bool(self.FINAL_FACT_CHECK_ENABLED),
-                "expected": len(news or []),
-                "eligible_cases": 0,
-                "checked": 0,
-                "corrected": 0,
-                "completed": False,
-            }
-    
-            if not self.FINAL_FACT_CHECK_ENABLED or not news:
-                stats["completed"] = True
-                self.last_fact_check_stats = stats
-                return news
-    
-            event_map = {
-                str(ev.get("event_id") or ""): ev
-                for ev in ranked_events
-                if isinstance(ev, dict) and ev.get("event_id")
-            }
-            cases = []
-            for item in news:
-                if not isinstance(item, dict):
-                    continue
-                event_id = str(item.get("event_id") or "")
-                text = str(item.get("text") or "").strip()
-                ev = event_map.get(event_id)
-                if not event_id or not text or not ev:
-                    continue
-    
-                source_ids = self._valid_source_ids(ev.get("source_ids"), posts)
-                preferred = ev.get("best_factual_source_id")
-                ordered_ids = []
-                if isinstance(preferred, int) and preferred in source_ids:
-                    ordered_ids.append(preferred)
-                ordered_ids.extend(sid for sid in source_ids if sid not in ordered_ids)
-    
-                source_payload = []
-                for source_id in ordered_ids[:3]:
-                    source_text = str(posts[source_id].get("text") or "").strip()
-                    if not source_text:
-                        continue
-                    source_payload.append({
-                        "source_id": source_id,
-                        "channel": str(
-                            posts[source_id].get("channel_title")
-                            or posts[source_id].get("channel_username")
-                            or ""
-                        ),
-                        "text": source_text[:1400],
-                    })
-    
-                cases.append({
-                    "event_id": event_id,
-                    "draft_text": text,
-                    "event_summary": str(ev.get("summary") or "")[:900],
-                    "key_facts": ev.get("key_facts", [])[:8]
-                    if isinstance(ev.get("key_facts"), list)
-                    else [],
-                    "sources": source_payload,
+
+                publishing_source = (
+                    media_source
+                    if media_source is not None
+                    else factual_source
+                )
+
+                manual_media_locked = bool(
+                    media_source is not None
+                    and posts[media_source].get("is_priority")
+                    and (
+                        posts[media_source].get("manual_media_path")
+                        or posts[media_source].get("manual_telegram_file_id")
+                        or posts[media_source].get("telegram_file_id")
+                    )
+                    and posts[media_source].get("manual_media_type") in {"photo", "video"}
+                )
+
+                discovery_score = self._calculate_discovery_score(
+                    cur,
+                    nov,
+                    practical,
+                    pub,
+                    rel,
+                    med,
+                )
+
+                ev_copy = dict(ev)
+                ev_copy.update({
+                    "source_ids": src_ids,
+                    "best_factual_source_id": factual_source,
+                    "best_media_source_id": media_source,
+                    "best_source_id": publishing_source,
+                    "manual_media_locked": manual_media_locked,
+                    "manual_media_source_id": media_source if manual_media_locked else None,
+                    "video_validation_needed": video_validation_needed,
+                    "visual_media_required": visual_media_required,
+                    "is_priority": is_priority,
+                    "eligible_for_digest": True,
+                    "event_type": event_type,
+                    "category": category,
+                    "digest_role": digest_role,
+                    "is_discovery_candidate": (
+                        digest_role == "discovery"
+                    ),
+                    "discovery_qualified": discovery_qualified,
+                    "discovery_score": discovery_score,
+                    "has_video": has_video,
+                    "has_media": has_media,
+                    "is_history_repeat": is_history_repeat,
+                    "history_update_strength": history_update,
+                    "importance": imp,
+                    "scale": scale,
+                    "reliability": rel,
+                    "public_interest": pub,
+                    "novelty": nov,
+                    "curiosity": cur,
+                    "practical_value": practical,
+                    "media_quality": med,
+                    "national_relevance": national,
+                    "urgency": urgency,
+                    "strategic_attack_context": strategic_attack_context,
+                    "direct_impact_video": direct_impact_video,
+                    "editorial_score": editorial_score,
+                    "raw_score": round(score, 2),
                 })
-    
-            stats["eligible_cases"] = len(cases)
-    
-            if not cases:
-                stats["completed"] = True
-                self.last_fact_check_stats = stats
-                return news
-    
-            payload = json.dumps(cases, ensure_ascii=False)
-            prompt = f"""
-    Ти — фінальний фактчекер українського Telegram-дайджесту.
-    
-    Для кожного case звір DRAFT_TEXT ТІЛЬКИ з EVENT_SUMMARY, KEY_FACTS і SOURCES.
-    Не використовуй зовнішні знання і не додавай нового факту. Склад новин,
-    event_id і порядок уже затверджені.
-    
-    Перевір:
-    1. Не розширюй вибірку/масштаб: одна бригада, компанія, місто, лікарня,
-       опитування чи група людей не означає все військо, країну або галузь.
-    2. "планує/готовий/може/має підписати" != "підписав";
-       "розглядають/пропонують" != "ухвалили"; "очікується" != "сталося".
-    3. Оцінка, заява, прогноз або припущення не є встановленим фактом.
-    4. Цифри, одиниці, назви та географію переносити точно.
-    5. Не додавай причинно-наслідкових висновків, яких немає в SOURCES.
-    6. Для посадових титулів не додавай зайві статусні прикметники
-       "обраний/колишній/чинний", якщо вони не потрібні для суті. Якщо титул
-       неоднозначний, безпечніше залишити ім'я без такого означення.
-    7. Прибери сусідні речення, які повторюють один і той самий факт.
-    8. Заголовок не може бути ширшим/категоричнішим за джерела.
-    9. Якщо DRAFT_TEXT уже точний — не переписуй його заради стилю.
-    
-    corrected_text: один емодзі + <b>Заголовок</b>\n\n2-6 завершених речень,
-    максимум {self.MAX_NEWS_CHARS} символів. Посилань не додавай.
-    
-    ВІДПОВІДЬ ТІЛЬКИ JSON:
-    {{"checks":[{{"event_id":"E1","changed":false,"corrected_text":"...","reason":"exact або коротка причина"}}]}}
-    
-    CASES:
-    {payload}
-    """
-            data = self._call_json_with_cascade(
-                prompt,
-                max_retries,
-                "FINAL_FACT_CHECK",
-                temperature=0.05,
+
+                ranked.append(ev_copy)
+
+            except Exception as e:
+                logger.warning(
+                    "Помилка ranking події: "
+                    f"{e}"
+                )
+
+        logger.info(
+            "Ranking gate: "
+            f"ineligible={rejected['ineligible']}, "
+            f"history_repeat={rejected['history_repeat']}, "
+            f"hard_reject={rejected['hard_reject']}, "
+            f"low_value={rejected['low_value']}, "
+            f"no_sources={rejected['no_sources']}."
+        )
+
+        ranked.sort(
+            key=lambda x: x.get("raw_score", 0),
+            reverse=True,
+        )
+
+        # Баланс категорій: після 3-4 матеріалів однієї теми наступному стає
+        # трохи важче. Manual не караємо, бо воно вже обране адміністратором.
+        category_counts: Dict[str, int] = {}
+
+        for ev in ranked:
+            if ev.get("is_priority"):
+                ev["balanced_score"] = ev["raw_score"]
+                continue
+
+            category = ev["category"]
+            current = category_counts.get(category, 0)
+
+            penalty = (
+                12
+                if current >= 4
+                else (
+                    6
+                    if current >= 3
+                    else 0
+                )
             )
-            checks = (
-                data.get("checks", [])
-                if data and isinstance(data.get("checks"), list)
-                else []
+
+            diversity_bonus = 0.0
+
+            if ev.get("curiosity", 0) >= 82:
+                diversity_bonus += 2.5
+
+            if ev.get("practical_value", 0) >= 82:
+                diversity_bonus += 2.5
+
+            # Справжній discovery-кандидат отримує маленький бонус доступу до
+            # candidate pool. Квоту у фіналі все одно контролює окремий mix.
+            if (
+                ev.get("digest_role") == "discovery"
+                and ev.get("discovery_qualified")
+            ):
+                diversity_bonus += 2.0
+
+            ev["balanced_score"] = round(
+                ev["raw_score"]
+                - penalty
+                + diversity_bonus,
+                2,
             )
-            check_map = {
-                str(check.get("event_id") or ""): check
-                for check in checks
-                if isinstance(check, dict) and check.get("event_id")
-            }
-    
-            valid_case_ids = {
-                str(case.get("event_id") or "")
-                for case in cases
-                if isinstance(case, dict) and case.get("event_id")
-            }
-            checked_count = sum(
-                1
-                for event_id in valid_case_ids
-                if event_id in check_map
-            )
-    
-            result = []
-            changed_count = 0
-            for item in news:
-                if not isinstance(item, dict):
-                    continue
-                item_copy = dict(item)
-                event_id = str(item_copy.get("event_id") or "")
-                check = check_map.get(event_id)
-                if check:
-                    corrected = str(check.get("corrected_text") or "").strip()
-                    if corrected:
-                        cleaned = self._clean_generated_news_text(corrected)
-                        if cleaned:
-                            old_text = str(item_copy.get("text") or "").strip()
-                            item_copy["text"] = cleaned
-                            if cleaned != old_text:
-                                changed_count += 1
-                                logger.info(
-                                    "Final fact-check corrected event_id=%s reason='%s'.",
-                                    event_id,
-                                    str(check.get("reason") or "")[:220],
-                                )
-                result.append(item_copy)
-    
-            stats.update({
-                "checked": checked_count,
-                "corrected": changed_count,
-                "completed": data is not None,
-            })
+
+            category_counts[category] = current + 1
+
+        ranked.sort(
+            key=lambda x: x.get("balanced_score", 0),
+            reverse=True,
+        )
+
+        return ranked
+
+    def _fact_check_final_news(
+        self,
+        news: List[Dict[str, Any]],
+        ranked_events: List[Dict[str, Any]],
+        posts: List[Dict[str, Any]],
+        max_retries: int,
+    ) -> List[Dict[str, Any]]:
+        """Фінальний factual/editorial pass одним batch-запитом."""
+        stats = {
+            "enabled": bool(self.FINAL_FACT_CHECK_ENABLED),
+            "expected": len(news or []),
+            "eligible_cases": 0,
+            "checked": 0,
+            "corrected": 0,
+            "completed": False,
+        }
+
+        if not self.FINAL_FACT_CHECK_ENABLED or not news:
+            stats["completed"] = True
             self.last_fact_check_stats = stats
-    
-            logger.info(
-                "Final fact-check: expected=%s eligible=%s checked=%s corrected=%s completed=%s.",
-                stats["expected"],
-                stats["eligible_cases"],
-                stats["checked"],
-                stats["corrected"],
-                stats["completed"],
-            )
-            return result
-    
-        def _generate_final_digest(
-            self,
-            events: List[Dict[str, Any]],
-            posts: List[Dict[str, Any]],
-            past_events: Optional[
-                Union[
-                    List[str],
-                    List[Dict[str, str]],
-                ]
-            ],
-            max_count: int,
-            max_retries: int,
-        ) -> List[Dict[str, Any]]:
-            event_blocks = []
-    
-            for ev in events:
-                factual_id = ev["best_factual_source_id"]
-                media_id = ev.get("best_media_source_id")
-                factual_post = posts[factual_id]
-    
-                media_description = "немає"
-                if isinstance(media_id, int):
-                    if posts[media_id].get("has_video"):
-                        media_description = (
-                            "відео з Telegram-поста цієї події"
-                        )
-                    elif posts[media_id].get("has_media"):
-                        media_description = (
-                            "фото з Telegram-поста цієї події"
-                        )
-    
-                key_facts = ev.get("key_facts", [])
-                key_facts_text = (
-                    "; ".join(
-                        str(x)
-                        for x in key_facts[:6]
-                    )
-                    if isinstance(key_facts, list)
-                    else str(key_facts)
-                )
-    
-                priority_flag = (
-                    " ⭐ ПРІОРИТЕТ АДМІНІСТРАТОРА"
-                    if ev.get("is_priority")
-                    else ""
-                )
-    
-                repeat_info = (
-                    "так, але є значущий новий розвиток"
-                    if ev.get("is_history_repeat")
-                    else "ні"
-                )
-    
-                event_blocks.append(
-                    "=== EVENT_ID: "
-                    f"{ev.get('event_id')}"
-                    f"{priority_flag} ===\n"
-                    "ТИП: "
-                    f"{ev.get('event_type', 'other')}\n"
-                    "КАТЕГОРІЯ: "
-                    f"{ev.get('category', 'other')}\n"
-                    "РОЛЬ У ДАЙДЖЕСТІ: "
-                    f"{self._event_digest_role(ev)}\n"
-                    "IMPORTANCE: "
-                    f"{ev.get('importance', 0)}\n"
-                    "PUBLIC_INTEREST: "
-                    f"{ev.get('public_interest', 0)}\n"
-                    "NOVELTY: "
-                    f"{ev.get('novelty', 0)}\n"
-                    "CURIOSITY: "
-                    f"{ev.get('curiosity', 0)}\n"
-                    "PRACTICAL_VALUE: "
-                    f"{ev.get('practical_value', 0)}\n"
-                    "URGENCY: "
-                    f"{ev.get('urgency', 0)}\n"
-                    "ПОВТОР ІСТОРІЇ: "
-                    f"{repeat_info}\n"
-                    "СИЛА НОВОГО РОЗВИТКУ: "
-                    f"{ev.get('history_update_strength', 0)}\n"
-                    "МЕДІА: "
-                    f"{media_description}\n"
-                    "СУТЬ: "
-                    f"{ev.get('summary', '')}\n"
-                    "ЧОМУ ВАЖЛИВО/ЦІКАВО: "
-                    f"{ev.get('why_it_matters', '')}\n"
-                    "КЛЮЧОВІ ФАКТИ: "
-                    f"{key_facts_text}\n"
-                    "ТЕКСТ ДЖЕРЕЛА: "
-                    f"{str(factual_post.get('text') or '')[:self.MAX_EVENT_SOURCE_CHARS]}\n"
-                )
-    
-            history_block = self._build_history_block(
-                past_events
-            )
-    
-            prompt = f"""
-    Ти — головний редактор українського новинного Telegram-каналу.
-    
-    Сформуй фінальний дайджест із найважливіших,
-    найцікавіших і найактуальніших подій.
-    Максимум: {max_count} новин.
-    
-    Якщо є достатньо якісних кандидатів, бажано сформувати 7-10 новин.
-    Не потрібно штучно набирати {max_count}, якщо кандидат справді слабкий.
-    
-    ВАЖЛИВА РЕДАКЦІЙНА СТРУКТУРА:
-    Кандидати мають роль CORE або DISCOVERY.
-    
-    CORE — головні/важкі новини. DISCOVERY — якісні цікаві або практично
-    корисні події, які органічно завершують випуск.
-    
-    ПРАВИЛО КІЛЬКОСТІ ДЛЯ ЛІМІТУ 10:
-    - якщо є 10 сильних CORE — бери 10 CORE і НЕ додавай discovery;
-    - якщо є 9 CORE — додай 1 discovery;
-    - якщо є 8 CORE — додай 1-2 discovery;
-    - якщо є 7 CORE — додай 1-3 discovery;
-    - якщо є 5-6 CORE — залиш їх ядром і додай до 3 discovery.
-    
-    Не витісняй справді важливу десяту CORE-новину цікавинкою.
-    Але коли після важких новин є вільні місця, не заповнюй їх слабкою
-    однотипною hard-news подією, якщо є якісна DISCOVERY.
-    
-    УСІ DISCOVERY-НОВИНИ СТАВ У КІНЦІ ДАЙДЖЕСТУ, після CORE.
-    Всередині CORE і DISCOVERY порядок визначай природно за важливістю/силою.
-    
-    Події ⭐ ПРІОРИТЕТ АДМІНІСТРАТОРА обов'язково включи у фінальний список.
-    Manual priority сильніше за звичайну квоту: його не можна відкинути.
-    При цьому не треба механічно ставити всі manual-події на початок —
-    розташовуй їх органічно за змістом; discovery-manual теж іде в кінцевий
-    discovery-блок.
-    
-    ━━━━━━━━━━━━━━━━━━━━
-    АРХІВ:
-    {history_block}
-    ━━━━━━━━━━━━━━━━━━━━
-    
-    ВИМОГИ ДО ВИБОРУ:
-    
-    1. Не повторюй одну реальну подію двічі.
-    2. Якщо подія вже була в архіві, включай її знову лише коли кандидат
-       містить реально значущий новий розвиток.
-    3. Агреговане зведення ППО / Повітряних сил зі статистикою збитих ракет
-       і БпЛА — максимум одне за 24 години. Інші цифри пізніше того ж дня
-       не роблять його новою окремою новиною.
-    4. Той самий закон/санкційний пакет/угоду протягом 24 годин не повторюй
-       через інший заголовок, повторне голосування тієї самої стадії або
-       "готовність/намір підписати". Новий етап — лише фактичне ухвалення після
-       стадії проєкту, фактичний підпис, набуття чинності, введення або вето.
-    5. Не додавай відверто слабку подію тільки для заповнення кількості.
-    6. Не вигадуй факти.
-    7. Не використовуй чутки.
-    8. Не оцінюй важливість за довжиною початкового Telegram-посту.
-    9. Коротка гаряча новина може бути однією з головних новин дайджесту.
-    10. Відео або фото саме по собі не робить слабку подію важливою.
-    11. Якщо значуща подія має реальне фото чи відео з місця — це плюс.
-    12. При близьких оцінках віддавай перевагу події,
-        яка додає нову тему, корисність або цікавість,
-        а не четвертій однотипній новині про вже представлену тему.
-    13. Високий CURIOSITY означає, що подія може зайняти 7-10 місце,
-        навіть якщо її стратегічна IMPORTANCE нижча.
-    14. Високий PRACTICAL_VALUE означає, що подія корисна людям
-        і теж може виправдано потрапити у фінальний список.
-    15. Для атак не оцінюй вагу лише за жертвами/руйнуваннями. Якщо у зоні
-        прямого ризику були світові політики, міжнародна делегація або інцидент
-        має чіткий контекст НАТО/ЄС/міжнародної ескалації, така подія може бути
-        сильнішою за звичайну science/discovery-новину навіть без постраждалих.
-    
-    ━━━━━━━━━━━━━━━━━━━━
-    ВИМОГИ ДО ТЕКСТУ:
-    
-    Ти пишеш НЕ для сухого інформагентства,
-    а для сучасного короткого Telegram-дайджесту.
-    
-    Читач має за 15-25 секунд:
-    1. зрозуміти, що сталося;
-    2. побачити найважливішу або найцікавішу деталь;
-    3. зрозуміти масштаб, наслідок або практичне значення;
-    4. отримати достатньо контексту, щоб новина не виглядала як обірваний факт.
-    
-    СТИЛЬ:
-    - живий;
-    - природний;
-    - конкретний;
-    - компактний;
-    - інформаційний;
-    - без канцеляриту;
-    - без штучної сенсаційності.
-    
-    Текст має читатися як хороша редакторська розповідь,
-    а не як список пунктів із пресрелізу.
-    
-    Кожна новина повинна мати маленький природний "гачок":
-    сильну цифру, конкретну деталь, наслідок, контраст,
-    незвичайний факт або просте пояснення, чому це цікаво.
-    
-    ГАЧОК НЕ ОЗНАЧАЄ КЛІКБЕЙТ.
-    Не перебільшуй і не домислюй.
-    
-    ━━━━━━━━━━━━━━━━━━━━
-    ДОВЖИНА:
-    
-    Максимальна довжина однієї новини — {self.MAX_NEWS_CHARS} символів.
-    
-    Бажана довжина — приблизно 450-800 символів разом із заголовком,
-    якщо кандидат містить достатньо підтверджених фактів.
-    
-    Типово пиши 3-6 ЗАВЕРШЕНИХ речень.
-    
-    Для простої гарячої події достатньо 2-3 речень.
-    Для змістовної новини з цифрами, контекстом або наслідками — 4-6 речень.
-    
-    Не розтягуй матеріал, якщо фактів мало.
-    Краще 3 сильні речення, ніж 6 речень із водою.
-    
-    Не роби речення надто довгими.
-    Частіше використовуй короткі або середні речення,
-    щоб пост легко читався зі смартфона.
-    
-    ━━━━━━━━━━━━━━━━━━━━
-    ЯК БУДУВАТИ НОВИНУ:
-    
-    НЕ використовуй одну жорстку схему для всіх матеріалів.
-    Обирай найприродніший початок залежно від події.
-    
-    Можна почати з:
-    - головного результату;
-    - найцікавішої деталі;
-    - сильної цифри;
-    - незвичайного факту;
-    - зміни, яка безпосередньо вплине на людей;
-    - короткого пояснення масштабу.
-    
-    Якщо серед фактів є одна особливо цікава деталь,
-    не ховай її в останньому реченні — винеси ближче до початку.
-    
-    Для війни та атак:
-    що сталося → головний наслідок → масштаб/місце → важливий контекст.
-    
-    Для фронту:
-    що змінилося → де → який результат → чому це важливо.
-    
-    Для технологій і науки:
-    що нового → чим це відрізняється → конкретна деталь/цифра →
-    чому це цікаво або що це може змінити, якщо це випливає з фактів.
-    
-    Для економіки:
-    що змінилося → цифри → кого це зачепить → практичний наслідок.
-    
-    Для суспільних новин:
-    що змінюється → як працюватиме → кого стосується →
-    що читачеві важливо запам'ятати.
-    
-    Для міжнародних:
-    що сталося → ключова деталь → чому це має значення для України або світу.
-    
-    Для українських виробництв/досягнень:
-    що запустили або створили → що саме вміють/виробляють →
-    масштаб або конкретика → чому це помітна зміна.
-    
-    ━━━━━━━━━━━━━━━━━━━━
-    ПРИКЛАД ПРИНЦИПУ СТИЛЮ:
-    
-    СУХО:
-    "Підприємство налагодило виробництво артилерійських стволів.
-    Воно виконує замовлення BAE Systems. Калібр становить від 25 до 203 мм."
-    
-    КРАЩЕ ЗА ЛОГІКОЮ:
-    "Український завод освоїв серійне виробництво артилерійських стволів —
-    від 25 до 203 мм. Підприємство вже виконує замовлення BAE Systems
-    на компоненти для західних артсистем. Це означає, що частину складного
-    виробництва для таких систем уже локалізують в Україні."
-    
-    НЕ копіюй цей текст і НЕ додавай висновків,
-    якщо їх немає у фактах кандидата.
-    Це лише приклад того, як зробити подачу природнішою.
-    
-    ━━━━━━━━━━━━━━━━━━━━
-    ЗАГОЛОВОК:
-    
-    4-10 слів.
-    
-    Він повинен бути:
-    - конкретним;
-    - зрозумілим без читання тексту;
-    - трохи цікавішим за канцелярський заголовок;
-    - без клікбейту;
-    - без порожніх формулювань.
-    
-    Добре:
-    "Київ змінює правила роботи під час тривог"
-    "Україна запускає виробництво стволів для західної артилерії"
-    "Новий тариф на воду може змінити платіжки киян"
-    
-    Погано:
-    "Стало відомо про важливе рішення"
-    "Нові подробиці ситуації"
-    "В Україні відбулася важлива подія"
-    
-    Заголовок не повинен дослівно повторювати перше речення.
-    
-    ━━━━━━━━━━━━━━━━━━━━
-    ВАЖЛИВО:
-    
-    - ніколи не обривай останнє речення;
-    - ніколи не завершуй новину на півслові;
-    - не додавай фактів, яких немає у кандидатові;
-    - не розширюй масштаб твердження: дані однієї бригади/компанії/міста/
-      вибірки не перетворюй на твердження про все військо, країну чи галузь;
-    - точно зберігай модальність і статус: "планує/готовий/може" не означає
-      "зробив/підписав/ухвалив"; оцінка або прогноз не є встановленим фактом;
-    - якщо статусний титул особи не потрібен для суті, не додавай зайвих
-      прикметників на кшталт "обраний/колишній/чинний" без потреби;
-    - не роби власних прогнозів;
-    - не приписуй причин, яких джерело не підтверджує;
-    - якщо текст виходить задовгим, скороти другорядні деталі;
-    - кожне речення повинно або додавати факт,
-      або пояснювати значення вже наведеного факту;
-    - не повторюй один і той самий факт різними словами;
-    - не використовуй сухий стиль протоколу;
-    - не використовуй надмірно емоційні формулювання.
-    
-    НЕ ВИКОРИСТОВУЙ шаблони:
-    
-    "Стало відомо..."
-    "Повідомляється, що..."
-    "Наразі відомо..."
-    "Як зазначають..."
-    "За інформацією джерел..."
-    "Ситуація залишається..."
-    "Варто зазначити..."
-    "Нагадаємо, що..." — якщо це не справді необхідний контекст.
-    
-    Не вставляй технічні маркери:
-    [ФОТО]
-    [ВІДЕО]
-    [ТЕКСТ]
-    
-    ФОРМАТ:
-    
-    ОДИН тематичний емодзі + <b>Заголовок</b>
-    
-    порожній рядок
-    
-    2-6 завершених природних речень.
-    
-    ПЕРЕД ВІДПОВІДДЮ ПЕРЕВІР КОЖНУ НОВИНУ:
-    
-    1. Чи не перевищує вона {self.MAX_NEWS_CHARS} символів?
-    2. Чи має вона достатньо контексту, а не лише сухий факт?
-    3. Чи завершене останнє речення?
-    4. Чи немає повторів і води?
-    5. Чи всі твердження походять із наданих фактів?
-    6. Чи не дублює вона іншу новину в цьому ж дайджесті?
-    7. Чи є в ній найцікавіша/найважливіша конкретна деталь кандидата?
-    8. Чи звучить текст природно українською?
-    9. Чи не став він клікбейтним?
-    10. Чи випуск загалом не перевантажений однією категорією,
-        якщо є якісні альтернативи?
-    
-    ВІДПОВІДЬ ТІЛЬКИ JSON:
-    
-    {{
-      "news": [
-        {{
-          "event_id": "E1",
-          "text": "💥 <b>Короткий заголовок</b>\\n\\nПерше завершене речення. Друге завершене речення. Третє завершене речення."
-        }}
-      ]
-    }}
-    
-    КАНДИДАТИ:
-    {chr(10).join(event_blocks)}
-    """
-    
-            data = self._call_json_with_cascade(
-                prompt,
-                max_retries,
-                "EDITOR",
-                temperature=0.30,
-            )
-    
-            raw_news = (
-                data.get("news", [])
-                if (
-                    data
-                    and isinstance(data.get("news"), list)
-                )
-                else []
-            )
-    
-            event_map = {
-                str(ev["event_id"]): ev
-                for ev in events
-                if ev.get("event_id")
-            }
-    
-            final_list = []
-    
-            for item in raw_news:
-                if not isinstance(item, dict):
-                    continue
-    
-                event_id = str(item.get("event_id") or "")
-                text = item.get("text")
-    
-                if (
-                    event_id not in event_map
-                    or not isinstance(text, str)
-                    or not text.strip()
-                ):
-                    continue
-    
-                ev = event_map[event_id]
-    
-                final_list.append({
-                    "event_id": event_id,
-                    "source_id": ev["best_source_id"],
-                    "source_ids": list(
-                        ev.get("source_ids", [])
-                    ),
-                    "summary": ev.get("summary", ""),
-                    "category": ev.get("category", "other"),
-                    "digest_role": self._event_digest_role(ev),
-                    "is_discovery_candidate": bool(
-                        ev.get("is_discovery_candidate")
-                    ),
-                    "is_priority": bool(ev.get("is_priority")),
-                    "video_validation_needed": bool(ev.get("video_validation_needed", False)),
-                    "visual_media_required": bool(ev.get("visual_media_required", False)),
-                    "text": text.strip(),
-                })
-    
-            return final_list
-    
-        @staticmethod
-        def _post_external_links(post: Dict[str, Any]) -> List[Dict[str, str]]:
-            raw = post.get("external_links")
-            if not isinstance(raw, list):
-                return []
-            result: List[Dict[str, str]] = []
-            seen = set()
-            for item in raw:
-                if isinstance(item, str):
-                    url = item.strip()
-                    label = ""
-                elif isinstance(item, dict):
-                    url = str(item.get("url") or "").strip()
-                    label = str(item.get("label") or "").strip()
-                else:
-                    continue
-                if not url or url in seen:
-                    continue
-                try:
-                    parsed = urlparse(url)
-                except Exception:
-                    continue
-                if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-                    continue
-                seen.add(url)
-                result.append({"url": url, "label": label})
-            return result
-    
-        @staticmethod
-        def _reference_kind(text: str) -> Optional[str]:
-            t = NewsSummarizer._normalize_similarity_text(text)
-            if not t:
-                return None
-            if any(marker in t for marker in (
-                "законопро", " закон ", "постан", "указ", "документ",
-                "регламент", "директив", "рішення суд", "ратифік",
-            )):
-                return "Документ"
-            if any(marker in t for marker in (
-                "дослідж", "study", "research", "науков статт",
-                "науковій статт", "журнал", "paper", "опитуван",
-            )):
-                return "Дослідження"
-            if any(marker in t for marker in (
-                "звіт", "доповід", "report", "індекс", "рейтинг",
-                "аналітичн звіт", "розслідуван",
-            )):
-                return "Звіт"
-            if any(marker in t for marker in (
-                "статт", "публікац", "матеріал видан", "колонк",
-                "інтерв ю", "інтерв'ю",
-            )):
-                return "Стаття"
-            return None
-    
-        @staticmethod
-        def _reference_domain_score(url: str, kind: str) -> float:
-            try:
-                host = (urlparse(url).hostname or "").lower()
-            except Exception:
-                return -1000.0
-            blocked_hosts = {
-                "t.me", "telegram.me", "telegram.org", "instagram.com",
-                "www.instagram.com", "facebook.com", "www.facebook.com",
-                "x.com", "twitter.com", "www.twitter.com", "youtube.com",
-                "www.youtube.com", "youtu.be", "tiktok.com", "www.tiktok.com",
-                "vk.com", "ok.ru",
-            }
-            if host in blocked_hosts or any(host.endswith("." + h) for h in blocked_hosts):
-                return -1000.0
-            score = 0.0
-            official_fragments = (
-                "gov.ua", "rada.gov.ua", "president.gov.ua", "kmu.gov.ua",
-                "europa.eu", "ec.europa.eu", "consilium.europa.eu", "nato.int",
-                "un.org", "who.int", "worldbank.org", "imf.org", "oecd.org",
-                ".gov", "parliament", "senate", "congress",
-            )
-            research_fragments = (
-                "nature.com", "science.org", "sciencedirect.com", "springer.com",
-                "wiley.com", "thelancet.com", "nejm.org", "bmj.com",
-                "arxiv.org", "doi.org", "pubmed.ncbi.nlm.nih.gov",
-            )
-            if any(fragment in host for fragment in official_fragments):
-                score += 45.0 if kind == "Документ" else 28.0
-            if any(fragment in host for fragment in research_fragments):
-                score += 45.0 if kind == "Дослідження" else 24.0
-            return score
-    
-        def _select_reference_link(
-            self,
-            ev: Dict[str, Any],
-            posts: List[Dict[str, Any]],
-        ) -> tuple[Optional[str], Optional[str]]:
-            event_text = self._event_source_text_bundle(ev, posts)
-            kind = self._reference_kind(event_text)
-            if not kind:
-                return None, None
-    
+            return news
+
+        event_map = {
+            str(ev.get("event_id") or ""): ev
+            for ev in ranked_events
+            if isinstance(ev, dict) and ev.get("event_id")
+        }
+        cases = []
+        for item in news:
+            if not isinstance(item, dict):
+                continue
+            event_id = str(item.get("event_id") or "")
+            text = str(item.get("text") or "").strip()
+            ev = event_map.get(event_id)
+            if not event_id or not text or not ev:
+                continue
+
             source_ids = self._valid_source_ids(ev.get("source_ids"), posts)
             preferred = ev.get("best_factual_source_id")
-            ordered_ids: List[int] = []
+            ordered_ids = []
             if isinstance(preferred, int) and preferred in source_ids:
                 ordered_ids.append(preferred)
             ordered_ids.extend(sid for sid in source_ids if sid not in ordered_ids)
-    
-            candidates = []
-            reference_words = (
-                "джерел", "дослідж", "study", "research", "звіт", "report",
-                "закон", "документ", "постан", "статт", "article", "читати",
-                "повний текст", "оригінал", "публікац",
-            )
-            for order, source_id in enumerate(ordered_ids):
-                for link in self._post_external_links(posts[source_id]):
-                    url = link["url"]
-                    label = self._normalize_similarity_text(link.get("label", ""))
-                    domain_score = self._reference_domain_score(url, kind)
-                    if domain_score <= -900:
-                        continue
-                    label_signal = any(word in label for word in reference_words)
-                    label_relevance = False
-                    if label:
-                        label_stats = self._history_similarity_stats(
-                            event_text,
-                            label,
-                        )
-                        label_relevance = (
-                            label_stats["common"] >= 3
-                            or label_stats["seq"] >= 0.38
-                            or bool(
-                                self._entity_signature(event_text)
-                                & self._entity_signature(label)
-                            )
-                        )
-    
-                    if not label_signal and not label_relevance and domain_score <= 0:
-                        continue
-    
-                    score = domain_score
-                    if source_id == preferred:
-                        score += 20.0
-                    score += max(0.0, 8.0 - order * 1.5)
-                    if label_signal:
-                        score += 22.0
-                    if label_relevance:
-                        score += 12.0
-                    if label and len(label) <= 80:
-                        score += 2.0
-                    candidates.append((score, url))
-    
-            if not candidates:
-                return None, None
-            candidates.sort(key=lambda item: item[0], reverse=True)
-            best_score, best_url = candidates[0]
-            if best_score < 12.0:
-                return None, None
-            return best_url, kind
-    
-        def _validate_final_news(
-            self,
-            news: List[Dict[str, Any]],
-            ranked_events: List[Dict[str, Any]],
-            posts: List[Dict[str, Any]],
-            count: int,
-        ) -> List[Dict[str, Any]]:
-            validated = []
-            used_event_ids = set()
-    
-            event_map = {
-                str(ev.get("event_id")): ev
-                for ev in ranked_events
-                if ev.get("event_id")
-            }
-    
-            for item in news:
-                source_id = item.get("source_id")
-                event_id = str(item.get("event_id") or "")
-                text = item.get("text")
-    
-                if event_id not in event_map:
+
+            source_payload = []
+            for source_id in ordered_ids[:3]:
+                source_text = str(posts[source_id].get("text") or "").strip()
+                if not source_text:
                     continue
-    
-                if (
-                    not isinstance(source_id, int)
-                    or not (0 <= source_id < len(posts))
-                ):
-                    continue
-    
-                if event_id in used_event_ids:
-                    continue
-    
-                if not isinstance(text, str) or not text.strip():
-                    continue
-    
-                text = self._clean_generated_news_text(text)
-                if not text:
-                    continue
-    
-                ev = event_map[event_id]
-                locked_source = ev.get("manual_media_source_id")
-                if (
-                    bool(ev.get("manual_media_locked"))
-                    and isinstance(locked_source, int)
-                    and 0 <= locked_source < len(posts)
-                ):
-                    source_id = locked_source
-    
-                reference_url, reference_label = self._select_reference_link(
-                    ev, posts
-                )
-    
-                validated.append({
-                    "event_id": event_id,
+                source_payload.append({
                     "source_id": source_id,
-                    "source_ids": list(ev.get("source_ids", [])),
-                    "text": text,
-                    "summary": item.get(
-                        "summary",
-                        ev.get("summary", ""),
+                    "channel": str(
+                        posts[source_id].get("channel_title")
+                        or posts[source_id].get("channel_username")
+                        or ""
                     ),
-                    "category": item.get(
-                        "category",
-                        ev.get("category", "other"),
-                    ),
-                    "digest_role": self._event_digest_role(ev),
-                    "is_discovery_candidate": bool(
-                        ev.get("is_discovery_candidate")
-                    ),
-                    "is_priority": bool(ev.get("is_priority")),
-                    "priority_source_ids": self._priority_source_ids_for_event(ev, posts),
-                    "manual_merge_verified": bool(ev.get("manual_merge_verified", True)),
-                    "manual_media_locked": bool(ev.get("manual_media_locked", False)),
-                    "manual_media_source_id": ev.get("manual_media_source_id"),
-                    "video_validation_needed": bool(ev.get("video_validation_needed", False)),
-                    "visual_media_required": bool(ev.get("visual_media_required", False)),
-                    "reference_url": reference_url,
-                    "reference_label": reference_label,
+                    "text": source_text[:1400],
                 })
-    
-                used_event_ids.add(event_id)
-    
-                if len(validated) >= count:
-                    break
-    
-            return validated
-    
-        def _ensure_priority_news_in_final(
-            self,
-            validated: List[Dict[str, Any]],
-            ranked_events: List[Dict[str, Any]],
-            posts: List[Dict[str, Any]],
-            count: int,
-        ) -> List[Dict[str, Any]]:
-            priority_events = [
-                ev
-                for ev in ranked_events
-                if ev.get("is_priority")
+
+            cases.append({
+                "event_id": event_id,
+                "draft_text": text,
+                "event_summary": str(ev.get("summary") or "")[:900],
+                "key_facts": ev.get("key_facts", [])[:8]
+                if isinstance(ev.get("key_facts"), list)
+                else [],
+                "sources": source_payload,
+            })
+
+        stats["eligible_cases"] = len(cases)
+
+        if not cases:
+            stats["completed"] = True
+            self.last_fact_check_stats = stats
+            return news
+
+        payload = json.dumps(cases, ensure_ascii=False)
+        prompt = f"""
+Ти — фінальний фактчекер українського Telegram-дайджесту.
+
+Для кожного case звір DRAFT_TEXT ТІЛЬКИ з EVENT_SUMMARY, KEY_FACTS і SOURCES.
+Не використовуй зовнішні знання і не додавай нового факту. Склад новин,
+event_id і порядок уже затверджені.
+
+Перевір:
+1. Не розширюй вибірку/масштаб: одна бригада, компанія, місто, лікарня,
+   опитування чи група людей не означає все військо, країну або галузь.
+2. "планує/готовий/може/має підписати" != "підписав";
+   "розглядають/пропонують" != "ухвалили"; "очікується" != "сталося".
+3. Оцінка, заява, прогноз або припущення не є встановленим фактом.
+4. Цифри, одиниці, назви та географію переносити точно.
+5. Не додавай причинно-наслідкових висновків, яких немає в SOURCES.
+6. Для посадових титулів не додавай зайві статусні прикметники
+   "обраний/колишній/чинний", якщо вони не потрібні для суті. Якщо титул
+   неоднозначний, безпечніше залишити ім'я без такого означення.
+7. Прибери сусідні речення, які повторюють один і той самий факт.
+8. Заголовок не може бути ширшим/категоричнішим за джерела.
+9. Якщо DRAFT_TEXT уже точний — не переписуй його заради стилю.
+
+corrected_text: один емодзі + <b>Заголовок</b>\n\n2-6 завершених речень,
+максимум {self.MAX_NEWS_CHARS} символів. Посилань не додавай.
+
+ВІДПОВІДЬ ТІЛЬКИ JSON:
+{{"checks":[{{"event_id":"E1","changed":false,"corrected_text":"...","reason":"exact або коротка причина"}}]}}
+
+CASES:
+{payload}
+"""
+        data = self._call_json_with_cascade(
+            prompt,
+            max_retries,
+            "FINAL_FACT_CHECK",
+            temperature=0.05,
+        )
+        checks = (
+            data.get("checks", [])
+            if data and isinstance(data.get("checks"), list)
+            else []
+        )
+        check_map = {
+            str(check.get("event_id") or ""): check
+            for check in checks
+            if isinstance(check, dict) and check.get("event_id")
+        }
+
+        valid_case_ids = {
+            str(case.get("event_id") or "")
+            for case in cases
+            if isinstance(case, dict) and case.get("event_id")
+        }
+        checked_count = sum(
+            1
+            for event_id in valid_case_ids
+            if event_id in check_map
+        )
+
+        result = []
+        changed_count = 0
+        for item in news:
+            if not isinstance(item, dict):
+                continue
+            item_copy = dict(item)
+            event_id = str(item_copy.get("event_id") or "")
+            check = check_map.get(event_id)
+            if check:
+                corrected = str(check.get("corrected_text") or "").strip()
+                if corrected:
+                    cleaned = self._clean_generated_news_text(corrected)
+                    if cleaned:
+                        old_text = str(item_copy.get("text") or "").strip()
+                        item_copy["text"] = cleaned
+                        if cleaned != old_text:
+                            changed_count += 1
+                            logger.info(
+                                "Final fact-check corrected event_id=%s reason='%s'.",
+                                event_id,
+                                str(check.get("reason") or "")[:220],
+                            )
+            result.append(item_copy)
+
+        stats.update({
+            "checked": checked_count,
+            "corrected": changed_count,
+            "completed": data is not None,
+        })
+        self.last_fact_check_stats = stats
+
+        logger.info(
+            "Final fact-check: expected=%s eligible=%s checked=%s corrected=%s completed=%s.",
+            stats["expected"],
+            stats["eligible_cases"],
+            stats["checked"],
+            stats["corrected"],
+            stats["completed"],
+        )
+        return result
+
+    def _generate_final_digest(
+        self,
+        events: List[Dict[str, Any]],
+        posts: List[Dict[str, Any]],
+        past_events: Optional[
+            Union[
+                List[str],
+                List[Dict[str, str]],
             ]
-            if not priority_events:
-                return validated[:count]
-    
-            result = list(validated)
-            used_event_ids = {
-                str(item.get("event_id") or "")
-                for item in result
-                if item.get("event_id")
-            }
-    
-            rank_index = {
-                str(ev.get("event_id") or ""): idx
-                for idx, ev in enumerate(ranked_events)
-                if ev.get("event_id")
-            }
-    
-            missing_events = [
-                ev
-                for ev in priority_events
-                if str(ev.get("event_id") or "") not in used_event_ids
-            ]
-    
-            if missing_events:
-                logger.warning(
-                    "EDITOR пропустив %s priority-подій. "
-                    "Додаємо їх Python-fallback без повторного відбору.",
-                    len(missing_events),
-                )
-    
-            for ev in missing_events:
-                item = self._build_fallback_news_item(ev, posts)
-                if not item:
-                    logger.error(
-                        "Не вдалося побудувати fallback для priority event_id=%s",
-                        ev.get("event_id"),
+        ],
+        max_count: int,
+        max_retries: int,
+    ) -> List[Dict[str, Any]]:
+        event_blocks = []
+
+        for ev in events:
+            factual_id = ev["best_factual_source_id"]
+            media_id = ev.get("best_media_source_id")
+            factual_post = posts[factual_id]
+
+            media_description = "немає"
+            if isinstance(media_id, int):
+                if posts[media_id].get("has_video"):
+                    media_description = (
+                        "відео з Telegram-поста цієї події"
                     )
-                    continue
-    
-                event_id = str(ev.get("event_id") or "")
-                target_rank = rank_index.get(event_id, len(ranked_events))
-    
-                # Вставляємо приблизно відповідно до ranked-позиції,
-                # не перебудовуючи весь порядок, який уже створив Editor.
-                insert_at = len(result)
-                for idx, existing in enumerate(result):
-                    existing_rank = rank_index.get(
-                        str(existing.get("event_id") or ""),
-                        len(ranked_events) + 100,
+                elif posts[media_id].get("has_media"):
+                    media_description = (
+                        "фото з Telegram-поста цієї події"
                     )
-                    if existing_rank > target_rank:
-                        insert_at = idx
-                        break
-    
-                result.insert(insert_at, item)
-                used_event_ids.add(event_id)
-    
-            # Якщо через обов'язкові manual-події перевищили count,
-            # прибираємо найслабші NON-priority, а не manual.
-            while len(result) > count:
-                removable_indexes = [
-                    idx
-                    for idx, item in enumerate(result)
-                    if not item.get("is_priority")
-                ]
-    
-                if not removable_indexes:
-                    # count вже має бути >= кількості priority, але не ріжемо
-                    # manual навіть якщо зовнішній код передав некоректний ліміт.
-                    break
-    
-                worst_idx = max(
-                    removable_indexes,
-                    key=lambda idx: rank_index.get(
-                        str(result[idx].get("event_id") or ""),
-                        len(ranked_events) + 1000,
-                    ),
+
+            key_facts = ev.get("key_facts", [])
+            key_facts_text = (
+                "; ".join(
+                    str(x)
+                    for x in key_facts[:6]
                 )
-                result.pop(worst_idx)
-    
-            final_ids = {
-                str(item.get("event_id") or "")
-                for item in result
-            }
-            missing_after_guard = [
-                str(ev.get("event_id") or "")
-                for ev in priority_events
-                if str(ev.get("event_id") or "") not in final_ids
-            ]
-    
-            if missing_after_guard:
-                logger.error(
-                    "CRITICAL final priority guarantee failed for event_ids=%s",
-                    missing_after_guard,
-                )
-    
-            return result[:max(count, len(priority_events))]
-    
-        def _ensure_priority_posts_in_final(
-            self,
-            validated: List[Dict[str, Any]],
-            ranked_events: List[Dict[str, Any]],
-            posts: List[Dict[str, Any]],
-            count: int,
-        ) -> List[Dict[str, Any]]:
-            """
-            Остання гарантія конкретних manual source IDs перед FINAL_FACT_CHECK.
-    
-            На відміну від event-level guard, тут перевіряємо кожен ручний пост.
-            Якщо він зник через неочікуваний merge/mix, створюємо окремий synthetic
-            event, додаємо його і в ranked_events, і у final. Тому наступний
-            FINAL_FACT_CHECK бачить та перевіряє аварійно відновлену новину.
-            """
-            priority_ids = self._get_priority_post_ids(posts)
-            if not priority_ids:
-                return validated[:count]
-    
-            result = [dict(item) for item in validated if isinstance(item, dict)]
-            covered = set()
-            for item in result:
-                source_ids = self._valid_source_ids(item.get("source_ids"), posts)
-                manual_ids = [
-                    source_id
-                    for source_id in source_ids
-                    if source_id in priority_ids
-                ]
-                if (
-                    len(manual_ids) > 1
-                    and not bool(item.get("manual_merge_verified", True))
-                ):
-                    primary = item.get("source_id")
-                    if isinstance(primary, int) and primary in manual_ids:
-                        covered.add(primary)
-                    elif manual_ids:
-                        covered.add(manual_ids[0])
-                else:
-                    covered.update(manual_ids)
-    
-            missing = [source_id for source_id in priority_ids if source_id not in covered]
-            if not missing:
-                return result[:count]
-    
-            logger.error(
-                "CRITICAL post-level manual guarantee: у фіналі бракує source_ids=%s. "
-                "Відновлюємо до FINAL_FACT_CHECK.",
-                missing,
+                if isinstance(key_facts, list)
+                else str(key_facts)
             )
-    
-            existing_event_ids = {
-                str(ev.get("event_id") or "")
-                for ev in ranked_events
-                if isinstance(ev, dict)
-            }
-    
-            for sequence, source_id in enumerate(missing, start=1):
-                synthetic = self._build_synthetic_priority_event(
-                    [source_id],
-                    posts,
-                    sequence,
-                )
-                synthetic["event_id"] = self._unique_event_id(
-                    f"P_FINAL_{source_id}",
-                    ranked_events,
-                )
-                synthetic["is_priority"] = True
-                synthetic["manual_merge_verified"] = True
-                synthetic["best_factual_source_id"] = source_id
-                synthetic["best_media_source_id"] = source_id if (
-                    posts[source_id].get("has_video") or posts[source_id].get("has_media")
-                ) else None
-                synthetic["best_source_id"] = (
-                    synthetic["best_media_source_id"]
-                    if synthetic["best_media_source_id"] is not None
-                    else source_id
-                )
-                synthetic["editorial_score"] = 0.0
-                synthetic["raw_score"] = 500.0
-                synthetic["balanced_score"] = 500.0
-                ranked_events.append(synthetic)
-                existing_event_ids.add(str(synthetic["event_id"]))
-    
-                item = self._build_fallback_news_item(synthetic, posts)
-                if not item:
-                    logger.error(
-                        "CRITICAL: не вдалося побудувати final manual fallback source_id=%s",
-                        source_id,
-                    )
+
+            priority_flag = (
+                " ⭐ ПРІОРИТЕТ АДМІНІСТРАТОРА"
+                if ev.get("is_priority")
+                else ""
+            )
+
+            repeat_info = (
+                "так, але є значущий новий розвиток"
+                if ev.get("is_history_repeat")
+                else "ні"
+            )
+
+            event_blocks.append(
+                "=== EVENT_ID: "
+                f"{ev.get('event_id')}"
+                f"{priority_flag} ===\n"
+                "ТИП: "
+                f"{ev.get('event_type', 'other')}\n"
+                "КАТЕГОРІЯ: "
+                f"{ev.get('category', 'other')}\n"
+                "РОЛЬ У ДАЙДЖЕСТІ: "
+                f"{self._event_digest_role(ev)}\n"
+                "IMPORTANCE: "
+                f"{ev.get('importance', 0)}\n"
+                "PUBLIC_INTEREST: "
+                f"{ev.get('public_interest', 0)}\n"
+                "NOVELTY: "
+                f"{ev.get('novelty', 0)}\n"
+                "CURIOSITY: "
+                f"{ev.get('curiosity', 0)}\n"
+                "PRACTICAL_VALUE: "
+                f"{ev.get('practical_value', 0)}\n"
+                "URGENCY: "
+                f"{ev.get('urgency', 0)}\n"
+                "ПОВТОР ІСТОРІЇ: "
+                f"{repeat_info}\n"
+                "СИЛА НОВОГО РОЗВИТКУ: "
+                f"{ev.get('history_update_strength', 0)}\n"
+                "МЕДІА: "
+                f"{media_description}\n"
+                "СУТЬ: "
+                f"{ev.get('summary', '')}\n"
+                "ЧОМУ ВАЖЛИВО/ЦІКАВО: "
+                f"{ev.get('why_it_matters', '')}\n"
+                "КЛЮЧОВІ ФАКТИ: "
+                f"{key_facts_text}\n"
+                "ТЕКСТ ДЖЕРЕЛА: "
+                f"{str(factual_post.get('text') or '')[:self.MAX_EVENT_SOURCE_CHARS]}\n"
+            )
+
+        history_block = self._build_history_block(
+            past_events
+        )
+
+        prompt = f"""
+Ти — головний редактор українського новинного Telegram-каналу.
+
+Сформуй фінальний дайджест із найважливіших,
+найцікавіших і найактуальніших подій.
+Максимум: {max_count} новин.
+
+Якщо є достатньо якісних кандидатів, бажано сформувати 7-10 новин.
+Не потрібно штучно набирати {max_count}, якщо кандидат справді слабкий.
+
+ВАЖЛИВА РЕДАКЦІЙНА СТРУКТУРА:
+Кандидати мають роль CORE або DISCOVERY.
+
+CORE — головні/важкі новини. DISCOVERY — якісні цікаві або практично
+корисні події, які органічно завершують випуск.
+
+ПРАВИЛО КІЛЬКОСТІ ДЛЯ ЛІМІТУ 10:
+- якщо є 10 сильних CORE — бери 10 CORE і НЕ додавай discovery;
+- якщо є 9 CORE — додай 1 discovery;
+- якщо є 8 CORE — додай 1-2 discovery;
+- якщо є 7 CORE — додай 1-3 discovery;
+- якщо є 5-6 CORE — залиш їх ядром і додай до 3 discovery.
+
+Не витісняй справді важливу десяту CORE-новину цікавинкою.
+Але коли після важких новин є вільні місця, не заповнюй їх слабкою
+однотипною hard-news подією, якщо є якісна DISCOVERY.
+
+УСІ DISCOVERY-НОВИНИ СТАВ У КІНЦІ ДАЙДЖЕСТУ, після CORE.
+Всередині CORE і DISCOVERY порядок визначай природно за важливістю/силою.
+
+Події ⭐ ПРІОРИТЕТ АДМІНІСТРАТОРА обов'язково включи у фінальний список.
+Manual priority сильніше за звичайну квоту: його не можна відкинути.
+При цьому не треба механічно ставити всі manual-події на початок —
+розташовуй їх органічно за змістом; discovery-manual теж іде в кінцевий
+discovery-блок.
+
+━━━━━━━━━━━━━━━━━━━━
+АРХІВ:
+{history_block}
+━━━━━━━━━━━━━━━━━━━━
+
+ВИМОГИ ДО ВИБОРУ:
+
+1. Не повторюй одну реальну подію двічі.
+2. Якщо подія вже була в архіві, включай її знову лише коли кандидат
+   містить реально значущий новий розвиток.
+3. Агреговане зведення ППО / Повітряних сил зі статистикою збитих ракет
+   і БпЛА — максимум одне за 24 години. Інші цифри пізніше того ж дня
+   не роблять його новою окремою новиною.
+4. Той самий закон/санкційний пакет/угоду протягом 24 годин не повторюй
+   через інший заголовок, повторне голосування тієї самої стадії або
+   "готовність/намір підписати". Новий етап — лише фактичне ухвалення після
+   стадії проєкту, фактичний підпис, набуття чинності, введення або вето.
+5. Не додавай відверто слабку подію тільки для заповнення кількості.
+6. Не вигадуй факти.
+7. Не використовуй чутки.
+8. Не оцінюй важливість за довжиною початкового Telegram-посту.
+9. Коротка гаряча новина може бути однією з головних новин дайджесту.
+10. Відео або фото саме по собі не робить слабку подію важливою.
+11. Якщо значуща подія має реальне фото чи відео з місця — це плюс.
+12. При близьких оцінках віддавай перевагу події,
+    яка додає нову тему, корисність або цікавість,
+    а не четвертій однотипній новині про вже представлену тему.
+13. Високий CURIOSITY означає, що подія може зайняти 7-10 місце,
+    навіть якщо її стратегічна IMPORTANCE нижча.
+14. Високий PRACTICAL_VALUE означає, що подія корисна людям
+    і теж може виправдано потрапити у фінальний список.
+15. Для атак не оцінюй вагу лише за жертвами/руйнуваннями. Якщо у зоні
+    прямого ризику були світові політики, міжнародна делегація або інцидент
+    має чіткий контекст НАТО/ЄС/міжнародної ескалації, така подія може бути
+    сильнішою за звичайну science/discovery-новину навіть без постраждалих.
+
+━━━━━━━━━━━━━━━━━━━━
+ВИМОГИ ДО ТЕКСТУ:
+
+Ти пишеш НЕ для сухого інформагентства,
+а для сучасного короткого Telegram-дайджесту.
+
+Читач має за 15-25 секунд:
+1. зрозуміти, що сталося;
+2. побачити найважливішу або найцікавішу деталь;
+3. зрозуміти масштаб, наслідок або практичне значення;
+4. отримати достатньо контексту, щоб новина не виглядала як обірваний факт.
+
+СТИЛЬ:
+- живий;
+- природний;
+- конкретний;
+- компактний;
+- інформаційний;
+- без канцеляриту;
+- без штучної сенсаційності.
+
+Текст має читатися як хороша редакторська розповідь,
+а не як список пунктів із пресрелізу.
+
+Кожна новина повинна мати маленький природний "гачок":
+сильну цифру, конкретну деталь, наслідок, контраст,
+незвичайний факт або просте пояснення, чому це цікаво.
+
+ГАЧОК НЕ ОЗНАЧАЄ КЛІКБЕЙТ.
+Не перебільшуй і не домислюй.
+
+━━━━━━━━━━━━━━━━━━━━
+ДОВЖИНА:
+
+Максимальна довжина однієї новини — {self.MAX_NEWS_CHARS} символів.
+
+Бажана довжина — приблизно 450-800 символів разом із заголовком,
+якщо кандидат містить достатньо підтверджених фактів.
+
+Типово пиши 3-6 ЗАВЕРШЕНИХ речень.
+
+Для простої гарячої події достатньо 2-3 речень.
+Для змістовної новини з цифрами, контекстом або наслідками — 4-6 речень.
+
+Не розтягуй матеріал, якщо фактів мало.
+Краще 3 сильні речення, ніж 6 речень із водою.
+
+Не роби речення надто довгими.
+Частіше використовуй короткі або середні речення,
+щоб пост легко читався зі смартфона.
+
+━━━━━━━━━━━━━━━━━━━━
+ЯК БУДУВАТИ НОВИНУ:
+
+НЕ використовуй одну жорстку схему для всіх матеріалів.
+Обирай найприродніший початок залежно від події.
+
+Можна почати з:
+- головного результату;
+- найцікавішої деталі;
+- сильної цифри;
+- незвичайного факту;
+- зміни, яка безпосередньо вплине на людей;
+- короткого пояснення масштабу.
+
+Якщо серед фактів є одна особливо цікава деталь,
+не ховай її в останньому реченні — винеси ближче до початку.
+
+Для війни та атак:
+що сталося → головний наслідок → масштаб/місце → важливий контекст.
+
+Для фронту:
+що змінилося → де → який результат → чому це важливо.
+
+Для технологій і науки:
+що нового → чим це відрізняється → конкретна деталь/цифра →
+чому це цікаво або що це може змінити, якщо це випливає з фактів.
+
+Для економіки:
+що змінилося → цифри → кого це зачепить → практичний наслідок.
+
+Для суспільних новин:
+що змінюється → як працюватиме → кого стосується →
+що читачеві важливо запам'ятати.
+
+Для міжнародних:
+що сталося → ключова деталь → чому це має значення для України або світу.
+
+Для українських виробництв/досягнень:
+що запустили або створили → що саме вміють/виробляють →
+масштаб або конкретика → чому це помітна зміна.
+
+━━━━━━━━━━━━━━━━━━━━
+ПРИКЛАД ПРИНЦИПУ СТИЛЮ:
+
+СУХО:
+"Підприємство налагодило виробництво артилерійських стволів.
+Воно виконує замовлення BAE Systems. Калібр становить від 25 до 203 мм."
+
+КРАЩЕ ЗА ЛОГІКОЮ:
+"Український завод освоїв серійне виробництво артилерійських стволів —
+від 25 до 203 мм. Підприємство вже виконує замовлення BAE Systems
+на компоненти для західних артсистем. Це означає, що частину складного
+виробництва для таких систем уже локалізують в Україні."
+
+НЕ копіюй цей текст і НЕ додавай висновків,
+якщо їх немає у фактах кандидата.
+Це лише приклад того, як зробити подачу природнішою.
+
+━━━━━━━━━━━━━━━━━━━━
+ЗАГОЛОВОК:
+
+4-10 слів.
+
+Він повинен бути:
+- конкретним;
+- зрозумілим без читання тексту;
+- трохи цікавішим за канцелярський заголовок;
+- без клікбейту;
+- без порожніх формулювань.
+
+Добре:
+"Київ змінює правила роботи під час тривог"
+"Україна запускає виробництво стволів для західної артилерії"
+"Новий тариф на воду може змінити платіжки киян"
+
+Погано:
+"Стало відомо про важливе рішення"
+"Нові подробиці ситуації"
+"В Україні відбулася важлива подія"
+
+Заголовок не повинен дослівно повторювати перше речення.
+
+━━━━━━━━━━━━━━━━━━━━
+ВАЖЛИВО:
+
+- ніколи не обривай останнє речення;
+- ніколи не завершуй новину на півслові;
+- не додавай фактів, яких немає у кандидатові;
+- не розширюй масштаб твердження: дані однієї бригади/компанії/міста/
+  вибірки не перетворюй на твердження про все військо, країну чи галузь;
+- точно зберігай модальність і статус: "планує/готовий/може" не означає
+  "зробив/підписав/ухвалив"; оцінка або прогноз не є встановленим фактом;
+- якщо статусний титул особи не потрібен для суті, не додавай зайвих
+  прикметників на кшталт "обраний/колишній/чинний" без потреби;
+- не роби власних прогнозів;
+- не приписуй причин, яких джерело не підтверджує;
+- якщо текст виходить задовгим, скороти другорядні деталі;
+- кожне речення повинно або додавати факт,
+  або пояснювати значення вже наведеного факту;
+- не повторюй один і той самий факт різними словами;
+- не використовуй сухий стиль протоколу;
+- не використовуй надмірно емоційні формулювання.
+
+НЕ ВИКОРИСТОВУЙ шаблони:
+
+"Стало відомо..."
+"Повідомляється, що..."
+"Наразі відомо..."
+"Як зазначають..."
+"За інформацією джерел..."
+"Ситуація залишається..."
+"Варто зазначити..."
+"Нагадаємо, що..." — якщо це не справді необхідний контекст.
+
+Не вставляй технічні маркери:
+[ФОТО]
+[ВІДЕО]
+[ТЕКСТ]
+
+ФОРМАТ:
+
+ОДИН тематичний емодзі + <b>Заголовок</b>
+
+порожній рядок
+
+2-6 завершених природних речень.
+
+ПЕРЕД ВІДПОВІДДЮ ПЕРЕВІР КОЖНУ НОВИНУ:
+
+1. Чи не перевищує вона {self.MAX_NEWS_CHARS} символів?
+2. Чи має вона достатньо контексту, а не лише сухий факт?
+3. Чи завершене останнє речення?
+4. Чи немає повторів і води?
+5. Чи всі твердження походять із наданих фактів?
+6. Чи не дублює вона іншу новину в цьому ж дайджесті?
+7. Чи є в ній найцікавіша/найважливіша конкретна деталь кандидата?
+8. Чи звучить текст природно українською?
+9. Чи не став він клікбейтним?
+10. Чи випуск загалом не перевантажений однією категорією,
+    якщо є якісні альтернативи?
+
+ВІДПОВІДЬ ТІЛЬКИ JSON:
+
+{{
+  "news": [
+    {{
+      "event_id": "E1",
+      "text": "💥 <b>Короткий заголовок</b>\\n\\nПерше завершене речення. Друге завершене речення. Третє завершене речення."
+    }}
+  ]
+}}
+
+КАНДИДАТИ:
+{chr(10).join(event_blocks)}
+"""
+
+        data = self._call_json_with_cascade(
+            prompt,
+            max_retries,
+            "EDITOR",
+            temperature=0.30,
+        )
+
+        raw_news = (
+            data.get("news", [])
+            if (
+                data
+                and isinstance(data.get("news"), list)
+            )
+            else []
+        )
+
+        event_map = {
+            str(ev["event_id"]): ev
+            for ev in events
+            if ev.get("event_id")
+        }
+
+        final_list = []
+
+        for item in raw_news:
+            if not isinstance(item, dict):
+                continue
+
+            event_id = str(item.get("event_id") or "")
+            text = item.get("text")
+
+            if (
+                event_id not in event_map
+                or not isinstance(text, str)
+                or not text.strip()
+            ):
+                continue
+
+            ev = event_map[event_id]
+
+            final_list.append({
+                "event_id": event_id,
+                "source_id": ev["best_source_id"],
+                "source_ids": list(
+                    ev.get("source_ids", [])
+                ),
+                "summary": ev.get("summary", ""),
+                "category": ev.get("category", "other"),
+                "digest_role": self._event_digest_role(ev),
+                "is_discovery_candidate": bool(
+                    ev.get("is_discovery_candidate")
+                ),
+                "is_priority": bool(ev.get("is_priority")),
+                "video_validation_needed": bool(ev.get("video_validation_needed", False)),
+                "visual_media_required": bool(ev.get("visual_media_required", False)),
+                "text": text.strip(),
+            })
+
+        return final_list
+
+    @staticmethod
+    def _post_external_links(post: Dict[str, Any]) -> List[Dict[str, str]]:
+        raw = post.get("external_links")
+        if not isinstance(raw, list):
+            return []
+        result: List[Dict[str, str]] = []
+        seen = set()
+        for item in raw:
+            if isinstance(item, str):
+                url = item.strip()
+                label = ""
+            elif isinstance(item, dict):
+                url = str(item.get("url") or "").strip()
+                label = str(item.get("label") or "").strip()
+            else:
+                continue
+            if not url or url in seen:
+                continue
+            try:
+                parsed = urlparse(url)
+            except Exception:
+                continue
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                continue
+            seen.add(url)
+            result.append({"url": url, "label": label})
+        return result
+
+    @staticmethod
+    def _reference_kind(text: str) -> Optional[str]:
+        t = NewsSummarizer._normalize_similarity_text(text)
+        if not t:
+            return None
+        if any(marker in t for marker in (
+            "законопро", " закон ", "постан", "указ", "документ",
+            "регламент", "директив", "рішення суд", "ратифік",
+        )):
+            return "Документ"
+        if any(marker in t for marker in (
+            "дослідж", "study", "research", "науков статт",
+            "науковій статт", "журнал", "paper", "опитуван",
+        )):
+            return "Дослідження"
+        if any(marker in t for marker in (
+            "звіт", "доповід", "report", "індекс", "рейтинг",
+            "аналітичн звіт", "розслідуван",
+        )):
+            return "Звіт"
+        if any(marker in t for marker in (
+            "статт", "публікац", "матеріал видан", "колонк",
+            "інтерв ю", "інтерв'ю",
+        )):
+            return "Стаття"
+        return None
+
+    @staticmethod
+    def _reference_domain_score(url: str, kind: str) -> float:
+        try:
+            host = (urlparse(url).hostname or "").lower()
+        except Exception:
+            return -1000.0
+        blocked_hosts = {
+            "t.me", "telegram.me", "telegram.org", "instagram.com",
+            "www.instagram.com", "facebook.com", "www.facebook.com",
+            "x.com", "twitter.com", "www.twitter.com", "youtube.com",
+            "www.youtube.com", "youtu.be", "tiktok.com", "www.tiktok.com",
+            "vk.com", "ok.ru",
+        }
+        if host in blocked_hosts or any(host.endswith("." + h) for h in blocked_hosts):
+            return -1000.0
+        score = 0.0
+        official_fragments = (
+            "gov.ua", "rada.gov.ua", "president.gov.ua", "kmu.gov.ua",
+            "europa.eu", "ec.europa.eu", "consilium.europa.eu", "nato.int",
+            "un.org", "who.int", "worldbank.org", "imf.org", "oecd.org",
+            ".gov", "parliament", "senate", "congress",
+        )
+        research_fragments = (
+            "nature.com", "science.org", "sciencedirect.com", "springer.com",
+            "wiley.com", "thelancet.com", "nejm.org", "bmj.com",
+            "arxiv.org", "doi.org", "pubmed.ncbi.nlm.nih.gov",
+        )
+        if any(fragment in host for fragment in official_fragments):
+            score += 45.0 if kind == "Документ" else 28.0
+        if any(fragment in host for fragment in research_fragments):
+            score += 45.0 if kind == "Дослідження" else 24.0
+        return score
+
+    def _select_reference_link(
+        self,
+        ev: Dict[str, Any],
+        posts: List[Dict[str, Any]],
+    ) -> tuple[Optional[str], Optional[str]]:
+        event_text = self._event_source_text_bundle(ev, posts)
+        kind = self._reference_kind(event_text)
+        if not kind:
+            return None, None
+
+        source_ids = self._valid_source_ids(ev.get("source_ids"), posts)
+        preferred = ev.get("best_factual_source_id")
+        ordered_ids: List[int] = []
+        if isinstance(preferred, int) and preferred in source_ids:
+            ordered_ids.append(preferred)
+        ordered_ids.extend(sid for sid in source_ids if sid not in ordered_ids)
+
+        candidates = []
+        reference_words = (
+            "джерел", "дослідж", "study", "research", "звіт", "report",
+            "закон", "документ", "постан", "статт", "article", "читати",
+            "повний текст", "оригінал", "публікац",
+        )
+        for order, source_id in enumerate(ordered_ids):
+            for link in self._post_external_links(posts[source_id]):
+                url = link["url"]
+                label = self._normalize_similarity_text(link.get("label", ""))
+                domain_score = self._reference_domain_score(url, kind)
+                if domain_score <= -900:
                     continue
-    
-                insert_at = next(
-                    (
-                        idx
-                        for idx, existing in enumerate(result)
-                        if existing.get("digest_role") == "discovery"
-                    ),
-                    len(result),
-                )
-                result.insert(insert_at, item)
-                covered.add(source_id)
-    
-            # Manual не обрізаємо. Якщо стандартний count переповнився, прибираємо
-            # лише non-priority з кінця/найслабшої позиції.
-            while len(result) > count:
-                removable = [
-                    idx
-                    for idx, item in enumerate(result)
-                    if not item.get("is_priority")
-                ]
-                if not removable:
-                    break
-                result.pop(removable[-1])
-    
-            still_missing = [source_id for source_id in priority_ids if source_id not in covered]
-            if still_missing:
-                logger.error(
-                    "CRITICAL post-level manual guarantee FAILED source_ids=%s",
-                    still_missing,
-                )
-    
-            return result[:max(count, len(priority_ids))]
-    
-        def _build_fallback_news_item(
-            self,
-            ev: Dict[str, Any],
-            posts: List[Dict[str, Any]],
-        ) -> Optional[Dict[str, Any]]:
-            source_id = ev.get("best_source_id")
+                label_signal = any(word in label for word in reference_words)
+                label_relevance = False
+                if label:
+                    label_stats = self._history_similarity_stats(
+                        event_text,
+                        label,
+                    )
+                    label_relevance = (
+                        label_stats["common"] >= 3
+                        or label_stats["seq"] >= 0.38
+                        or bool(
+                            self._entity_signature(event_text)
+                            & self._entity_signature(label)
+                        )
+                    )
+
+                if not label_signal and not label_relevance and domain_score <= 0:
+                    continue
+
+                score = domain_score
+                if source_id == preferred:
+                    score += 20.0
+                score += max(0.0, 8.0 - order * 1.5)
+                if label_signal:
+                    score += 22.0
+                if label_relevance:
+                    score += 12.0
+                if label and len(label) <= 80:
+                    score += 2.0
+                candidates.append((score, url))
+
+        if not candidates:
+            return None, None
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        best_score, best_url = candidates[0]
+        if best_score < 12.0:
+            return None, None
+        return best_url, kind
+
+    def _validate_final_news(
+        self,
+        news: List[Dict[str, Any]],
+        ranked_events: List[Dict[str, Any]],
+        posts: List[Dict[str, Any]],
+        count: int,
+    ) -> List[Dict[str, Any]]:
+        validated = []
+        used_event_ids = set()
+
+        event_map = {
+            str(ev.get("event_id")): ev
+            for ev in ranked_events
+            if ev.get("event_id")
+        }
+
+        for item in news:
+            source_id = item.get("source_id")
+            event_id = str(item.get("event_id") or "")
+            text = item.get("text")
+
+            if event_id not in event_map:
+                continue
+
+            if (
+                not isinstance(source_id, int)
+                or not (0 <= source_id < len(posts))
+            ):
+                continue
+
+            if event_id in used_event_ids:
+                continue
+
+            if not isinstance(text, str) or not text.strip():
+                continue
+
+            text = self._clean_generated_news_text(text)
+            if not text:
+                continue
+
+            ev = event_map[event_id]
             locked_source = ev.get("manual_media_source_id")
             if (
                 bool(ev.get("manual_media_locked"))
@@ -6529,116 +6244,24 @@
                 and 0 <= locked_source < len(posts)
             ):
                 source_id = locked_source
-    
-            if (
-                not isinstance(source_id, int)
-                or not (0 <= source_id < len(posts))
-            ):
-                source_ids = self._valid_source_ids(
-                    ev.get("source_ids"),
-                    posts,
-                )
-                if not source_ids:
-                    return None
-                source_id = source_ids[0]
-    
-            headline = (
-                str(ev.get("headline_hint") or "").strip()
-                or self._priority_headline_from_text(
-                    posts[source_id].get("text") or ""
-                )
-                or "Важлива подія"
-            )
-    
-            category = ev.get("category", "other")
-            if category not in self.ALLOWED_CATEGORIES:
-                category = "other"
-    
-            emoji_map = {
-                "war": "💥",
-                "politics": "🏛",
-                "economy": "💰",
-                "international": "🌍",
-                "society": "🇺🇦",
-                "technology": "⚡",
-                "science": "🔬",
-                "culture": "🎭",
-                "other": "📰",
-            }
-            emoji = emoji_map.get(category, "📰")
-    
-            key_facts = ev.get("key_facts", [])
-            facts = (
-                [
-                    str(x).strip()
-                    for x in key_facts
-                    if str(x).strip()
-                ]
-                if isinstance(key_facts, list)
-                else []
-            )
-    
-            summary = str(ev.get("summary") or "").strip()
-            why = str(ev.get("why_it_matters") or "").strip()
-    
-            sentences: List[str] = []
-    
-            if summary:
-                sentences.append(
-                    self._ensure_sentence_end(summary)
-                )
-    
-            for fact in facts[:5]:
-                sentence = self._ensure_sentence_end(fact)
-                if sentence and sentence not in sentences:
-                    sentences.append(sentence)
-    
-            if why:
-                sentence = self._ensure_sentence_end(why)
-                if sentence and sentence not in sentences:
-                    sentences.append(sentence)
-    
-            original_text = posts[source_id].get("text") or ""
-            if len(sentences) < 3 and original_text:
-                for sentence in self._extract_sentences(original_text):
-                    clean_sentence = self._ensure_sentence_end(sentence)
-                    if (
-                        clean_sentence
-                        and clean_sentence not in sentences
-                    ):
-                        sentences.append(clean_sentence)
-                    if len(sentences) >= 5:
-                        break
-    
-            # Для manual гарантія важливіша за ідеальну кількість речень.
-            # Якщо текст дуже короткий, дозволяємо один завершений факт.
-            if not sentences and original_text.strip():
-                sentences.append(
-                    self._ensure_sentence_end(original_text.strip())
-                )
-    
-            if not sentences:
-                return None
-    
-            text = (
-                f"{emoji} <b>{headline}</b>\n\n"
-                f"{' '.join(sentences[:6])}"
-            )
-            text = self._clean_generated_news_text(text)
-            if not text:
-                return None
-    
+
             reference_url, reference_label = self._select_reference_link(
                 ev, posts
             )
-    
-            return {
-                "event_id": str(ev.get("event_id") or ""),
+
+            validated.append({
+                "event_id": event_id,
                 "source_id": source_id,
                 "source_ids": list(ev.get("source_ids", [])),
                 "text": text,
-                "summary": summary,
-                "category": category,
+                "summary": item.get(
+                    "summary",
+                    ev.get("summary", ""),
+                ),
+                "category": item.get(
+                    "category",
+                    ev.get("category", "other"),
+                ),
                 "digest_role": self._event_digest_role(ev),
                 "is_discovery_candidate": bool(
                     ev.get("is_discovery_candidate")
@@ -6652,2453 +6275,2830 @@
                 "visual_media_required": bool(ev.get("visual_media_required", False)),
                 "reference_url": reference_url,
                 "reference_label": reference_label,
-            }
-    
-        def _enforce_digest_mix(
-            self,
-            validated: List[Dict[str, Any]],
-            ranked_events: List[Dict[str, Any]],
-            posts: List[Dict[str, Any]],
-            count: int,
-        ) -> List[Dict[str, Any]]:
-            """
-            Фінальна Python-гарантія структури випуску.
-    
-            Вона НЕ переоцінює факти і НЕ створює нові події. Вона лише бере
-            події, які вже пройшли Analyzer + history gate + ranking, і розкладає
-            їх у редакційну структуру:
-    
-            10 core -> 10 core + 0 discovery
-             9 core ->  9 core + 1 discovery
-             8 core ->  8 core + до 2 discovery
-             7 core ->  7 core + до 3 discovery
-            <=6 core -> core + до 3 discovery
-    
-            Manual priority є абсолютним override: якщо ручна discovery-подія
-            конфліктує з десятою non-priority core, ручна подія лишається.
-            """
-            if count <= 0 or not ranked_events:
-                return []
-    
-            event_map = {
-                str(ev.get("event_id") or ""): ev
-                for ev in ranked_events
-                if ev.get("event_id")
-            }
-    
-            polished_map = {
-                str(item.get("event_id") or ""): item
-                for item in validated
-                if (
-                    item.get("event_id")
-                    and str(item.get("event_id") or "") in event_map
+            })
+
+            used_event_ids.add(event_id)
+
+            if len(validated) >= count:
+                break
+
+        return validated
+
+    def _ensure_priority_news_in_final(
+        self,
+        validated: List[Dict[str, Any]],
+        ranked_events: List[Dict[str, Any]],
+        posts: List[Dict[str, Any]],
+        count: int,
+    ) -> List[Dict[str, Any]]:
+        priority_events = [
+            ev
+            for ev in ranked_events
+            if ev.get("is_priority")
+        ]
+        if not priority_events:
+            return validated[:count]
+
+        result = list(validated)
+        used_event_ids = {
+            str(item.get("event_id") or "")
+            for item in result
+            if item.get("event_id")
+        }
+
+        rank_index = {
+            str(ev.get("event_id") or ""): idx
+            for idx, ev in enumerate(ranked_events)
+            if ev.get("event_id")
+        }
+
+        missing_events = [
+            ev
+            for ev in priority_events
+            if str(ev.get("event_id") or "") not in used_event_ids
+        ]
+
+        if missing_events:
+            logger.warning(
+                "EDITOR пропустив %s priority-подій. "
+                "Додаємо їх Python-fallback без повторного відбору.",
+                len(missing_events),
+            )
+
+        for ev in missing_events:
+            item = self._build_fallback_news_item(ev, posts)
+            if not item:
+                logger.error(
+                    "Не вдалося побудувати fallback для priority event_id=%s",
+                    ev.get("event_id"),
                 )
-            }
-    
-            core_events = [
-                ev
-                for ev in ranked_events
-                if self._event_digest_role(ev) == "core"
+                continue
+
+            event_id = str(ev.get("event_id") or "")
+            target_rank = rank_index.get(event_id, len(ranked_events))
+
+            # Вставляємо приблизно відповідно до ranked-позиції,
+            # не перебудовуючи весь порядок, який уже створив Editor.
+            insert_at = len(result)
+            for idx, existing in enumerate(result):
+                existing_rank = rank_index.get(
+                    str(existing.get("event_id") or ""),
+                    len(ranked_events) + 100,
+                )
+                if existing_rank > target_rank:
+                    insert_at = idx
+                    break
+
+            result.insert(insert_at, item)
+            used_event_ids.add(event_id)
+
+        # Якщо через обов'язкові manual-події перевищили count,
+        # прибираємо найслабші NON-priority, а не manual.
+        while len(result) > count:
+            removable_indexes = [
+                idx
+                for idx, item in enumerate(result)
+                if not item.get("is_priority")
             ]
-            discovery_events = [
-                ev
-                for ev in ranked_events
-                if self._is_publishable_discovery(ev)
-            ]
-    
-            core_events.sort(
-                key=self._core_presentation_score,
-                reverse=True,
+
+            if not removable_indexes:
+                # count вже має бути >= кількості priority, але не ріжемо
+                # manual навіть якщо зовнішній код передав некоректний ліміт.
+                break
+
+            worst_idx = max(
+                removable_indexes,
+                key=lambda idx: rank_index.get(
+                    str(result[idx].get("event_id") or ""),
+                    len(ranked_events) + 1000,
+                ),
             )
-            discovery_events.sort(
-                key=self._discovery_sort_score,
-                reverse=True,
+            result.pop(worst_idx)
+
+        final_ids = {
+            str(item.get("event_id") or "")
+            for item in result
+        }
+        missing_after_guard = [
+            str(ev.get("event_id") or "")
+            for ev in priority_events
+            if str(ev.get("event_id") or "") not in final_ids
+        ]
+
+        if missing_after_guard:
+            logger.error(
+                "CRITICAL final priority guarantee failed for event_ids=%s",
+                missing_after_guard,
             )
-    
-            priority_core = [
-                ev for ev in core_events
-                if ev.get("is_priority")
+
+        return result[:max(count, len(priority_events))]
+
+    def _ensure_priority_posts_in_final(
+        self,
+        validated: List[Dict[str, Any]],
+        ranked_events: List[Dict[str, Any]],
+        posts: List[Dict[str, Any]],
+        count: int,
+    ) -> List[Dict[str, Any]]:
+        """
+        Остання гарантія конкретних manual source IDs перед FINAL_FACT_CHECK.
+
+        На відміну від event-level guard, тут перевіряємо кожен ручний пост.
+        Якщо він зник через неочікуваний merge/mix, створюємо окремий synthetic
+        event, додаємо його і в ranked_events, і у final. Тому наступний
+        FINAL_FACT_CHECK бачить та перевіряє аварійно відновлену новину.
+        """
+        priority_ids = self._get_priority_post_ids(posts)
+        if not priority_ids:
+            return validated[:count]
+
+        result = [dict(item) for item in validated if isinstance(item, dict)]
+        covered = set()
+        for item in result:
+            source_ids = self._valid_source_ids(item.get("source_ids"), posts)
+            manual_ids = [
+                source_id
+                for source_id in source_ids
+                if source_id in priority_ids
             ]
-            priority_discovery = [
-                ev for ev in discovery_events
-                if ev.get("is_priority")
+            if (
+                len(manual_ids) > 1
+                and not bool(item.get("manual_merge_verified", True))
+            ):
+                primary = item.get("source_id")
+                if isinstance(primary, int) and primary in manual_ids:
+                    covered.add(primary)
+                elif manual_ids:
+                    covered.add(manual_ids[0])
+            else:
+                covered.update(manual_ids)
+
+        missing = [source_id for source_id in priority_ids if source_id not in covered]
+        if not missing:
+            return result[:count]
+
+        logger.error(
+            "CRITICAL post-level manual guarantee: у фіналі бракує source_ids=%s. "
+            "Відновлюємо до FINAL_FACT_CHECK.",
+            missing,
+        )
+
+        existing_event_ids = {
+            str(ev.get("event_id") or "")
+            for ev in ranked_events
+            if isinstance(ev, dict)
+        }
+
+        for sequence, source_id in enumerate(missing, start=1):
+            synthetic = self._build_synthetic_priority_event(
+                [source_id],
+                posts,
+                sequence,
+            )
+            synthetic["event_id"] = self._unique_event_id(
+                f"P_FINAL_{source_id}",
+                ranked_events,
+            )
+            synthetic["is_priority"] = True
+            synthetic["manual_merge_verified"] = True
+            synthetic["best_factual_source_id"] = source_id
+            synthetic["best_media_source_id"] = source_id if (
+                posts[source_id].get("has_video") or posts[source_id].get("has_media")
+            ) else None
+            synthetic["best_source_id"] = (
+                synthetic["best_media_source_id"]
+                if synthetic["best_media_source_id"] is not None
+                else source_id
+            )
+            synthetic["editorial_score"] = 0.0
+            synthetic["raw_score"] = 500.0
+            synthetic["balanced_score"] = 500.0
+            ranked_events.append(synthetic)
+            existing_event_ids.add(str(synthetic["event_id"]))
+
+            item = self._build_fallback_news_item(synthetic, posts)
+            if not item:
+                logger.error(
+                    "CRITICAL: не вдалося побудувати final manual fallback source_id=%s",
+                    source_id,
+                )
+                continue
+
+            insert_at = next(
+                (
+                    idx
+                    for idx, existing in enumerate(result)
+                    if existing.get("digest_role") == "discovery"
+                ),
+                len(result),
+            )
+            result.insert(insert_at, item)
+            covered.add(source_id)
+
+        # Manual не обрізаємо. Якщо стандартний count переповнився, прибираємо
+        # лише non-priority з кінця/найслабшої позиції.
+        while len(result) > count:
+            removable = [
+                idx
+                for idx, item in enumerate(result)
+                if not item.get("is_priority")
             ]
-    
-            discovery_slots = self._desired_discovery_slots(
-                len(core_events),
+            if not removable:
+                break
+            result.pop(removable[-1])
+
+        still_missing = [source_id for source_id in priority_ids if source_id not in covered]
+        if still_missing:
+            logger.error(
+                "CRITICAL post-level manual guarantee FAILED source_ids=%s",
+                still_missing,
+            )
+
+        return result[:max(count, len(priority_ids))]
+
+    def _build_fallback_news_item(
+        self,
+        ev: Dict[str, Any],
+        posts: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        source_id = ev.get("best_source_id")
+        locked_source = ev.get("manual_media_source_id")
+        if (
+            bool(ev.get("manual_media_locked"))
+            and isinstance(locked_source, int)
+            and 0 <= locked_source < len(posts)
+        ):
+            source_id = locked_source
+
+        if (
+            not isinstance(source_id, int)
+            or not (0 <= source_id < len(posts))
+        ):
+            source_ids = self._valid_source_ids(
+                ev.get("source_ids"),
+                posts,
+            )
+            if not source_ids:
+                return None
+            source_id = source_ids[0]
+
+        headline = (
+            str(ev.get("headline_hint") or "").strip()
+            or self._priority_headline_from_text(
+                posts[source_id].get("text") or ""
+            )
+            or "Важлива подія"
+        )
+
+        category = ev.get("category", "other")
+        if category not in self.ALLOWED_CATEGORIES:
+            category = "other"
+
+        emoji_map = {
+            "war": "💥",
+            "politics": "🏛",
+            "economy": "💰",
+            "international": "🌍",
+            "society": "🇺🇦",
+            "technology": "⚡",
+            "science": "🔬",
+            "culture": "🎭",
+            "other": "📰",
+        }
+        emoji = emoji_map.get(category, "📰")
+
+        key_facts = ev.get("key_facts", [])
+        facts = (
+            [
+                str(x).strip()
+                for x in key_facts
+                if str(x).strip()
+            ]
+            if isinstance(key_facts, list)
+            else []
+        )
+
+        summary = str(ev.get("summary") or "").strip()
+        why = str(ev.get("why_it_matters") or "").strip()
+
+        sentences: List[str] = []
+
+        if summary:
+            sentences.append(
+                self._ensure_sentence_end(summary)
+            )
+
+        for fact in facts[:5]:
+            sentence = self._ensure_sentence_end(fact)
+            if sentence and sentence not in sentences:
+                sentences.append(sentence)
+
+        if why:
+            sentence = self._ensure_sentence_end(why)
+            if sentence and sentence not in sentences:
+                sentences.append(sentence)
+
+        original_text = posts[source_id].get("text") or ""
+        if len(sentences) < 3 and original_text:
+            for sentence in self._extract_sentences(original_text):
+                clean_sentence = self._ensure_sentence_end(sentence)
+                if (
+                    clean_sentence
+                    and clean_sentence not in sentences
+                ):
+                    sentences.append(clean_sentence)
+                if len(sentences) >= 5:
+                    break
+
+        # Для manual гарантія важливіша за ідеальну кількість речень.
+        # Якщо текст дуже короткий, дозволяємо один завершений факт.
+        if not sentences and original_text.strip():
+            sentences.append(
+                self._ensure_sentence_end(original_text.strip())
+            )
+
+        if not sentences:
+            return None
+
+        text = (
+            f"{emoji} <b>{headline}</b>\n\n"
+            f"{' '.join(sentences[:6])}"
+        )
+        text = self._clean_generated_news_text(text)
+        if not text:
+            return None
+
+        reference_url, reference_label = self._select_reference_link(
+            ev, posts
+        )
+
+        return {
+            "event_id": str(ev.get("event_id") or ""),
+            "source_id": source_id,
+            "source_ids": list(ev.get("source_ids", [])),
+            "text": text,
+            "summary": summary,
+            "category": category,
+            "digest_role": self._event_digest_role(ev),
+            "is_discovery_candidate": bool(
+                ev.get("is_discovery_candidate")
+            ),
+            "is_priority": bool(ev.get("is_priority")),
+            "priority_source_ids": self._priority_source_ids_for_event(ev, posts),
+            "manual_merge_verified": bool(ev.get("manual_merge_verified", True)),
+            "manual_media_locked": bool(ev.get("manual_media_locked", False)),
+            "manual_media_source_id": ev.get("manual_media_source_id"),
+            "video_validation_needed": bool(ev.get("video_validation_needed", False)),
+            "visual_media_required": bool(ev.get("visual_media_required", False)),
+            "reference_url": reference_url,
+            "reference_label": reference_label,
+        }
+
+    def _enforce_digest_mix(
+        self,
+        validated: List[Dict[str, Any]],
+        ranked_events: List[Dict[str, Any]],
+        posts: List[Dict[str, Any]],
+        count: int,
+    ) -> List[Dict[str, Any]]:
+        """
+        Фінальна Python-гарантія структури випуску.
+
+        Вона НЕ переоцінює факти і НЕ створює нові події. Вона лише бере
+        події, які вже пройшли Analyzer + history gate + ranking, і розкладає
+        їх у редакційну структуру:
+
+        10 core -> 10 core + 0 discovery
+         9 core ->  9 core + 1 discovery
+         8 core ->  8 core + до 2 discovery
+         7 core ->  7 core + до 3 discovery
+        <=6 core -> core + до 3 discovery
+
+        Manual priority є абсолютним override: якщо ручна discovery-подія
+        конфліктує з десятою non-priority core, ручна подія лишається.
+        """
+        if count <= 0 or not ranked_events:
+            return []
+
+        event_map = {
+            str(ev.get("event_id") or ""): ev
+            for ev in ranked_events
+            if ev.get("event_id")
+        }
+
+        polished_map = {
+            str(item.get("event_id") or ""): item
+            for item in validated
+            if (
+                item.get("event_id")
+                and str(item.get("event_id") or "") in event_map
+            )
+        }
+
+        core_events = [
+            ev
+            for ev in ranked_events
+            if self._event_digest_role(ev) == "core"
+        ]
+        discovery_events = [
+            ev
+            for ev in ranked_events
+            if self._is_publishable_discovery(ev)
+        ]
+
+        core_events.sort(
+            key=self._core_presentation_score,
+            reverse=True,
+        )
+        discovery_events.sort(
+            key=self._discovery_sort_score,
+            reverse=True,
+        )
+
+        priority_core = [
+            ev for ev in core_events
+            if ev.get("is_priority")
+        ]
+        priority_discovery = [
+            ev for ev in discovery_events
+            if ev.get("is_priority")
+        ]
+
+        discovery_slots = self._desired_discovery_slots(
+            len(core_events),
+            count,
+        )
+
+        # Звичайна квота. Якщо місця є і discovery-кандидати пройшли quality
+        # gate, намагаємось використати всі дозволені 1-3 місця.
+        desired_discovery = min(
+            discovery_slots,
+            len(discovery_events),
+        )
+
+        # Manual discovery не можна відкинути навіть коли є 10 core.
+        desired_discovery = max(
+            desired_discovery,
+            len(priority_discovery),
+        )
+
+        desired_core = min(
+            len(core_events),
+            max(0, count - desired_discovery),
+        )
+        desired_core = max(
+            desired_core,
+            len(priority_core),
+        )
+
+        # Якщо mandatory manual змінив стандартну квоту, прибираємо спочатку
+        # non-priority core/discovery. Самі manual не ріжемо.
+        while desired_core + desired_discovery > count:
+            if desired_core > len(priority_core):
+                desired_core -= 1
+                continue
+            if desired_discovery > len(priority_discovery):
+                desired_discovery -= 1
+                continue
+            break
+
+        mandatory_total = (
+            len(priority_core) + len(priority_discovery)
+        )
+        if mandatory_total > count:
+            # select_top_distinct_news зазвичай уже розширив effective_count,
+            # але тут лишаємо останню страховку.
+            logger.warning(
+                "Digest mix: priority=%s перевищує count=%s. "
+                "Manual не обрізаємо.",
+                mandatory_total,
                 count,
             )
-    
-            # Звичайна квота. Якщо місця є і discovery-кандидати пройшли quality
-            # gate, намагаємось використати всі дозволені 1-3 місця.
-            desired_discovery = min(
-                discovery_slots,
-                len(discovery_events),
-            )
-    
-            # Manual discovery не можна відкинути навіть коли є 10 core.
+            count = mandatory_total
+            desired_core = max(desired_core, len(priority_core))
             desired_discovery = max(
                 desired_discovery,
                 len(priority_discovery),
             )
-    
-            desired_core = min(
-                len(core_events),
-                max(0, count - desired_discovery),
-            )
-            desired_core = max(
-                desired_core,
-                len(priority_core),
-            )
-    
-            # Якщо mandatory manual змінив стандартну квоту, прибираємо спочатку
-            # non-priority core/discovery. Самі manual не ріжемо.
-            while desired_core + desired_discovery > count:
-                if desired_core > len(priority_core):
-                    desired_core -= 1
-                    continue
-                if desired_discovery > len(priority_discovery):
-                    desired_discovery -= 1
-                    continue
-                break
-    
-            mandatory_total = (
-                len(priority_core) + len(priority_discovery)
-            )
-            if mandatory_total > count:
-                # select_top_distinct_news зазвичай уже розширив effective_count,
-                # але тут лишаємо останню страховку.
-                logger.warning(
-                    "Digest mix: priority=%s перевищує count=%s. "
-                    "Manual не обрізаємо.",
-                    mandatory_total,
-                    count,
-                )
-                count = mandatory_total
-                desired_core = max(desired_core, len(priority_core))
-                desired_discovery = max(
-                    desired_discovery,
-                    len(priority_discovery),
-                )
-    
-            def select_with_priority(
-                pool: List[Dict[str, Any]],
-                target: int,
-            ) -> List[Dict[str, Any]]:
-                if target <= 0:
-                    return []
-    
-                selected: List[Dict[str, Any]] = []
-                selected_ids = set()
-    
-                # Спочатку резервуємо всі manual, але фінальний порядок нижче
-                # знову визначатиметься змістовним score, а не priority bonus.
-                for ev in pool:
-                    if not ev.get("is_priority"):
-                        continue
-                    event_id = str(ev.get("event_id") or "")
-                    if not event_id or event_id in selected_ids:
-                        continue
-                    selected.append(ev)
-                    selected_ids.add(event_id)
-    
-                for ev in pool:
-                    if len(selected) >= target:
-                        break
-                    event_id = str(ev.get("event_id") or "")
-                    if not event_id or event_id in selected_ids:
-                        continue
-                    selected.append(ev)
-                    selected_ids.add(event_id)
-    
-                return selected
-    
-            selected_core = select_with_priority(
-                core_events,
-                desired_core,
-            )
-            selected_discovery = select_with_priority(
-                discovery_events,
-                desired_discovery,
-            )
-    
-            # Після priority-reserve кількість може бути > target лише у випадку,
-            # коли mandatory manual більше за стандартну квоту. Це очікувано.
-            selected_core.sort(
-                key=self._core_presentation_score,
-                reverse=True,
-            )
-            selected_discovery.sort(
-                key=self._discovery_sort_score,
-                reverse=True,
-            )
-    
-            final_items: List[Dict[str, Any]] = []
-            used_ids = set()
-    
-            def materialize(ev: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-                event_id = str(ev.get("event_id") or "")
-                if not event_id or event_id in used_ids:
-                    return None
-    
-                item = polished_map.get(event_id)
-                if item is not None:
-                    result_item = dict(item)
-                    result_item["digest_role"] = self._event_digest_role(ev)
-                    result_item["is_discovery_candidate"] = bool(
-                        ev.get("is_discovery_candidate")
-                    )
-                    result_item["is_priority"] = bool(
-                        ev.get("is_priority")
-                    )
-                    result_item["priority_source_ids"] = (
-                        self._priority_source_ids_for_event(ev, posts)
-                    )
-                    result_item["manual_merge_verified"] = bool(
-                        ev.get("manual_merge_verified", True)
-                    )
-                else:
-                    result_item = self._build_fallback_news_item(
-                        ev,
-                        posts,
-                    )
-    
-                if not result_item:
-                    return None
-    
-                used_ids.add(event_id)
-                return result_item
-    
-            # CORE завжди йде першим.
-            for ev in selected_core:
-                item = materialize(ev)
-                if item:
-                    final_items.append(item)
-    
-            core_materialized = len(final_items)
-    
-            # DISCOVERY завжди в кінці.
-            for ev in selected_discovery:
-                item = materialize(ev)
-                if item:
-                    final_items.append(item)
-    
-            discovery_materialized = (
-                len(final_items) - core_materialized
-            )
-    
-            # У дуже рідкісному випадку fallback для обраної події не зібрався,
-            # пробуємо наступного кандидата ТІЄЇ Ж ролі, не ламаючи структуру.
-            if core_materialized < desired_core:
-                for ev in core_events:
-                    if core_materialized >= desired_core:
-                        break
-                    item = materialize(ev)
-                    if not item:
-                        continue
-                    # Додаємо до кінця core-блоку, тобто перед discovery.
-                    final_items.insert(core_materialized, item)
-                    core_materialized += 1
-    
-            current_discovery = len(final_items) - core_materialized
-            if current_discovery < desired_discovery:
-                for ev in discovery_events:
-                    if current_discovery >= desired_discovery:
-                        break
-                    item = materialize(ev)
-                    if not item:
-                        continue
-                    final_items.append(item)
-                    current_discovery += 1
-    
-            # Остання manual-перевірка: жодна priority-подія не має загубитись
-            # навіть через неочікувану помилку materialize/квоти.
-            priority_events = [
-                ev for ev in ranked_events
-                if ev.get("is_priority")
-            ]
-            missing_priority = [
-                ev
-                for ev in priority_events
-                if str(ev.get("event_id") or "") not in used_ids
-            ]
-    
-            for ev in missing_priority:
-                item = materialize(ev)
-                if not item:
-                    logger.error(
-                        "CRITICAL: не вдалося матеріалізувати priority event_id=%s",
-                        ev.get("event_id"),
-                    )
-                    continue
-    
-                if self._event_digest_role(ev) == "discovery":
-                    final_items.append(item)
-                else:
-                    # Core manual вставляємо перед discovery-блоком.
-                    insert_at = next(
-                        (
-                            idx
-                            for idx, existing in enumerate(final_items)
-                            if existing.get("digest_role") == "discovery"
-                        ),
-                        len(final_items),
-                    )
-                    final_items.insert(insert_at, item)
-                    core_materialized += 1
-    
-            # Якщо mandatory manual спричинив перевищення count, видаляємо
-            # найслабші NON-priority, починаючи з ролі, де є надлишок.
-            while len(final_items) > count:
-                removable = [
-                    (idx, item)
-                    for idx, item in enumerate(final_items)
-                    if not item.get("is_priority")
-                ]
-                if not removable:
-                    break
-    
-                # Віддаємо перевагу видаленню найслабшого core, якщо discovery
-                # mandatory; інакше просто найслабшого за content score.
-                def removal_score(entry):
-                    idx, item = entry
-                    ev = event_map.get(str(item.get("event_id") or ""), {})
-                    if self._event_digest_role(ev) == "discovery":
-                        return self._discovery_sort_score(ev)
-                    return self._core_presentation_score(ev)
-    
-                worst_idx, _ = min(removable, key=removal_score)
-                final_items.pop(worst_idx)
-    
-            # Після можливого trim ще раз стабілізуємо порядок: core -> discovery.
-            core_items = []
-            discovery_items = []
-            for item in final_items:
-                ev = event_map.get(
-                    str(item.get("event_id") or ""),
-                    {},
-                )
-                if self._event_digest_role(ev) == "discovery":
-                    item["digest_role"] = "discovery"
-                    discovery_items.append(item)
-                else:
-                    item["digest_role"] = "core"
-                    core_items.append(item)
-    
-            core_items.sort(
-                key=lambda item: self._core_presentation_score(
-                    event_map.get(str(item.get("event_id") or ""), {})
-                ),
-                reverse=True,
-            )
-            discovery_items.sort(
-                key=lambda item: self._discovery_sort_score(
-                    event_map.get(str(item.get("event_id") or ""), {})
-                ),
-                reverse=True,
-            )
-    
-            final_items = core_items + discovery_items
-    
-            final_priority_ids = {
-                str(item.get("event_id") or "")
-                for item in final_items
-                if item.get("is_priority")
-            }
-            expected_priority_ids = {
-                str(ev.get("event_id") or "")
-                for ev in priority_events
-            }
-            lost_priority = sorted(
-                expected_priority_ids - final_priority_ids
-            )
-            if lost_priority:
-                logger.error(
-                    "CRITICAL final digest mix lost priority event_ids=%s",
-                    lost_priority,
-                )
-    
-            logger.info(
-                "Digest mix: available core=%s, discovery=%s; "
-                "selected core=%s, discovery=%s; total=%s.",
-                len(core_events),
-                len(discovery_events),
-                len(core_items),
-                len(discovery_items),
-                len(final_items),
-            )
-    
-            for idx, item in enumerate(final_items, start=1):
-                logger.info(
-                    "FINAL #%s role=%s priority=%s event_id=%s",
-                    idx,
-                    item.get("digest_role", "core"),
-                    bool(item.get("is_priority")),
-                    item.get("event_id"),
-                )
-    
-            return final_items[:count]
-    
-        def _fill_missing_news(
-            self,
-            validated: List[Dict[str, Any]],
-            ranked_events: List[Dict[str, Any]],
-            posts: List[Dict[str, Any]],
-            count: int,
+
+        def select_with_priority(
+            pool: List[Dict[str, Any]],
+            target: int,
         ) -> List[Dict[str, Any]]:
-            result = list(validated)
-    
-            used_event_ids = {
-                str(item.get("event_id") or "")
-                for item in result
-                if item.get("event_id")
-            }
-    
-            for ev in ranked_events:
-                if len(result) >= count:
-                    break
-    
-                event_id = str(ev.get("event_id") or "")
-                if not event_id or event_id in used_event_ids:
+            if target <= 0:
+                return []
+
+            selected: List[Dict[str, Any]] = []
+            selected_ids = set()
+
+            # Спочатку резервуємо всі manual, але фінальний порядок нижче
+            # знову визначатиметься змістовним score, а не priority bonus.
+            for ev in pool:
+                if not ev.get("is_priority"):
                     continue
-    
-                item = self._build_fallback_news_item(ev, posts)
+                event_id = str(ev.get("event_id") or "")
+                if not event_id or event_id in selected_ids:
+                    continue
+                selected.append(ev)
+                selected_ids.add(event_id)
+
+            for ev in pool:
+                if len(selected) >= target:
+                    break
+                event_id = str(ev.get("event_id") or "")
+                if not event_id or event_id in selected_ids:
+                    continue
+                selected.append(ev)
+                selected_ids.add(event_id)
+
+            return selected
+
+        selected_core = select_with_priority(
+            core_events,
+            desired_core,
+        )
+        selected_discovery = select_with_priority(
+            discovery_events,
+            desired_discovery,
+        )
+
+        # Після priority-reserve кількість може бути > target лише у випадку,
+        # коли mandatory manual більше за стандартну квоту. Це очікувано.
+        selected_core.sort(
+            key=self._core_presentation_score,
+            reverse=True,
+        )
+        selected_discovery.sort(
+            key=self._discovery_sort_score,
+            reverse=True,
+        )
+
+        final_items: List[Dict[str, Any]] = []
+        used_ids = set()
+
+        def materialize(ev: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+            event_id = str(ev.get("event_id") or "")
+            if not event_id or event_id in used_ids:
+                return None
+
+            item = polished_map.get(event_id)
+            if item is not None:
+                result_item = dict(item)
+                result_item["digest_role"] = self._event_digest_role(ev)
+                result_item["is_discovery_candidate"] = bool(
+                    ev.get("is_discovery_candidate")
+                )
+                result_item["is_priority"] = bool(
+                    ev.get("is_priority")
+                )
+                result_item["priority_source_ids"] = (
+                    self._priority_source_ids_for_event(ev, posts)
+                )
+                result_item["manual_merge_verified"] = bool(
+                    ev.get("manual_merge_verified", True)
+                )
+            else:
+                result_item = self._build_fallback_news_item(
+                    ev,
+                    posts,
+                )
+
+            if not result_item:
+                return None
+
+            used_ids.add(event_id)
+            return result_item
+
+        # CORE завжди йде першим.
+        for ev in selected_core:
+            item = materialize(ev)
+            if item:
+                final_items.append(item)
+
+        core_materialized = len(final_items)
+
+        # DISCOVERY завжди в кінці.
+        for ev in selected_discovery:
+            item = materialize(ev)
+            if item:
+                final_items.append(item)
+
+        discovery_materialized = (
+            len(final_items) - core_materialized
+        )
+
+        # У дуже рідкісному випадку fallback для обраної події не зібрався,
+        # пробуємо наступного кандидата ТІЄЇ Ж ролі, не ламаючи структуру.
+        if core_materialized < desired_core:
+            for ev in core_events:
+                if core_materialized >= desired_core:
+                    break
+                item = materialize(ev)
                 if not item:
                     continue
-    
-                result.append(item)
-                used_event_ids.add(event_id)
-    
-            return result[:count]
-    
-        def _select_factual_source(
-            self,
-            source_ids: List[int],
-            posts: List[Dict[str, Any]],
-            preferred_id: Any = None,
-        ) -> int:
-            if (
-                isinstance(preferred_id, int)
-                and preferred_id in source_ids
-            ):
-                return preferred_id
-    
-            return max(
-                source_ids,
-                key=lambda s: self._factual_source_score(
-                    posts[s]
-                ),
-            )
-    
-        def _manual_locked_media_source(
-            self,
-            source_ids: List[int],
-            posts: List[Dict[str, Any]],
-            preferred_id: Any = None,
-        ) -> Optional[int]:
-            """
-            Manual media is immutable: якщо адмін надіслав фото/відео, жоден
-            автоматичний source не має права замінити цей файл. Інші source_ids
-            можуть лише збагачувати факти/текст події.
-            """
-            locked = []
-            for source_id in source_ids:
-                post = posts[source_id]
-                media_path = str(post.get("manual_media_path") or "").strip()
-                media_file_id = str(
-                    post.get("manual_telegram_file_id")
-                    or post.get("telegram_file_id")
-                    or ""
-                ).strip()
-                media_type = str(post.get("manual_media_type") or "").strip().lower()
-                if (
-                    bool(post.get("is_priority"))
-                    and (media_path or media_file_id)
-                    and media_type in {"photo", "video"}
-                ):
-                    locked.append(source_id)
-    
-            if not locked:
-                return None
-            if isinstance(preferred_id, int) and preferred_id in locked:
-                return preferred_id
-            return locked[0]
-    
-        def _media_source_matches_event(
-            self,
-            source_id: int,
-            posts: List[Dict[str, Any]],
-            event: Dict[str, Any],
-            relevance: float,
-        ) -> bool:
-            """
-            AUTO media pre-gate.
-    
-            Photos stay relatively strict. Videos are deliberately softer because
-            short/night/impact clips often have tiny captions and are hard to
-            classify reliably. A video is rejected here mainly on an explicit
-            location conflict; otherwise moderate text overlap is enough and the
-            Publisher has one final fail-open obvious-conflict check.
-            """
-            post_text = str(posts[source_id].get("text") or "").strip()
-            event_text = self._event_text_bundle(event)
-            if not post_text or not event_text:
-                return False
-    
-            factual_id = event.get("best_factual_source_id")
-            factual_text = ""
-            if (
-                isinstance(factual_id, int)
-                and 0 <= factual_id < len(posts)
-                and factual_id != source_id
-            ):
-                factual_text = str(posts[factual_id].get("text") or "").strip()
-    
-            reference_text = " ".join(
-                part for part in (event_text, factual_text) if part
-            )
-    
-            is_video = bool(posts[source_id].get("has_video"))
-    
-            # Same factual source is naturally strong. Video gets an even softer
-            # threshold because caption can be only a few words.
-            if source_id == factual_id:
-                return relevance >= (0.04 if is_video else 0.10)
-    
-            post_entities = self._entity_signature(post_text)
-            ref_entities = self._entity_signature(reference_text)
-            shared_entities = post_entities & ref_entities
-            shared_story = (
-                self._story_signature(post_text)
-                & self._story_signature(reference_text)
-            )
-    
-            post_is_attack = self._looks_like_attack_text(post_text)
-            ref_is_attack = self._looks_like_attack_text(reference_text)
-    
-            if post_is_attack or ref_is_attack:
-                post_centers = self._regional_center_names(post_text)
-                ref_centers = self._regional_center_names(reference_text)
-    
-                # This is the one strong deterministic video reject: both texts
-                # explicitly name different regional centres.
-                if (
-                    post_centers
-                    and ref_centers
-                    and post_centers.isdisjoint(ref_centers)
-                ):
-                    return False
-    
-                if self._attack_same_story_anchor_match(
-                    post_text,
-                    reference_text,
-                ):
-                    return True
-    
-                shared_anchors = (
-                    self._attack_anchor_signature(post_text)
-                    & self._attack_anchor_signature(reference_text)
+                # Додаємо до кінця core-блоку, тобто перед discovery.
+                final_items.insert(core_materialized, item)
+                core_materialized += 1
+
+        current_discovery = len(final_items) - core_materialized
+        if current_discovery < desired_discovery:
+            for ev in discovery_events:
+                if current_discovery >= desired_discovery:
+                    break
+                item = materialize(ev)
+                if not item:
+                    continue
+                final_items.append(item)
+                current_discovery += 1
+
+        # Остання manual-перевірка: жодна priority-подія не має загубитись
+        # навіть через неочікувану помилку materialize/квоти.
+        priority_events = [
+            ev for ev in ranked_events
+            if ev.get("is_priority")
+        ]
+        missing_priority = [
+            ev
+            for ev in priority_events
+            if str(ev.get("event_id") or "") not in used_ids
+        ]
+
+        for ev in missing_priority:
+            item = materialize(ev)
+            if not item:
+                logger.error(
+                    "CRITICAL: не вдалося матеріалізувати priority event_id=%s",
+                    ev.get("event_id"),
                 )
-    
-                if is_video:
-                    # Direct-impact clips deserve extra tolerance. Do not demand
-                    # long caption similarity if target/location anchors agree.
-                    if (
-                        self._is_direct_impact_video_post(posts[source_id])
-                        and (
-                            shared_entities
-                            or shared_anchors
-                            or relevance >= 0.06
-                        )
-                    ):
-                        return True
-    
-                    if shared_entities or shared_anchors:
-                        return True
-                    if len(shared_story) >= 1:
-                        return True
-                    return relevance >= 0.08
-    
-                # Photos stay stricter than videos.
-                return bool(
-                    relevance >= 0.34
+                continue
+
+            if self._event_digest_role(ev) == "discovery":
+                final_items.append(item)
+            else:
+                # Core manual вставляємо перед discovery-блоком.
+                insert_at = next(
+                    (
+                        idx
+                        for idx, existing in enumerate(final_items)
+                        if existing.get("digest_role") == "discovery"
+                    ),
+                    len(final_items),
+                )
+                final_items.insert(insert_at, item)
+                core_materialized += 1
+
+        # Якщо mandatory manual спричинив перевищення count, видаляємо
+        # найслабші NON-priority, починаючи з ролі, де є надлишок.
+        while len(final_items) > count:
+            removable = [
+                (idx, item)
+                for idx, item in enumerate(final_items)
+                if not item.get("is_priority")
+            ]
+            if not removable:
+                break
+
+            # Віддаємо перевагу видаленню найслабшого core, якщо discovery
+            # mandatory; інакше просто найслабшого за content score.
+            def removal_score(entry):
+                idx, item = entry
+                ev = event_map.get(str(item.get("event_id") or ""), {})
+                if self._event_digest_role(ev) == "discovery":
+                    return self._discovery_sort_score(ev)
+                return self._core_presentation_score(ev)
+
+            worst_idx, _ = min(removable, key=removal_score)
+            final_items.pop(worst_idx)
+
+        # Після можливого trim ще раз стабілізуємо порядок: core -> discovery.
+        core_items = []
+        discovery_items = []
+        for item in final_items:
+            ev = event_map.get(
+                str(item.get("event_id") or ""),
+                {},
+            )
+            if self._event_digest_role(ev) == "discovery":
+                item["digest_role"] = "discovery"
+                discovery_items.append(item)
+            else:
+                item["digest_role"] = "core"
+                core_items.append(item)
+
+        core_items.sort(
+            key=lambda item: self._core_presentation_score(
+                event_map.get(str(item.get("event_id") or ""), {})
+            ),
+            reverse=True,
+        )
+        discovery_items.sort(
+            key=lambda item: self._discovery_sort_score(
+                event_map.get(str(item.get("event_id") or ""), {})
+            ),
+            reverse=True,
+        )
+
+        final_items = core_items + discovery_items
+
+        final_priority_ids = {
+            str(item.get("event_id") or "")
+            for item in final_items
+            if item.get("is_priority")
+        }
+        expected_priority_ids = {
+            str(ev.get("event_id") or "")
+            for ev in priority_events
+        }
+        lost_priority = sorted(
+            expected_priority_ids - final_priority_ids
+        )
+        if lost_priority:
+            logger.error(
+                "CRITICAL final digest mix lost priority event_ids=%s",
+                lost_priority,
+            )
+
+        logger.info(
+            "Digest mix: available core=%s, discovery=%s; "
+            "selected core=%s, discovery=%s; total=%s.",
+            len(core_events),
+            len(discovery_events),
+            len(core_items),
+            len(discovery_items),
+            len(final_items),
+        )
+
+        for idx, item in enumerate(final_items, start=1):
+            logger.info(
+                "FINAL #%s role=%s priority=%s event_id=%s",
+                idx,
+                item.get("digest_role", "core"),
+                bool(item.get("is_priority")),
+                item.get("event_id"),
+            )
+
+        return final_items[:count]
+
+    def _fill_missing_news(
+        self,
+        validated: List[Dict[str, Any]],
+        ranked_events: List[Dict[str, Any]],
+        posts: List[Dict[str, Any]],
+        count: int,
+    ) -> List[Dict[str, Any]]:
+        result = list(validated)
+
+        used_event_ids = {
+            str(item.get("event_id") or "")
+            for item in result
+            if item.get("event_id")
+        }
+
+        for ev in ranked_events:
+            if len(result) >= count:
+                break
+
+            event_id = str(ev.get("event_id") or "")
+            if not event_id or event_id in used_event_ids:
+                continue
+
+            item = self._build_fallback_news_item(ev, posts)
+            if not item:
+                continue
+
+            result.append(item)
+            used_event_ids.add(event_id)
+
+        return result[:count]
+
+    def _select_factual_source(
+        self,
+        source_ids: List[int],
+        posts: List[Dict[str, Any]],
+        preferred_id: Any = None,
+    ) -> int:
+        if (
+            isinstance(preferred_id, int)
+            and preferred_id in source_ids
+        ):
+            return preferred_id
+
+        return max(
+            source_ids,
+            key=lambda s: self._factual_source_score(
+                posts[s]
+            ),
+        )
+
+    def _manual_locked_media_source(
+        self,
+        source_ids: List[int],
+        posts: List[Dict[str, Any]],
+        preferred_id: Any = None,
+    ) -> Optional[int]:
+        """
+        Manual media is immutable: якщо адмін надіслав фото/відео, жоден
+        автоматичний source не має права замінити цей файл. Інші source_ids
+        можуть лише збагачувати факти/текст події.
+        """
+        locked = []
+        for source_id in source_ids:
+            post = posts[source_id]
+            media_path = str(post.get("manual_media_path") or "").strip()
+            media_file_id = str(
+                post.get("manual_telegram_file_id")
+                or post.get("telegram_file_id")
+                or ""
+            ).strip()
+            media_type = str(post.get("manual_media_type") or "").strip().lower()
+            if (
+                bool(post.get("is_priority"))
+                and (media_path or media_file_id)
+                and media_type in {"photo", "video"}
+            ):
+                locked.append(source_id)
+
+        if not locked:
+            return None
+        if isinstance(preferred_id, int) and preferred_id in locked:
+            return preferred_id
+        return locked[0]
+
+    def _media_source_matches_event(
+        self,
+        source_id: int,
+        posts: List[Dict[str, Any]],
+        event: Dict[str, Any],
+        relevance: float,
+    ) -> bool:
+        """
+        AUTO media pre-gate.
+
+        Photos stay relatively strict. Videos are deliberately softer because
+        short/night/impact clips often have tiny captions and are hard to
+        classify reliably. A video is rejected here mainly on an explicit
+        location conflict; otherwise moderate text overlap is enough and the
+        Publisher has one final fail-open obvious-conflict check.
+        """
+        post_text = str(posts[source_id].get("text") or "").strip()
+        event_text = self._event_text_bundle(event)
+        if not post_text or not event_text:
+            return False
+
+        factual_id = event.get("best_factual_source_id")
+        factual_text = ""
+        if (
+            isinstance(factual_id, int)
+            and 0 <= factual_id < len(posts)
+            and factual_id != source_id
+        ):
+            factual_text = str(posts[factual_id].get("text") or "").strip()
+
+        reference_text = " ".join(
+            part for part in (event_text, factual_text) if part
+        )
+
+        is_video = bool(posts[source_id].get("has_video"))
+
+        # Same factual source is naturally strong. Video gets an even softer
+        # threshold because caption can be only a few words.
+        if source_id == factual_id:
+            return relevance >= (0.04 if is_video else 0.10)
+
+        post_entities = self._entity_signature(post_text)
+        ref_entities = self._entity_signature(reference_text)
+        shared_entities = post_entities & ref_entities
+        shared_story = (
+            self._story_signature(post_text)
+            & self._story_signature(reference_text)
+        )
+
+        post_is_attack = self._looks_like_attack_text(post_text)
+        ref_is_attack = self._looks_like_attack_text(reference_text)
+
+        if post_is_attack or ref_is_attack:
+            post_centers = self._regional_center_names(post_text)
+            ref_centers = self._regional_center_names(reference_text)
+
+            # This is the one strong deterministic video reject: both texts
+            # explicitly name different regional centres.
+            if (
+                post_centers
+                and ref_centers
+                and post_centers.isdisjoint(ref_centers)
+            ):
+                return False
+
+            if self._attack_same_story_anchor_match(
+                post_text,
+                reference_text,
+            ):
+                return True
+
+            shared_anchors = (
+                self._attack_anchor_signature(post_text)
+                & self._attack_anchor_signature(reference_text)
+            )
+
+            if is_video:
+                # Direct-impact clips deserve extra tolerance. Do not demand
+                # long caption similarity if target/location anchors agree.
+                if (
+                    self._is_direct_impact_video_post(posts[source_id])
                     and (
                         shared_entities
-                        or len(shared_anchors) >= 2
-                        or len(shared_story) >= 3
+                        or shared_anchors
+                        or relevance >= 0.06
                     )
-                )
-    
-            if is_video:
-                if shared_entities or len(shared_story) >= 2:
-                    return True
-                return relevance >= 0.12
-    
-            if relevance >= 0.36:
-                return True
-            if relevance >= 0.24 and (
-                shared_entities
-                or len(shared_story) >= 3
-            ):
-                return True
-            return False
-    
-        def _auto_media_is_publishable(
-            self,
-            post: Dict[str, Any],
-        ) -> bool:
-            """Cheap pre-publication capability check for AUTO media."""
-            if not (post.get("has_video") or post.get("has_media")):
-                return False
-            if post.get("has_video"):
-                try:
-                    size = int(post.get("media_size") or 0)
-                except (TypeError, ValueError):
-                    size = 0
-                if size and size > self.AUTO_VIDEO_MAX_BYTES:
-                    return False
-            return True
-    
-        def _is_visual_discovery_event(
-            self,
-            event: Dict[str, Any],
-            posts: List[Dict[str, Any]],
-        ) -> bool:
-            """
-            Returns True for discovery stories whose value is mainly visual:
-            monuments, fountains, sculptures, murals, architecture, exhibitions.
-            Manual priority is handled elsewhere and is never rejected by this gate.
-            """
-            if self._event_digest_role(event) != "discovery":
-                return False
-    
-            chunks = [
-                str(event.get("headline_hint") or ""),
-                str(event.get("summary") or ""),
-                str(event.get("why_it_matters") or ""),
-            ]
-            for source_id in self._valid_source_ids(event.get("source_ids"), posts):
-                chunks.append(str(posts[source_id].get("text") or ""))
-            text = self._normalize_similarity_text(" ".join(chunks))
-            return any(term in text for term in self.VISUAL_DISCOVERY_TERMS)
-    
-        def _selected_video_needs_gemini(
-            self,
-            source_id: Optional[int],
-            posts: List[Dict[str, Any]],
-            event: Dict[str, Any],
-        ) -> bool:
-            """
-            Gemini video is now exceptional, not the default. Only a borderline
-            AUTO clip with very weak text linkage gets the expensive check. Clear
-            location conflicts are already rejected by _media_source_matches_event.
-            """
-            if not isinstance(source_id, int) or not (0 <= source_id < len(posts)):
-                return False
-            post = posts[source_id]
-            if post.get("is_priority") or not post.get("has_video"):
-                return False
-    
-            event_text = self._event_text_bundle(event)
-            post_text = str(post.get("text") or "").strip()
-            relevance = self._media_text_relevance(event_text, post_text)
-    
-            shared_entities = (
-                self._entity_signature(event_text)
-                & self._entity_signature(post_text)
-            )
-            shared_story = (
-                self._story_signature(event_text)
-                & self._story_signature(post_text)
-            )
-    
-            # Borderline only: ordinary selected videos skip Gemini completely.
-            return bool(
-                relevance < 0.12
-                and not shared_entities
-                and len(shared_story) < 2
-            )
-    
-        def _select_media_source(
-            self,
-            source_ids: List[int],
-            posts: List[Dict[str, Any]],
-            event: Dict[str, Any],
-            preferred_id: Any = None,
-        ) -> Optional[int]:
-            """
-            Manual media is locked. For automatic events, choose media only among
-            source-posts that are semantically consistent with the concrete event.
-            """
-            locked_manual = self._manual_locked_media_source(
-                source_ids,
-                posts,
-                preferred_id,
-            )
-            if locked_manual is not None:
-                logger.info(
-                    "MANUAL MEDIA LOCK: event_id=%s source_id=%s type=%s",
-                    event.get("event_id"),
-                    locked_manual,
-                    posts[locked_manual].get("manual_media_type"),
-                )
-                return locked_manual
-    
-            media_ids = []
-            for s in source_ids:
-                if not self._auto_media_is_publishable(posts[s]):
-                    if posts[s].get("has_video"):
-                        try:
-                            size_mb = float(posts[s].get("media_size") or 0) / 1024 / 1024
-                        except (TypeError, ValueError):
-                            size_mb = 0.0
-                        if size_mb > 0:
-                            logger.info(
-                                "Auto media candidate skipped before ranking: "
-                                "event_id=%s source_id=%s video_size=%.1fMB limit=35MB",
-                                event.get("event_id"),
-                                s,
-                                size_mb,
-                            )
-                    continue
-                media_ids.append(s)
-    
-            if not media_ids:
-                return None
-    
-            event_text = self._event_text_bundle(event)
-    
-            scored: List[tuple] = []
-            for source_id in media_ids:
-                post_text = str(posts[source_id].get("text") or "").strip()
-                relevance = self._media_text_relevance(event_text, post_text)
-    
-                if not self._media_source_matches_event(
-                    source_id,
-                    posts,
-                    event,
-                    relevance,
                 ):
-                    logger.info(
-                        "Auto media candidate rejected: event_id=%s source_id=%s "
-                        "relevance=%.2f type=%s",
-                        event.get("event_id"),
-                        source_id,
-                        relevance,
-                        "video" if posts[source_id].get("has_video") else "photo",
-                    )
-                    continue
-    
-                score = self._media_source_score(posts[source_id])
-                score += relevance * 35.0
-    
-                if source_id == preferred_id:
-                    # LLM preference is only a bonus after deterministic safety.
-                    score += 8.0
-    
-                scored.append((score, relevance, source_id))
-    
-            if not scored:
-                logger.info(
-                    "Media source rejected by event-consistency gate: event_id=%s",
-                    event.get("event_id"),
+                    return True
+
+                if shared_entities or shared_anchors:
+                    return True
+                if len(shared_story) >= 1:
+                    return True
+                return relevance >= 0.08
+
+            # Photos stay stricter than videos.
+            return bool(
+                relevance >= 0.34
+                and (
+                    shared_entities
+                    or len(shared_anchors) >= 2
+                    or len(shared_story) >= 3
                 )
-                return None
-    
-            scored.sort(reverse=True)
-            best_score, best_relevance, best_id = scored[0]
-    
+            )
+
+        if is_video:
+            if shared_entities or len(shared_story) >= 2:
+                return True
+            return relevance >= 0.12
+
+        if relevance >= 0.36:
+            return True
+        if relevance >= 0.24 and (
+            shared_entities
+            or len(shared_story) >= 3
+        ):
+            return True
+        return False
+
+    def _auto_media_is_publishable(
+        self,
+        post: Dict[str, Any],
+    ) -> bool:
+        """Cheap pre-publication capability check for AUTO media."""
+        if not (post.get("has_video") or post.get("has_media")):
+            return False
+        if post.get("has_video"):
+            try:
+                size = int(post.get("media_size") or 0)
+            except (TypeError, ValueError):
+                size = 0
+            if size and size > self.AUTO_VIDEO_MAX_BYTES:
+                return False
+        return True
+
+    def _is_visual_discovery_event(
+        self,
+        event: Dict[str, Any],
+        posts: List[Dict[str, Any]],
+    ) -> bool:
+        """
+        Returns True for discovery stories whose value is mainly visual:
+        monuments, fountains, sculptures, murals, architecture, exhibitions.
+        Manual priority is handled elsewhere and is never rejected by this gate.
+        """
+        if self._event_digest_role(event) != "discovery":
+            return False
+
+        chunks = [
+            str(event.get("headline_hint") or ""),
+            str(event.get("summary") or ""),
+            str(event.get("why_it_matters") or ""),
+        ]
+        for source_id in self._valid_source_ids(event.get("source_ids"), posts):
+            chunks.append(str(posts[source_id].get("text") or ""))
+        text = self._normalize_similarity_text(" ".join(chunks))
+        return any(term in text for term in self.VISUAL_DISCOVERY_TERMS)
+
+    def _selected_video_needs_gemini(
+        self,
+        source_id: Optional[int],
+        posts: List[Dict[str, Any]],
+        event: Dict[str, Any],
+    ) -> bool:
+        """
+        Gemini video is now exceptional, not the default. Only a borderline
+        AUTO clip with very weak text linkage gets the expensive check. Clear
+        location conflicts are already rejected by _media_source_matches_event.
+        """
+        if not isinstance(source_id, int) or not (0 <= source_id < len(posts)):
+            return False
+        post = posts[source_id]
+        if post.get("is_priority") or not post.get("has_video"):
+            return False
+
+        event_text = self._event_text_bundle(event)
+        post_text = str(post.get("text") or "").strip()
+        relevance = self._media_text_relevance(event_text, post_text)
+
+        shared_entities = (
+            self._entity_signature(event_text)
+            & self._entity_signature(post_text)
+        )
+        shared_story = (
+            self._story_signature(event_text)
+            & self._story_signature(post_text)
+        )
+
+        # Borderline only: ordinary selected videos skip Gemini completely.
+        return bool(
+            relevance < 0.12
+            and not shared_entities
+            and len(shared_story) < 2
+        )
+
+    def _select_media_source(
+        self,
+        source_ids: List[int],
+        posts: List[Dict[str, Any]],
+        event: Dict[str, Any],
+        preferred_id: Any = None,
+    ) -> Optional[int]:
+        """
+        Manual media is locked. For automatic events, choose media only among
+        source-posts that are semantically consistent with the concrete event.
+        """
+        locked_manual = self._manual_locked_media_source(
+            source_ids,
+            posts,
+            preferred_id,
+        )
+        if locked_manual is not None:
             logger.info(
-                "Media source selected: event_id=%s source_id=%s relevance=%.2f score=%.2f",
+                "MANUAL MEDIA LOCK: event_id=%s source_id=%s type=%s",
                 event.get("event_id"),
-                best_id,
-                best_relevance,
-                best_score,
+                locked_manual,
+                posts[locked_manual].get("manual_media_type"),
             )
-            return best_id
-    
-        def _media_text_relevance(
-            self,
-            event_text: str,
-            post_text: str,
-        ) -> float:
-            """0..1: наскільки текст media-source відповідає event."""
-            a = self._normalize_similarity_text(event_text)
-            b = self._normalize_similarity_text(post_text)
-            if not a or not b:
-                return 0.0
-    
-            stats = self._history_similarity_stats(a, b)
-            shared_entities = self._entity_signature(a) & self._entity_signature(b)
-            shared_story = self._story_signature(a) & self._story_signature(b)
-    
-            entity_bonus = min(len(shared_entities), 3) * 0.08
-            story_bonus = min(len(shared_story), 8) * 0.025
-    
-            score = (
-                stats["seq"] * 0.28
-                + stats["overlap"] * 0.30
-                + stats["jaccard"] * 0.22
-                + entity_bonus
-                + story_bonus
+            return locked_manual
+
+        media_ids = []
+        for s in source_ids:
+            if not self._auto_media_is_publishable(posts[s]):
+                if posts[s].get("has_video"):
+                    try:
+                        size_mb = float(posts[s].get("media_size") or 0) / 1024 / 1024
+                    except (TypeError, ValueError):
+                        size_mb = 0.0
+                    if size_mb > 0:
+                        logger.info(
+                            "Auto media candidate skipped before ranking: "
+                            "event_id=%s source_id=%s video_size=%.1fMB limit=35MB",
+                            event.get("event_id"),
+                            s,
+                            size_mb,
+                        )
+                continue
+            media_ids.append(s)
+
+        if not media_ids:
+            return None
+
+        event_text = self._event_text_bundle(event)
+
+        scored: List[tuple] = []
+        for source_id in media_ids:
+            post_text = str(posts[source_id].get("text") or "").strip()
+            relevance = self._media_text_relevance(event_text, post_text)
+
+            if not self._media_source_matches_event(
+                source_id,
+                posts,
+                event,
+                relevance,
+            ):
+                logger.info(
+                    "Auto media candidate rejected: event_id=%s source_id=%s "
+                    "relevance=%.2f type=%s",
+                    event.get("event_id"),
+                    source_id,
+                    relevance,
+                    "video" if posts[source_id].get("has_video") else "photo",
+                )
+                continue
+
+            score = self._media_source_score(posts[source_id])
+            score += relevance * 35.0
+
+            if source_id == preferred_id:
+                # LLM preference is only a bonus after deterministic safety.
+                score += 8.0
+
+            scored.append((score, relevance, source_id))
+
+        if not scored:
+            logger.info(
+                "Media source rejected by event-consistency gate: event_id=%s",
+                event.get("event_id"),
             )
-            return max(0.0, min(1.0, score))
-    
-        def _factual_source_score(
-            self,
-            post: Dict[str, Any],
-        ) -> float:
-            if post.get("is_priority"):
-                return 10000.0
-    
+            return None
+
+        scored.sort(reverse=True)
+        best_score, best_relevance, best_id = scored[0]
+
+        logger.info(
+            "Media source selected: event_id=%s source_id=%s relevance=%.2f score=%.2f",
+            event.get("event_id"),
+            best_id,
+            best_relevance,
+            best_score,
+        )
+        return best_id
+
+    def _media_text_relevance(
+        self,
+        event_text: str,
+        post_text: str,
+    ) -> float:
+        """0..1: наскільки текст media-source відповідає event."""
+        a = self._normalize_similarity_text(event_text)
+        b = self._normalize_similarity_text(post_text)
+        if not a or not b:
+            return 0.0
+
+        stats = self._history_similarity_stats(a, b)
+        shared_entities = self._entity_signature(a) & self._entity_signature(b)
+        shared_story = self._story_signature(a) & self._story_signature(b)
+
+        entity_bonus = min(len(shared_entities), 3) * 0.08
+        story_bonus = min(len(shared_story), 8) * 0.025
+
+        score = (
+            stats["seq"] * 0.28
+            + stats["overlap"] * 0.30
+            + stats["jaccard"] * 0.22
+            + entity_bonus
+            + story_bonus
+        )
+        return max(0.0, min(1.0, score))
+
+    def _factual_source_score(
+        self,
+        post: Dict[str, Any],
+    ) -> float:
+        if post.get("is_priority"):
+            return 10000.0
+
+        username = (
+            str(post.get("channel_username", "") or "")
+            .replace("@", "")
+            .strip()
+        )
+
+        views = int(post.get("views") or 0)
+        forwards = int(post.get("forwards") or 0)
+        text_length = len(post.get("text") or "")
+
+        # Довжина тут не оцінює важливість події.
+        # Вона лише допомагає вибрати інформативніше джерело.
+        score = (
+            min(
+                math.log10(max(views, 1)) * 5,
+                25,
+            )
+            + min(
+                math.log10(max(forwards, 1)) * 3,
+                10,
+            )
+            + min(text_length / 180, 7)
+        )
+
+        return score * self._get_source_multiplier(
+            username
+        )
+
+    @staticmethod
+    def _media_source_score(
+        post: Dict[str, Any],
+    ) -> float:
+        score = (
+            40
+            if post.get("has_video")
+            else (
+                20
+                if post.get("has_media")
+                else 0
+            )
+        )
+
+        views = int(post.get("views") or 0)
+        forwards = int(post.get("forwards") or 0)
+
+        score += min(
+            math.log10(max(views, 1)) * 3,
+            18,
+        )
+
+        score += min(
+            math.log10(max(forwards, 1)) * 2,
+            8,
+        )
+
+        return score
+
+    def _event_source_multiplier(
+        self,
+        source_ids: List[int],
+        posts: List[Dict[str, Any]],
+    ) -> float:
+        multipliers = []
+
+        for source_id in source_ids:
             username = (
-                str(post.get("channel_username", "") or "")
+                str(
+                    posts[source_id].get(
+                        "channel_username",
+                        "",
+                    )
+                    or ""
+                )
                 .replace("@", "")
                 .strip()
             )
-    
-            views = int(post.get("views") or 0)
-            forwards = int(post.get("forwards") or 0)
-            text_length = len(post.get("text") or "")
-    
-            # Довжина тут не оцінює важливість події.
-            # Вона лише допомагає вибрати інформативніше джерело.
-            score = (
-                min(
-                    math.log10(max(views, 1)) * 5,
-                    25,
-                )
-                + min(
-                    math.log10(max(forwards, 1)) * 3,
-                    10,
-                )
-                + min(text_length / 180, 7)
+
+            multipliers.append(
+                self._get_source_multiplier(username)
             )
-    
-            return score * self._get_source_multiplier(
-                username
-            )
-    
-        @staticmethod
-        def _media_source_score(
-            post: Dict[str, Any],
-        ) -> float:
-            score = (
-                40
-                if post.get("has_video")
-                else (
-                    20
-                    if post.get("has_media")
-                    else 0
-                )
-            )
-    
-            views = int(post.get("views") or 0)
-            forwards = int(post.get("forwards") or 0)
-    
-            score += min(
-                math.log10(max(views, 1)) * 3,
-                18,
-            )
-    
-            score += min(
-                math.log10(max(forwards, 1)) * 2,
-                8,
-            )
-    
-            return score
-    
-        def _event_source_multiplier(
-            self,
-            source_ids: List[int],
-            posts: List[Dict[str, Any]],
-        ) -> float:
-            multipliers = []
-    
-            for source_id in source_ids:
-                username = (
-                    str(
-                        posts[source_id].get(
-                            "channel_username",
-                            "",
-                        )
-                        or ""
+
+        # Не караємо подію за те, що поряд із сильним джерелом
+        # її перепостив слабший агрегатор.
+        return max(multipliers) if multipliers else 1.0
+
+    @staticmethod
+    def _get_source_multiplier(
+        username: str,
+    ) -> float:
+        if username in SOURCE_TIERS:
+            return SOURCE_TIERS[username]
+
+        username_lower = username.lower()
+
+        for source, multiplier in SOURCE_TIERS.items():
+            if source.lower() == username_lower:
+                return multiplier
+
+        return 1.0
+
+    def _call_json_with_cascade(
+        self,
+        prompt: str,
+        max_retries: int,
+        op_name: str,
+        temperature: float = 0.15,
+    ) -> Optional[Dict[str, Any]]:
+        max_retries = max(1, int(max_retries or 1))
+
+        for model in self.models_priority:
+            for attempt in range(1, max_retries + 1):
+                retry_hint = ""
+                if attempt > 1:
+                    retry_hint = (
+                        "\n\nКРИТИЧНО: попередня відповідь не пройшла "
+                        "машинний JSON-парсер. Поверни ЛИШЕ один валідний "
+                        "JSON-об'єкт: подвійні лапки для ключів і рядків, "
+                        "без trailing commas, без Markdown і без пояснень."
                     )
-                    .replace("@", "")
-                    .strip()
-                )
-    
-                multipliers.append(
-                    self._get_source_multiplier(username)
-                )
-    
-            # Не караємо подію за те, що поряд із сильним джерелом
-            # її перепостив слабший агрегатор.
-            return max(multipliers) if multipliers else 1.0
-    
-        @staticmethod
-        def _get_source_multiplier(
-            username: str,
-        ) -> float:
-            if username in SOURCE_TIERS:
-                return SOURCE_TIERS[username]
-    
-            username_lower = username.lower()
-    
-            for source, multiplier in SOURCE_TIERS.items():
-                if source.lower() == username_lower:
-                    return multiplier
-    
-            return 1.0
-    
-        def _call_json_with_cascade(
-            self,
-            prompt: str,
-            max_retries: int,
-            op_name: str,
-            temperature: float = 0.15,
-        ) -> Optional[Dict[str, Any]]:
-            max_retries = max(1, int(max_retries or 1))
-    
-            for model in self.models_priority:
-                for attempt in range(1, max_retries + 1):
-                    retry_hint = ""
-                    if attempt > 1:
-                        retry_hint = (
-                            "\n\nКРИТИЧНО: попередня відповідь не пройшла "
-                            "машинний JSON-парсер. Поверни ЛИШЕ один валідний "
-                            "JSON-об'єкт: подвійні лапки для ключів і рядків, "
-                            "без trailing commas, без Markdown і без пояснень."
-                        )
-    
+
+                try:
+                    logger.info(
+                        f"{op_name}: спроба "
+                        f"{attempt}/{max_retries} "
+                        f"через {model} "
+                        f"(temperature={temperature})"
+                    )
+
+                    response = self.client.models.generate_content(
+                        model=model,
+                        contents=prompt + retry_hint,
+                        config=types.GenerateContentConfig(
+                            response_mime_type="application/json",
+                            temperature=temperature,
+                        ),
+                    )
+
+                    raw_text = self._clean_json_response(
+                        (response.text or "").strip()
+                    )
+
+                    if not raw_text:
+                        raise ValueError("Модель повернула порожню відповідь")
+
                     try:
-                        logger.info(
-                            f"{op_name}: спроба "
-                            f"{attempt}/{max_retries} "
-                            f"через {model} "
-                            f"(temperature={temperature})"
-                        )
-    
-                        response = self.client.models.generate_content(
-                            model=model,
-                            contents=prompt + retry_hint,
-                            config=types.GenerateContentConfig(
-                                response_mime_type="application/json",
-                                temperature=temperature,
-                            ),
-                        )
-    
-                        raw_text = self._clean_json_response(
-                            (response.text or "").strip()
-                        )
-    
-                        if not raw_text:
-                            raise ValueError("Модель повернула порожню відповідь")
-    
-                        try:
-                            data = json.loads(raw_text)
-                        except json.JSONDecodeError as json_error:
-                            logger.warning(
-                                "%s: невалідний JSON від %s, спроба %s/%s: %s",
-                                op_name,
-                                model,
-                                attempt,
-                                max_retries,
-                                json_error,
-                            )
-    
-                            if attempt < max_retries:
-                                time.sleep(min(4 * attempt, 8))
-                                continue
-    
-                            # Після вичерпання спроб цього model переходимо
-                            # до наступного model у cascade.
-                            break
-    
-                        if isinstance(data, dict):
-                            return data
-    
+                        data = json.loads(raw_text)
+                    except json.JSONDecodeError as json_error:
                         logger.warning(
-                            "%s: %s повернув JSON типу %s замість object.",
+                            "%s: невалідний JSON від %s, спроба %s/%s: %s",
                             op_name,
                             model,
-                            type(data).__name__,
+                            attempt,
+                            max_retries,
+                            json_error,
                         )
-    
+
                         if attempt < max_retries:
-                            time.sleep(min(attempt, 2))
+                            time.sleep(min(4 * attempt, 8))
                             continue
-    
+
+                        # Після вичерпання спроб цього model переходимо
+                        # до наступного model у cascade.
                         break
-    
-                    except Exception as e:
-                        err = str(e)
-    
-                        transient_error = any(
-                            x in err
-                            for x in [
-                                "503",
-                                "429",
-                                "UNAVAILABLE",
-                                "ResourceExhausted",
-                            ]
+
+                    if isinstance(data, dict):
+                        return data
+
+                    logger.warning(
+                        "%s: %s повернув JSON типу %s замість object.",
+                        op_name,
+                        model,
+                        type(data).__name__,
+                    )
+
+                    if attempt < max_retries:
+                        time.sleep(min(attempt, 2))
+                        continue
+
+                    break
+
+                except Exception as e:
+                    err = str(e)
+
+                    transient_error = any(
+                        x in err
+                        for x in [
+                            "503",
+                            "429",
+                            "UNAVAILABLE",
+                            "ResourceExhausted",
+                        ]
+                    )
+
+                    model_unavailable = any(
+                        x in err
+                        for x in [
+                            "NOT_FOUND",
+                            "404",
+                        ]
+                    )
+
+                    if transient_error:
+                        logger.warning(
+                            "%s: тимчасова помилка моделі %s, спроба %s/%s: %s",
+                            op_name,
+                            model,
+                            attempt,
+                            max_retries,
+                            e,
                         )
-    
-                        model_unavailable = any(
-                            x in err
-                            for x in [
-                                "NOT_FOUND",
-                                "404",
-                            ]
-                        )
-    
-                        if transient_error:
-                            logger.warning(
-                                "%s: тимчасова помилка моделі %s, спроба %s/%s: %s",
-                                op_name,
-                                model,
-                                attempt,
-                                max_retries,
-                                e,
-                            )
-                            if attempt < max_retries:
-                                time.sleep(min(5 * attempt, 10))
-                                continue
-                            break
-    
-                        if model_unavailable:
-                            logger.warning(
-                                "%s: модель %s недоступна: %s. "
-                                "Переходимо до наступної.",
-                                op_name,
-                                model,
-                                e,
-                            )
-                            break
-    
-                        logger.error(
-                            "Помилка "
-                            f"{op_name} "
-                            f"({model}), спроба {attempt}/{max_retries}: {e}"
-                        )
-    
-                        # Для неочікуваної локальної/SDK помилки одна повторна
-                        # спроба теж корисна. Раніше тут був break уже після 1/2.
                         if attempt < max_retries:
-                            time.sleep(min(2 * attempt, 4))
+                            time.sleep(min(5 * attempt, 10))
                             continue
-    
                         break
-    
-            return None
-    
-        @staticmethod
-        def _history_item_parts(
-            item: Any,
-        ) -> Dict[str, str]:
-            if isinstance(item, dict):
-                # Підтримуємо обидва формати: старий title і фактичну назву
-                # колонки БД published_title.
-                title = str(
-                    item.get("title")
-                    or item.get("published_title")
-                    or ""
-                ).strip()
-                summary = str(item.get("summary") or "").strip()
-                published_at = str(
-                    item.get("published_at")
-                    or item.get("created_at")
-                    or ""
-                ).strip()
-                return {
-                    "title": title,
-                    "summary": summary,
-                    "published_at": published_at,
-                }
-    
-            if isinstance(item, str) and item.strip():
-                return {
-                    "title": item.strip(),
-                    "summary": "",
-                    "published_at": "",
-                }
-    
+
+                    if model_unavailable:
+                        logger.warning(
+                            "%s: модель %s недоступна: %s. "
+                            "Переходимо до наступної.",
+                            op_name,
+                            model,
+                            e,
+                        )
+                        break
+
+                    logger.error(
+                        "Помилка "
+                        f"{op_name} "
+                        f"({model}), спроба {attempt}/{max_retries}: {e}"
+                    )
+
+                    # Для неочікуваної локальної/SDK помилки одна повторна
+                    # спроба теж корисна. Раніше тут був break уже після 1/2.
+                    if attempt < max_retries:
+                        time.sleep(min(2 * attempt, 4))
+                        continue
+
+                    break
+
+        return None
+
+    @staticmethod
+    def _history_item_parts(
+        item: Any,
+    ) -> Dict[str, str]:
+        if isinstance(item, dict):
+            # Підтримуємо обидва формати: старий title і фактичну назву
+            # колонки БД published_title.
+            title = str(
+                item.get("title")
+                or item.get("published_title")
+                or ""
+            ).strip()
+            summary = str(item.get("summary") or "").strip()
+            published_at = str(
+                item.get("published_at")
+                or item.get("created_at")
+                or ""
+            ).strip()
             return {
-                "title": "",
+                "title": title,
+                "summary": summary,
+                "published_at": published_at,
+            }
+
+        if isinstance(item, str) and item.strip():
+            return {
+                "title": item.strip(),
                 "summary": "",
                 "published_at": "",
             }
-    
-        def _prepare_history_entries(
-            self,
-            past_events: Optional[
-                Union[
-                    List[str],
-                    List[Dict[str, str]],
-                ]
-            ],
-        ) -> List[Dict[str, str]]:
-            """
-            Готує компактний архів для LLM і Python-history guard.
-    
-            published_news може містити по кілька рядків на одну реальну подію
-            (по одному на різні source message_id). Не дозволяємо таким рядкам
-            забивати HISTORY_LIMIT однаковими title/summary.
-            """
-            if not past_events:
-                return []
-    
-            unique: List[Dict[str, str]] = []
-            seen = set()
-    
-            for raw_item in past_events:
-                item = self._history_item_parts(raw_item)
-                title = item["title"]
-                summary = item["summary"]
-    
-                if not title and not summary:
-                    continue
-    
-                norm_title = self._normalize_similarity_text(title)
-                norm_summary = self._normalize_similarity_text(summary)
-    
-                # У БД дублікати однієї події зазвичай мають ідентичний summary.
-                # Для коротких/порожніх summary використовуємо title+summary.
-                if len(norm_summary) >= 45:
-                    key = ("summary", norm_summary)
-                else:
-                    key = (
-                        "full",
-                        f"{norm_title} | {norm_summary}".strip(),
-                    )
-    
-                if key in seen:
-                    continue
-    
-                seen.add(key)
-                unique.append(item)
-    
-                if len(unique) >= self.HISTORY_LIMIT:
-                    break
-    
-            raw_count = len(past_events) if isinstance(past_events, list) else 0
-            logger.info(
-                "History context: raw=%s, unique=%s, limit=%s.",
-                raw_count,
-                len(unique),
-                self.HISTORY_LIMIT,
-            )
-    
-            return unique
-    
-        @staticmethod
-        def _history_signature(
-            text: str,
-        ) -> set:
-            """
-            Грубий морфологічно-стійкий fingerprint.
-    
-            Беремо перші 5 символів довших слів, тому
-            'Віткофф'/'Віткоффа', 'Кушнер'/'Кушнера' тощо збігаються,
-            але рішення про дубль усе одно вимагає кількох спільних ознак.
-            """
-            normalized = NewsSummarizer._normalize_similarity_text(text)
-            if not normalized:
-                return set()
-    
-            stop_words = {
-                "або", "але", "без", "був", "була", "були", "буде",
-                "вже", "від", "для", "до", "його", "її", "їх", "між",
-                "над", "перед", "після", "під", "про", "при", "так",
-                "та", "те", "цей", "ця", "це", "через", "що", "щодо",
-                "який", "яка", "які", "із", "зі", "за", "на", "по",
-                "у", "в", "і", "й", "не",
+
+        return {
+            "title": "",
+            "summary": "",
+            "published_at": "",
+        }
+
+    def _prepare_history_entries(
+        self,
+        past_events: Optional[
+            Union[
+                List[str],
+                List[Dict[str, str]],
+            ]
+        ],
+    ) -> List[Dict[str, str]]:
+        """
+        Готує компактний архів для LLM і Python-history guard.
+
+        published_news може містити по кілька рядків на одну реальну подію
+        (по одному на різні source message_id). Не дозволяємо таким рядкам
+        забивати HISTORY_LIMIT однаковими title/summary.
+        """
+        if not past_events:
+            return []
+
+        unique: List[Dict[str, str]] = []
+        seen = set()
+
+        for raw_item in past_events:
+            item = self._history_item_parts(raw_item)
+            title = item["title"]
+            summary = item["summary"]
+
+            if not title and not summary:
+                continue
+
+            norm_title = self._normalize_similarity_text(title)
+            norm_summary = self._normalize_similarity_text(summary)
+
+            # У БД дублікати однієї події зазвичай мають ідентичний summary.
+            # Для коротких/порожніх summary використовуємо title+summary.
+            if len(norm_summary) >= 45:
+                key = ("summary", norm_summary)
+            else:
+                key = (
+                    "full",
+                    f"{norm_title} | {norm_summary}".strip(),
+                )
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+            unique.append(item)
+
+            if len(unique) >= self.HISTORY_LIMIT:
+                break
+
+        raw_count = len(past_events) if isinstance(past_events, list) else 0
+        logger.info(
+            "History context: raw=%s, unique=%s, limit=%s.",
+            raw_count,
+            len(unique),
+            self.HISTORY_LIMIT,
+        )
+
+        return unique
+
+    @staticmethod
+    def _history_signature(
+        text: str,
+    ) -> set:
+        """
+        Грубий морфологічно-стійкий fingerprint.
+
+        Беремо перші 5 символів довших слів, тому
+        'Віткофф'/'Віткоффа', 'Кушнер'/'Кушнера' тощо збігаються,
+        але рішення про дубль усе одно вимагає кількох спільних ознак.
+        """
+        normalized = NewsSummarizer._normalize_similarity_text(text)
+        if not normalized:
+            return set()
+
+        stop_words = {
+            "або", "але", "без", "був", "була", "були", "буде",
+            "вже", "від", "для", "до", "його", "її", "їх", "між",
+            "над", "перед", "після", "під", "про", "при", "так",
+            "та", "те", "цей", "ця", "це", "через", "що", "щодо",
+            "який", "яка", "які", "із", "зі", "за", "на", "по",
+            "у", "в", "і", "й", "не",
+        }
+
+        result = set()
+
+        for token in re.findall(
+            r"[0-9a-zа-яіїєґёъыэ-]{3,}",
+            normalized,
+        ):
+            if token in stop_words:
+                continue
+
+            if token.isdigit() or len(token) < 6:
+                result.add(token)
+            else:
+                result.add(token[:5])
+
+        return result
+
+    def _history_similarity_stats(
+        self,
+        left: str,
+        right: str,
+    ) -> Dict[str, float]:
+        a = self._normalize_similarity_text(left)
+        b = self._normalize_similarity_text(right)
+
+        if not a or not b:
+            return {
+                "seq": 0.0,
+                "common": 0.0,
+                "jaccard": 0.0,
+                "overlap": 0.0,
             }
-    
-            result = set()
-    
-            for token in re.findall(
-                r"[0-9a-zа-яіїєґёъыэ-]{3,}",
-                normalized,
-            ):
-                if token in stop_words:
-                    continue
-    
-                if token.isdigit() or len(token) < 6:
-                    result.add(token)
-                else:
-                    result.add(token[:5])
-    
-            return result
-    
-        def _history_similarity_stats(
-            self,
-            left: str,
-            right: str,
-        ) -> Dict[str, float]:
-            a = self._normalize_similarity_text(left)
-            b = self._normalize_similarity_text(right)
-    
-            if not a or not b:
-                return {
-                    "seq": 0.0,
-                    "common": 0.0,
-                    "jaccard": 0.0,
-                    "overlap": 0.0,
-                }
-    
-            seq_ratio = SequenceMatcher(
-                None,
-                a[:1200],
-                b[:1200],
-            ).ratio()
-    
-            tokens_a = self._history_signature(a)
-            tokens_b = self._history_signature(b)
-    
-            if not tokens_a or not tokens_b:
-                return {
-                    "seq": seq_ratio,
-                    "common": 0.0,
-                    "jaccard": 0.0,
-                    "overlap": 0.0,
-                }
-    
-            common = tokens_a & tokens_b
-            union = tokens_a | tokens_b
-    
+
+        seq_ratio = SequenceMatcher(
+            None,
+            a[:1200],
+            b[:1200],
+        ).ratio()
+
+        tokens_a = self._history_signature(a)
+        tokens_b = self._history_signature(b)
+
+        if not tokens_a or not tokens_b:
             return {
                 "seq": seq_ratio,
-                "common": float(len(common)),
-                "jaccard": len(common) / max(len(union), 1),
-                "overlap": len(common) / max(
-                    min(len(tokens_a), len(tokens_b)),
-                    1,
-                ),
+                "common": 0.0,
+                "jaccard": 0.0,
+                "overlap": 0.0,
             }
-    
-        @staticmethod
-        def _history_age_hours(
-            history: Dict[str, str],
-        ) -> Optional[float]:
-            """Повертає вік history-запису у годинах, якщо timestamp валідний."""
-            raw = str(history.get("published_at") or "").strip()
-            if not raw:
-                return None
-    
-            value = raw.replace("Z", "+00:00")
-            parsed: Optional[datetime] = None
-    
-            # sqlite CURRENT_TIMESTAMP: 2026-09-06 20:59:50
-            # ISO: 2026-09-06T20:59:50+00:00
-            try:
-                parsed = datetime.fromisoformat(value)
-            except ValueError:
-                for fmt in (
-                    "%Y-%m-%d %H:%M:%S",
-                    "%Y-%m-%d %H:%M",
-                    "%Y-%m-%dT%H:%M:%S",
-                    "%Y-%m-%dT%H:%M",
-                ):
-                    try:
-                        parsed = datetime.strptime(value, fmt)
-                        break
-                    except ValueError:
-                        continue
-    
-            if parsed is None:
-                return None
-    
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=timezone.utc)
-            else:
-                parsed = parsed.astimezone(timezone.utc)
-    
-            return max(
-                0.0,
-                (datetime.now(timezone.utc) - parsed).total_seconds() / 3600.0,
-            )
-    
-        @staticmethod
-        def _entity_signature(text: str) -> set:
-            """
-            Власні назви/імена у морфологічно стійкому вигляді.
-    
-            Критично: не вважаємо слова на кшталт "Удар", "Атака", "Російський"
-            або "Перший" сутностями. Саме такі псевдо-сутності раніше давали
-            false-positive між Звягелем, Луцьком, Рівненщиною тощо.
-            """
-            clean = str(text or "")
-            clean = re.sub(r"https?://\S+|t\.me/\S+", " ", clean)
-            clean = re.sub(r"<[^>]+>", " ", clean)
-    
-            generic_exact = {
-                "суд", "сторони", "сама", "слідство", "окрім", "зустріч",
-                "переговори", "візит", "україна", "україни", "україні",
-                "росія", "росії", "сша", "рф", "єс", "нато", "мвс",
-                "уряд", "кабмін", "рада", "президент", "міністр",
-                "генштаб", "зсу", "сбу", "гур",
-            }
-            generic_stems = {
-                "удар", "атака", "вибух", "обстр", "масов", "росій",
-                "украї", "ворог", "перш", "новин", "стало", "повід",
-                "заяв", "компа", "влада", "війсь", "дрони", "дрон",
-                "бпла", "ракет", "пожеж", "загин", "поран", "постр",
-            }
-    
-            result = set()
-            for match in re.finditer(
-                r"\b[A-ZА-ЯІЇЄҐ][A-Za-zА-Яа-яІіЇїЄєҐґ'’\-]{2,}\b",
-                clean,
+
+        common = tokens_a & tokens_b
+        union = tokens_a | tokens_b
+
+        return {
+            "seq": seq_ratio,
+            "common": float(len(common)),
+            "jaccard": len(common) / max(len(union), 1),
+            "overlap": len(common) / max(
+                min(len(tokens_a), len(tokens_b)),
+                1,
+            ),
+        }
+
+    @staticmethod
+    def _history_age_hours(
+        history: Dict[str, str],
+    ) -> Optional[float]:
+        """Повертає вік history-запису у годинах, якщо timestamp валідний."""
+        raw = str(history.get("published_at") or "").strip()
+        if not raw:
+            return None
+
+        value = raw.replace("Z", "+00:00")
+        parsed: Optional[datetime] = None
+
+        # sqlite CURRENT_TIMESTAMP: 2026-09-06 20:59:50
+        # ISO: 2026-09-06T20:59:50+00:00
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            for fmt in (
+                "%Y-%m-%d %H:%M:%S",
+                "%Y-%m-%d %H:%M",
+                "%Y-%m-%dT%H:%M:%S",
+                "%Y-%m-%dT%H:%M",
             ):
-                token = match.group(0)
-                normalized = token.lower().replace("’", "'")
-                if normalized in generic_exact:
+                try:
+                    parsed = datetime.strptime(value, fmt)
+                    break
+                except ValueError:
                     continue
-    
-                stem = normalized if len(normalized) < 6 else normalized[:5]
-                if stem in generic_stems:
-                    continue
-    
-                result.add(stem)
-    
-            return result
-    
-        @staticmethod
-        def _story_signature(text: str) -> set:
-            """Змістові fingerprints без загального новинного шуму."""
-            signature = NewsSummarizer._history_signature(text)
-            generic = {
-                "росій", "украї", "новин", "повід", "заяв", "стало",
-                "атака", "атаку", "удар", "удари", "обстр", "дрон",
-                "дрони", "бпла", "ракет", "ворог", "війсь", "загин",
-                "поран", "постр", "жертв", "пошко", "руйну", "вибух",
-                "пожеж", "масов", "об'єк", "обєкт", "через", "також",
-                "можут", "буде", "було", "були", "після", "проти",
-                "зокре", "серед", "даним", "повід", "викор", "спроб",
-            }
-            return {token for token in signature if token not in generic}
-    
-        @staticmethod
-        def _topic_family_signature(text: str) -> set:
-            t = NewsSummarizer._normalize_similarity_text(text)
-            padded = f" {t} "
-            families = {
-                "cyber_ai": (
-                    "claude", "anthropic", "штучн", "інтелект", "нейромереж",
-                    "кібер", "хакер", "фішинг", "malware", "ai ",
-                ),
-                "attack": (
-                    "обстр", "атак", "удар", "дрон", "бпла", "ракет",
-                    "влуч", "шахед", "вибух",
-                ),
-                "energy": (
-                    "енергет", "електр", "підстанц", "нафт", "нпз", "газ",
-                ),
-                "transport": (
-                    "залізнич", "потяг", "метро", "аеропорт", "порт", "мост",
-                ),
-                "diplomacy": (
-                    "переговор", "зустріч", "саміт", "g20", "мирн", "угод",
-                ),
-                "sanctions": ("санкц", "оліг", "актив", "заморож"),
-                "politics_law": (
-                    "закон", "уряд", "рада", "кабмін", "вибор", "пдв",
-                    "подат", "постан", "рішенн",
-                ),
-                "health_science": (
-                    "дослід", "вчен", "ризик", "рак ", "онколог", "медицин",
-                    "лікуван", "здоров",
-                ),
-                "defense_industry": (
-                    "виробниц", "контракт", "ракета", "дрон", "озброєн",
-                    "перехоп", "рсзв", "patriot",
-                ),
-                "crime": (
-                    "затрим", "обшук", "підозр", "шахрай", "злочин", "суд",
-                ),
-            }
-            found = set()
-            for family, needles in families.items():
-                if any(needle in padded for needle in needles):
-                    found.add(family)
-    
-            # Не додаємо physical-attack family лише через слово "кібератака".
-            if "cyber_ai" in found and "attack" in found:
-                physical = (
-                    "обстр", " удар", "удар ", "дрон", "бпла",
-                    "ракет", "влуч", "вибух", "шахед",
-                )
-                if not any(marker in padded for marker in physical):
-                    found.discard("attack")
-    
-            return found
-    
-        @staticmethod
-        def _attack_specific_entity_signature(text: str) -> set:
-            entities = NewsSummarizer._entity_signature(text)
-            # Для атак військові/державні органи — занадто загальні якорі.
-            generic = {
-                "сбу", "гур", "зсу", "мвс", "нато", "сша", "геншт",
-                "росій", "украї",
-            }
-            return {item for item in entities if item not in generic}
-    
-        @staticmethod
-        def _attack_anchor_signature(text: str) -> set:
-            """Конкретні якорі атаки: місце/ціль/об'єкт, а не сам факт удару."""
-            anchors = set(NewsSummarizer._attack_specific_entity_signature(text))
-            content = NewsSummarizer._story_signature(text)
-            attack_noise = {
-                "атак", "удар", "обстр", "дрон", "бпла", "ракет", "влуч",
-                "шахед", "вибух", "загин", "поран", "постр", "жертв",
-                "пошко", "руйну", "масов", "війсь", "росій", "украї",
-                "нічн", "повіт", "сили", "засоб", "наслі", "людей",
-            }
-            anchors.update(token for token in content if token not in attack_noise)
-            return anchors
-    
-        def _attack_same_story_anchor_match(
-            self,
-            current_text: str,
-            history_text: str,
-        ) -> bool:
-            if not (
-                self._looks_like_attack_text(current_text)
-                and self._looks_like_attack_text(history_text)
-            ):
-                return False
-    
-            stats = self._history_similarity_stats(current_text, history_text)
-            shared_entities = (
-                self._attack_specific_entity_signature(current_text)
-                & self._attack_specific_entity_signature(history_text)
+
+        if parsed is None:
+            return None
+
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        else:
+            parsed = parsed.astimezone(timezone.utc)
+
+        return max(
+            0.0,
+            (datetime.now(timezone.utc) - parsed).total_seconds() / 3600.0,
+        )
+
+    @staticmethod
+    def _entity_signature(text: str) -> set:
+        """
+        Власні назви/імена у морфологічно стійкому вигляді.
+
+        Критично: не вважаємо слова на кшталт "Удар", "Атака", "Російський"
+        або "Перший" сутностями. Саме такі псевдо-сутності раніше давали
+        false-positive між Звягелем, Луцьком, Рівненщиною тощо.
+        """
+        clean = str(text or "")
+        clean = re.sub(r"https?://\S+|t\.me/\S+", " ", clean)
+        clean = re.sub(r"<[^>]+>", " ", clean)
+
+        generic_exact = {
+            "суд", "сторони", "сама", "слідство", "окрім", "зустріч",
+            "переговори", "візит", "україна", "україни", "україні",
+            "росія", "росії", "сша", "рф", "єс", "нато", "мвс",
+            "уряд", "кабмін", "рада", "президент", "міністр",
+            "генштаб", "зсу", "сбу", "гур",
+        }
+        generic_stems = {
+            "удар", "атака", "вибух", "обстр", "масов", "росій",
+            "украї", "ворог", "перш", "новин", "стало", "повід",
+            "заяв", "компа", "влада", "війсь", "дрони", "дрон",
+            "бпла", "ракет", "пожеж", "загин", "поран", "постр",
+        }
+
+        result = set()
+        for match in re.finditer(
+            r"\b[A-ZА-ЯІЇЄҐ][A-Za-zА-Яа-яІіЇїЄєҐґ'’\-]{2,}\b",
+            clean,
+        ):
+            token = match.group(0)
+            normalized = token.lower().replace("’", "'")
+            if normalized in generic_exact:
+                continue
+
+            stem = normalized if len(normalized) < 6 else normalized[:5]
+            if stem in generic_stems:
+                continue
+
+            result.add(stem)
+
+        return result
+
+    @staticmethod
+    def _story_signature(text: str) -> set:
+        """Змістові fingerprints без загального новинного шуму."""
+        signature = NewsSummarizer._history_signature(text)
+        generic = {
+            "росій", "украї", "новин", "повід", "заяв", "стало",
+            "атака", "атаку", "удар", "удари", "обстр", "дрон",
+            "дрони", "бпла", "ракет", "ворог", "війсь", "загин",
+            "поран", "постр", "жертв", "пошко", "руйну", "вибух",
+            "пожеж", "масов", "об'єк", "обєкт", "через", "також",
+            "можут", "буде", "було", "були", "після", "проти",
+            "зокре", "серед", "даним", "повід", "викор", "спроб",
+        }
+        return {token for token in signature if token not in generic}
+
+    @staticmethod
+    def _topic_family_signature(text: str) -> set:
+        t = NewsSummarizer._normalize_similarity_text(text)
+        padded = f" {t} "
+        families = {
+            "cyber_ai": (
+                "claude", "anthropic", "штучн", "інтелект", "нейромереж",
+                "кібер", "хакер", "фішинг", "malware", "ai ",
+            ),
+            "attack": (
+                "обстр", "атак", "удар", "дрон", "бпла", "ракет",
+                "влуч", "шахед", "вибух",
+            ),
+            "energy": (
+                "енергет", "електр", "підстанц", "нафт", "нпз", "газ",
+            ),
+            "transport": (
+                "залізнич", "потяг", "метро", "аеропорт", "порт", "мост",
+            ),
+            "diplomacy": (
+                "переговор", "зустріч", "саміт", "g20", "мирн", "угод",
+            ),
+            "sanctions": ("санкц", "оліг", "актив", "заморож"),
+            "politics_law": (
+                "закон", "уряд", "рада", "кабмін", "вибор", "пдв",
+                "подат", "постан", "рішенн",
+            ),
+            "health_science": (
+                "дослід", "вчен", "ризик", "рак ", "онколог", "медицин",
+                "лікуван", "здоров",
+            ),
+            "defense_industry": (
+                "виробниц", "контракт", "ракета", "дрон", "озброєн",
+                "перехоп", "рсзв", "patriot",
+            ),
+            "crime": (
+                "затрим", "обшук", "підозр", "шахрай", "злочин", "суд",
+            ),
+        }
+        found = set()
+        for family, needles in families.items():
+            if any(needle in padded for needle in needles):
+                found.add(family)
+
+        # Не додаємо physical-attack family лише через слово "кібератака".
+        if "cyber_ai" in found and "attack" in found:
+            physical = (
+                "обстр", " удар", "удар ", "дрон", "бпла",
+                "ракет", "влуч", "вибух", "шахед",
             )
-            shared_anchors = (
-                self._attack_anchor_signature(current_text)
-                & self._attack_anchor_signature(history_text)
-            )
-    
-            # Один конкретний спільний топонім/об'єкт + змістова підтримка.
-            if (
-                len(shared_entities) >= 1
-                and stats["common"] >= 3
-                and (
-                    stats["overlap"] >= 0.20
-                    or stats["jaccard"] >= 0.12
-                    or stats["seq"] >= 0.38
-                    or len(shared_anchors) >= 2
-                )
-            ):
-                return True
-    
-            # Якщо власна назва загубилась у переказі, потрібні щонайменше
-            # три конкретні спільні якорі. Це навмисно суворо.
-            if (
-                len(shared_anchors) >= 3
-                and stats["common"] >= 5
-                and (
-                    stats["overlap"] >= 0.28
-                    or stats["jaccard"] >= 0.16
-                    or stats["seq"] >= 0.46
-                )
-            ):
-                return True
-    
+            if not any(marker in padded for marker in physical):
+                found.discard("attack")
+
+        return found
+
+    @staticmethod
+    def _attack_specific_entity_signature(text: str) -> set:
+        entities = NewsSummarizer._entity_signature(text)
+        # Для атак військові/державні органи — занадто загальні якорі.
+        generic = {
+            "сбу", "гур", "зсу", "мвс", "нато", "сша", "геншт",
+            "росій", "украї",
+        }
+        return {item for item in entities if item not in generic}
+
+    @staticmethod
+    def _attack_anchor_signature(text: str) -> set:
+        """Конкретні якорі атаки: місце/ціль/об'єкт, а не сам факт удару."""
+        anchors = set(NewsSummarizer._attack_specific_entity_signature(text))
+        content = NewsSummarizer._story_signature(text)
+        attack_noise = {
+            "атак", "удар", "обстр", "дрон", "бпла", "ракет", "влуч",
+            "шахед", "вибух", "загин", "поран", "постр", "жертв",
+            "пошко", "руйну", "масов", "війсь", "росій", "украї",
+            "нічн", "повіт", "сили", "засоб", "наслі", "людей",
+        }
+        anchors.update(token for token in content if token not in attack_noise)
+        return anchors
+
+    def _attack_same_story_anchor_match(
+        self,
+        current_text: str,
+        history_text: str,
+    ) -> bool:
+        if not (
+            self._looks_like_attack_text(current_text)
+            and self._looks_like_attack_text(history_text)
+        ):
             return False
-    
-        def _semantic_story_duplicate(
-            self,
-            event: Dict[str, Any],
-            history: Dict[str, str],
-        ) -> bool:
-            """
-            Консервативний semantic-anchor matcher.
-    
-            Він ловить переписані сюжети на кшталт Claude/Anthropic, але для атак
-            делегує рішення окремому строгому matcher-у, щоб не склеювати різні
-            удари лише через слова "дрон/ракета/РФ".
-            """
-            current_text = self._event_text_bundle(event)
-            history_text = " ".join(
-                value
-                for value in [
-                    str(history.get("title") or ""),
-                    str(history.get("summary") or ""),
-                ]
-                if value
+
+        stats = self._history_similarity_stats(current_text, history_text)
+        shared_entities = (
+            self._attack_specific_entity_signature(current_text)
+            & self._attack_specific_entity_signature(history_text)
+        )
+        shared_anchors = (
+            self._attack_anchor_signature(current_text)
+            & self._attack_anchor_signature(history_text)
+        )
+
+        # Один конкретний спільний топонім/об'єкт + змістова підтримка.
+        if (
+            len(shared_entities) >= 1
+            and stats["common"] >= 3
+            and (
+                stats["overlap"] >= 0.20
+                or stats["jaccard"] >= 0.12
+                or stats["seq"] >= 0.38
+                or len(shared_anchors) >= 2
             )
-            if not current_text or not history_text:
-                return False
-    
-            current_is_attack = self._event_is_physical_attack(event)
-            history_is_attack = self._looks_like_attack_text(history_text)
-            if current_is_attack:
-                if not history_is_attack:
-                    return False
-                return self._attack_same_story_anchor_match(
-                    current_text,
-                    history_text,
-                )
-    
-            stats = self._history_similarity_stats(current_text, history_text)
-            shared_entities = (
-                self._entity_signature(current_text)
-                & self._entity_signature(history_text)
+        ):
+            return True
+
+        # Якщо власна назва загубилась у переказі, потрібні щонайменше
+        # три конкретні спільні якорі. Це навмисно суворо.
+        if (
+            len(shared_anchors) >= 3
+            and stats["common"] >= 5
+            and (
+                stats["overlap"] >= 0.28
+                or stats["jaccard"] >= 0.16
+                or stats["seq"] >= 0.46
             )
-            shared_story = (
-                self._story_signature(current_text)
-                & self._story_signature(history_text)
-            )
-            shared_topics = (
-                self._topic_family_signature(current_text)
-                & self._topic_family_signature(history_text)
-            )
-    
-            # Два конкретні спільні entity + спільна тема — дуже сильний сигнал.
-            if (
-                len(shared_entities) >= 2
-                and len(shared_topics) >= 1
-                and len(shared_story) >= 2
-            ):
-                return True
-    
-            # Один унікальний бренд/продукт/організація (Claude, Anthropic тощо)
-            # + кілька змістових збігів + та сама тематична сім'я.
-            if (
-                len(shared_entities) >= 1
-                and len(shared_topics) >= 1
-                and len(shared_story) >= 2
-                and (
-                    stats["common"] >= 5
-                    or stats["overlap"] >= 0.30
-                    or stats["jaccard"] >= 0.18
-                )
-            ):
-                return True
-    
-            # Без entity дозволяємо лише дуже насичений змістовий збіг.
-            if (
-                len(shared_topics) >= 1
-                and len(shared_story) >= 6
-                and stats["common"] >= 8
-                and (
-                    stats["overlap"] >= 0.42
-                    or stats["jaccard"] >= 0.24
-                    or stats["seq"] >= 0.62
-                )
-            ):
-                return True
-    
+        ):
+            return True
+
+        return False
+
+    def _semantic_story_duplicate(
+        self,
+        event: Dict[str, Any],
+        history: Dict[str, str],
+    ) -> bool:
+        """
+        Консервативний semantic-anchor matcher.
+
+        Він ловить переписані сюжети на кшталт Claude/Anthropic, але для атак
+        делегує рішення окремому строгому matcher-у, щоб не склеювати різні
+        удари лише через слова "дрон/ракета/РФ".
+        """
+        current_text = self._event_text_bundle(event)
+        history_text = " ".join(
+            value
+            for value in [
+                str(history.get("title") or ""),
+                str(history.get("summary") or ""),
+            ]
+            if value
+        )
+        if not current_text or not history_text:
             return False
-    
-        def _is_recent_attack_continuation(
-            self,
-            event: Dict[str, Any],
-            history: Dict[str, str],
-        ) -> bool:
-            """
-            Продовження ТІЄЇ САМОЇ атаки у сусідньому випуску.
-    
-            Старий варіант дозволяв одному випадковому capitalized-word + кільком
-            загальним attack-stems склеювати різні міста. Тепер обов'язковий
-            конкретний спільний якір місця/цілі/об'єкта.
-            """
-            age_hours = self._history_age_hours(history)
-            if age_hours is None or age_hours > self.ADJACENT_DUPLICATE_LOCK_HOURS:
+
+        current_is_attack = self._event_is_physical_attack(event)
+        history_is_attack = self._looks_like_attack_text(history_text)
+        if current_is_attack:
+            if not history_is_attack:
                 return False
-    
-            if not self._event_is_physical_attack(event):
+            return self._attack_same_story_anchor_match(
+                current_text,
+                history_text,
+            )
+
+        stats = self._history_similarity_stats(current_text, history_text)
+        shared_entities = (
+            self._entity_signature(current_text)
+            & self._entity_signature(history_text)
+        )
+        shared_story = (
+            self._story_signature(current_text)
+            & self._story_signature(history_text)
+        )
+        shared_topics = (
+            self._topic_family_signature(current_text)
+            & self._topic_family_signature(history_text)
+        )
+
+        # Два конкретні спільні entity + спільна тема — дуже сильний сигнал.
+        if (
+            len(shared_entities) >= 2
+            and len(shared_topics) >= 1
+            and len(shared_story) >= 2
+        ):
+            return True
+
+        # Один унікальний бренд/продукт/організація (Claude, Anthropic тощо)
+        # + кілька змістових збігів + та сама тематична сім'я.
+        if (
+            len(shared_entities) >= 1
+            and len(shared_topics) >= 1
+            and len(shared_story) >= 2
+            and (
+                stats["common"] >= 5
+                or stats["overlap"] >= 0.30
+                or stats["jaccard"] >= 0.18
+            )
+        ):
+            return True
+
+        # Без entity дозволяємо лише дуже насичений змістовий збіг.
+        if (
+            len(shared_topics) >= 1
+            and len(shared_story) >= 6
+            and stats["common"] >= 8
+            and (
+                stats["overlap"] >= 0.42
+                or stats["jaccard"] >= 0.24
+                or stats["seq"] >= 0.62
+            )
+        ):
+            return True
+
+        return False
+
+    def _is_recent_attack_continuation(
+        self,
+        event: Dict[str, Any],
+        history: Dict[str, str],
+    ) -> bool:
+        """
+        Продовження ТІЄЇ САМОЇ атаки у сусідньому випуску.
+
+        Старий варіант дозволяв одному випадковому capitalized-word + кільком
+        загальним attack-stems склеювати різні міста. Тепер обов'язковий
+        конкретний спільний якір місця/цілі/об'єкта.
+        """
+        age_hours = self._history_age_hours(history)
+        if age_hours is None or age_hours > self.ADJACENT_DUPLICATE_LOCK_HOURS:
+            return False
+
+        if not self._event_is_physical_attack(event):
+            return False
+
+        current_text = self._event_text_bundle(event)
+        history_text = " ".join(
+            value
+            for value in [
+                str(history.get("title") or ""),
+                str(history.get("summary") or ""),
+            ]
+            if value
+        )
+
+        if not self._attack_same_story_anchor_match(current_text, history_text):
+            return False
+
+        shared_entities = (
+            self._attack_specific_entity_signature(current_text)
+            & self._attack_specific_entity_signature(history_text)
+        )
+        shared_anchors = (
+            self._attack_anchor_signature(current_text)
+            & self._attack_anchor_signature(history_text)
+        )
+
+        # Хоча базовий matcher уже суворий, для continuation залишаємо
+        # додаткову вимогу: або конкретна спільна власна назва, або 3+ anchors.
+        return bool(shared_entities) or len(shared_anchors) >= 3
+
+    def _is_recent_hard_duplicate(
+        self,
+        event: Dict[str, Any],
+        history: Dict[str, str],
+    ) -> bool:
+        """Дуже сильний збіг тієї самої історії у сусідньому випуску."""
+        age_hours = self._history_age_hours(history)
+        if age_hours is None or age_hours > self.ADJACENT_DUPLICATE_LOCK_HOURS:
+            return False
+
+        headline = str(event.get("headline_hint") or "").strip()
+        summary = str(event.get("summary") or "").strip()
+        facts = event.get("key_facts")
+        facts_text = ""
+        if isinstance(facts, list):
+            facts_text = " ".join(
+                str(value).strip()
+                for value in facts[:6]
+                if str(value).strip()
+            )
+
+        history_title = str(history.get("title") or "").strip()
+        history_summary = str(history.get("summary") or "").strip()
+
+        title_stats = self._history_similarity_stats(headline, history_title)
+        summary_stats = self._history_similarity_stats(
+            summary or facts_text,
+            history_summary,
+        )
+
+        if (
+            title_stats["seq"] >= 0.84
+            and title_stats["common"] >= 4
+            and title_stats["overlap"] >= 0.70
+        ):
+            return True
+
+        if (
+            title_stats["common"] >= 5
+            and title_stats["overlap"] >= 0.80
+            and title_stats["jaccard"] >= 0.44
+        ):
+            return True
+
+        current_full = " ".join(
+            value for value in [headline, summary, facts_text] if value
+        )
+        history_full = " ".join(
+            value for value in [history_title, history_summary] if value
+        )
+
+        # Для фізичних атак — тільки строгий location/target anchor matcher.
+        # Technology/cyber event не вважаємо фізичною атакою лише через слова
+        # "ракети/дрони" в переліку можливих застосувань.
+        current_attack = self._event_is_physical_attack(event)
+        history_attack = self._looks_like_attack_text(history_full)
+        if current_attack:
+            if not history_attack:
                 return False
-    
-            current_text = self._event_text_bundle(event)
-            history_text = " ".join(
-                value
-                for value in [
-                    str(history.get("title") or ""),
-                    str(history.get("summary") or ""),
-                ]
-                if value
+            return self._attack_same_story_anchor_match(
+                current_full,
+                history_full,
+            ) and (
+                summary_stats["common"] >= 6
+                or title_stats["common"] >= 4
+                or summary_stats["seq"] >= 0.58
             )
-    
-            if not self._attack_same_story_anchor_match(current_text, history_text):
-                return False
-    
-            shared_entities = (
-                self._attack_specific_entity_signature(current_text)
-                & self._attack_specific_entity_signature(history_text)
+
+        shared_entities = (
+            self._entity_signature(current_full)
+            & self._entity_signature(history_full)
+        )
+
+        if (
+            summary_stats["common"] >= 9
+            and summary_stats["overlap"] >= 0.38
+            and len(shared_entities) >= 2
+        ):
+            return True
+
+        if (
+            summary_stats["common"] >= 14
+            and summary_stats["jaccard"] >= 0.24
+            and len(shared_entities) >= 2
+        ):
+            return True
+
+        # Семантичні (але не lexical-hard) збіги нижче обробляє окремий
+        # soft matcher + HISTORY_REVIEW, щоб модель могла виправити false-positive.
+        return False
+
+    def _event_matches_history_entry(
+        self,
+        event: Dict[str, Any],
+        history: Dict[str, str],
+    ) -> bool:
+        headline = str(event.get("headline_hint") or "").strip()
+        summary = str(event.get("summary") or "").strip()
+
+        facts = event.get("key_facts")
+        facts_text = ""
+        if isinstance(facts, list):
+            facts_text = " ".join(
+                str(value).strip()
+                for value in facts[:6]
+                if str(value).strip()
             )
-            shared_anchors = (
-                self._attack_anchor_signature(current_text)
-                & self._attack_anchor_signature(history_text)
+
+        history_title = history.get("title", "")
+        history_summary = history.get("summary", "")
+
+        title_stats = self._history_similarity_stats(
+            headline,
+            history_title,
+        )
+        summary_stats = self._history_similarity_stats(
+            summary or facts_text,
+            history_summary,
+        )
+
+        title_strong = (
+            title_stats["seq"] >= 0.84
+            or (
+                title_stats["common"] >= 4
+                and title_stats["overlap"] >= 0.75
+                and title_stats["jaccard"] >= 0.50
             )
-    
-            # Хоча базовий matcher уже суворий, для continuation залишаємо
-            # додаткову вимогу: або конкретна спільна власна назва, або 3+ anchors.
-            return bool(shared_entities) or len(shared_anchors) >= 3
-    
-        def _is_recent_hard_duplicate(
-            self,
-            event: Dict[str, Any],
-            history: Dict[str, str],
-        ) -> bool:
-            """Дуже сильний збіг тієї самої історії у сусідньому випуску."""
-            age_hours = self._history_age_hours(history)
-            if age_hours is None or age_hours > self.ADJACENT_DUPLICATE_LOCK_HOURS:
-                return False
-    
-            headline = str(event.get("headline_hint") or "").strip()
-            summary = str(event.get("summary") or "").strip()
-            facts = event.get("key_facts")
-            facts_text = ""
-            if isinstance(facts, list):
-                facts_text = " ".join(
-                    str(value).strip()
-                    for value in facts[:6]
-                    if str(value).strip()
-                )
-    
-            history_title = str(history.get("title") or "").strip()
-            history_summary = str(history.get("summary") or "").strip()
-    
-            title_stats = self._history_similarity_stats(headline, history_title)
-            summary_stats = self._history_similarity_stats(
-                summary or facts_text,
-                history_summary,
-            )
-    
-            if (
-                title_stats["seq"] >= 0.84
-                and title_stats["common"] >= 4
-                and title_stats["overlap"] >= 0.70
-            ):
-                return True
-    
-            if (
-                title_stats["common"] >= 5
+            or (
+                title_stats["common"] >= 3
                 and title_stats["overlap"] >= 0.80
-                and title_stats["jaccard"] >= 0.44
+                and title_stats["seq"] >= 0.60
+            )
+        )
+
+        title_support = (
+            title_stats["seq"] >= 0.56
+            or (
+                title_stats["common"] >= 3
+                and title_stats["overlap"] >= 0.55
+            )
+        )
+
+        summary_strong = (
+            summary_stats["seq"] >= 0.76
+            or (
+                summary_stats["common"] >= 8
+                and summary_stats["overlap"] >= 0.62
+                and summary_stats["jaccard"] >= 0.34
+            )
+            or (
+                summary_stats["common"] >= 6
+                and summary_stats["overlap"] >= 0.72
+                and summary_stats["jaccard"] >= 0.38
+            )
+        )
+
+        summary_support = (
+            summary_stats["seq"] >= 0.52
+            or (
+                summary_stats["common"] >= 6
+                and summary_stats["overlap"] >= 0.45
+            )
+        )
+
+        # Якщо обидві сторони мають title+summary, зазвичай вимагаємо
+        # підтвердження з другого поля. Виняток — майже однаковий достатньо
+        # конкретний заголовок зі спільною числовою ознакою (наприклад,
+        # "майже 400 кажанів"): різні перекази summary не мають сховати дубль.
+        if headline and history_title:
+            current_numbers = set(
+                re.findall(r"\b\d+(?:[.,]\d+)?\b", headline)
+            )
+            history_numbers = set(
+                re.findall(r"\b\d+(?:[.,]\d+)?\b", history_title)
+            )
+            shared_number = bool(
+                current_numbers & history_numbers
+            )
+
+            title_numeric_exact = (
+                title_stats["seq"] >= 0.90
+                and shared_number
+                and min(
+                    len(self._history_signature(headline)),
+                    len(self._history_signature(history_title)),
+                ) >= 5
+            )
+
+            if title_numeric_exact:
+                return True
+
+            # У свіжій історії дуже близький конкретний заголовок уже є
+            # достатнім сигналом дубля, навіть якщо друге джерело переказало
+            # summary зовсім іншими словами.
+            age_hours = self._history_age_hours(history)
+            recent_title_repeat = (
+                age_hours is not None
+                and age_hours <= self.ADJACENT_DUPLICATE_LOCK_HOURS
+                and title_stats["seq"] >= 0.80
+                and title_stats["common"] >= 4
+                and title_stats["overlap"] >= 0.68
+            )
+
+            if recent_title_repeat:
+                return True
+
+            if title_strong and (
+                not summary
+                or not history_summary
+                or summary_support
             ):
                 return True
-    
-            current_full = " ".join(
-                value for value in [headline, summary, facts_text] if value
-            )
-            history_full = " ".join(
-                value for value in [history_title, history_summary] if value
-            )
-    
-            # Для фізичних атак — тільки строгий location/target anchor matcher.
-            # Technology/cyber event не вважаємо фізичною атакою лише через слова
-            # "ракети/дрони" в переліку можливих застосувань.
-            current_attack = self._event_is_physical_attack(event)
-            history_attack = self._looks_like_attack_text(history_full)
-            if current_attack:
-                if not history_attack:
-                    return False
-                return self._attack_same_story_anchor_match(
-                    current_full,
-                    history_full,
-                ) and (
-                    summary_stats["common"] >= 6
-                    or title_stats["common"] >= 4
-                    or summary_stats["seq"] >= 0.58
-                )
-    
-            shared_entities = (
-                self._entity_signature(current_full)
-                & self._entity_signature(history_full)
-            )
-    
-            if (
-                summary_stats["common"] >= 9
-                and summary_stats["overlap"] >= 0.38
-                and len(shared_entities) >= 2
+
+        if summary and history_summary:
+            if summary_strong and (
+                not headline
+                or not history_title
+                or title_support
             ):
                 return True
-    
-            if (
-                summary_stats["common"] >= 14
-                and summary_stats["jaccard"] >= 0.24
-                and len(shared_entities) >= 2
-            ):
-                return True
-    
-            # Семантичні (але не lexical-hard) збіги нижче обробляє окремий
-            # soft matcher + HISTORY_REVIEW, щоб модель могла виправити false-positive.
-            return False
-    
-        def _event_matches_history_entry(
-            self,
-            event: Dict[str, Any],
-            history: Dict[str, str],
-        ) -> bool:
-            headline = str(event.get("headline_hint") or "").strip()
-            summary = str(event.get("summary") or "").strip()
-    
-            facts = event.get("key_facts")
-            facts_text = ""
-            if isinstance(facts, list):
-                facts_text = " ".join(
-                    str(value).strip()
-                    for value in facts[:6]
-                    if str(value).strip()
-                )
-    
-            history_title = history.get("title", "")
-            history_summary = history.get("summary", "")
-    
-            title_stats = self._history_similarity_stats(
-                headline,
-                history_title,
+
+        # Для історичних записів без окремого title/summary дозволяємо
+        # дуже сильний збіг одного інформативного поля.
+        if not history_summary and title_stats["seq"] >= 0.90:
+            return True
+        if not history_title and summary_stats["seq"] >= 0.88:
+            return True
+
+        # Переписаний заголовок/summary, але той самий базовий сюжет.
+        # Для атак цей helper уже вимагає конкретний збіг location/target.
+        if self._semantic_story_duplicate(event, history):
+            return True
+
+        return False
+
+    def _deduplicate_current_events(
+        self,
+        events: List[Dict[str, Any]],
+        posts: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """
+        Детерміновано склеює дублікати всередині одного циклу.
+
+        Analyzer зазвичай сам групує source_ids, але при великому контексті
+        може повернути одну реальну подію двома event_id. Не покладаємось
+        лише на event_id: спочатку перевіряємо source overlap/старий matcher,
+        потім — той самий консервативний title+summary matcher, що й history.
+        """
+        result: List[Dict[str, Any]] = []
+        merged_count = 0
+
+        for raw_event in events or []:
+            if not isinstance(raw_event, dict):
+                continue
+
+            candidate = dict(raw_event)
+            candidate["source_ids"] = self._valid_source_ids(
+                candidate.get("source_ids"),
+                posts,
             )
-            summary_stats = self._history_similarity_stats(
-                summary or facts_text,
-                history_summary,
+
+            match_idx = self._find_matching_event_index(
+                result,
+                candidate,
+                posts,
             )
-    
-            title_strong = (
-                title_stats["seq"] >= 0.84
-                or (
-                    title_stats["common"] >= 4
-                    and title_stats["overlap"] >= 0.75
-                    and title_stats["jaccard"] >= 0.50
-                )
-                or (
-                    title_stats["common"] >= 3
-                    and title_stats["overlap"] >= 0.80
-                    and title_stats["seq"] >= 0.60
-                )
-            )
-    
-            title_support = (
-                title_stats["seq"] >= 0.56
-                or (
-                    title_stats["common"] >= 3
-                    and title_stats["overlap"] >= 0.55
-                )
-            )
-    
-            summary_strong = (
-                summary_stats["seq"] >= 0.76
-                or (
-                    summary_stats["common"] >= 8
-                    and summary_stats["overlap"] >= 0.62
-                    and summary_stats["jaccard"] >= 0.34
-                )
-                or (
-                    summary_stats["common"] >= 6
-                    and summary_stats["overlap"] >= 0.72
-                    and summary_stats["jaccard"] >= 0.38
-                )
-            )
-    
-            summary_support = (
-                summary_stats["seq"] >= 0.52
-                or (
-                    summary_stats["common"] >= 6
-                    and summary_stats["overlap"] >= 0.45
-                )
-            )
-    
-            # Якщо обидві сторони мають title+summary, зазвичай вимагаємо
-            # підтвердження з другого поля. Виняток — майже однаковий достатньо
-            # конкретний заголовок зі спільною числовою ознакою (наприклад,
-            # "майже 400 кажанів"): різні перекази summary не мають сховати дубль.
-            if headline and history_title:
-                current_numbers = set(
-                    re.findall(r"\b\d+(?:[.,]\d+)?\b", headline)
-                )
-                history_numbers = set(
-                    re.findall(r"\b\d+(?:[.,]\d+)?\b", history_title)
-                )
-                shared_number = bool(
-                    current_numbers & history_numbers
-                )
-    
-                title_numeric_exact = (
-                    title_stats["seq"] >= 0.90
-                    and shared_number
-                    and min(
-                        len(self._history_signature(headline)),
-                        len(self._history_signature(history_title)),
-                    ) >= 5
-                )
-    
-                if title_numeric_exact:
-                    return True
-    
-                # У свіжій історії дуже близький конкретний заголовок уже є
-                # достатнім сигналом дубля, навіть якщо друге джерело переказало
-                # summary зовсім іншими словами.
-                age_hours = self._history_age_hours(history)
-                recent_title_repeat = (
-                    age_hours is not None
-                    and age_hours <= self.ADJACENT_DUPLICATE_LOCK_HOURS
-                    and title_stats["seq"] >= 0.80
-                    and title_stats["common"] >= 4
-                    and title_stats["overlap"] >= 0.68
-                )
-    
-                if recent_title_repeat:
-                    return True
-    
-                if title_strong and (
-                    not summary
-                    or not history_summary
-                    or summary_support
-                ):
-                    return True
-    
-            if summary and history_summary:
-                if summary_strong and (
-                    not headline
-                    or not history_title
-                    or title_support
-                ):
-                    return True
-    
-            # Для історичних записів без окремого title/summary дозволяємо
-            # дуже сильний збіг одного інформативного поля.
-            if not history_summary and title_stats["seq"] >= 0.90:
-                return True
-            if not history_title and summary_stats["seq"] >= 0.88:
-                return True
-    
-            # Переписаний заголовок/summary, але той самий базовий сюжет.
-            # Для атак цей helper уже вимагає конкретний збіг location/target.
-            if self._semantic_story_duplicate(event, history):
-                return True
-    
-            return False
-    
-        def _deduplicate_current_events(
-            self,
-            events: List[Dict[str, Any]],
-            posts: List[Dict[str, Any]],
-        ) -> List[Dict[str, Any]]:
-            """
-            Детерміновано склеює дублікати всередині одного циклу.
-    
-            Analyzer зазвичай сам групує source_ids, але при великому контексті
-            може повернути одну реальну подію двома event_id. Не покладаємось
-            лише на event_id: спочатку перевіряємо source overlap/старий matcher,
-            потім — той самий консервативний title+summary matcher, що й history.
-            """
-            result: List[Dict[str, Any]] = []
-            merged_count = 0
-    
-            for raw_event in events or []:
-                if not isinstance(raw_event, dict):
-                    continue
-    
-                candidate = dict(raw_event)
-                candidate["source_ids"] = self._valid_source_ids(
-                    candidate.get("source_ids"),
-                    posts,
-                )
-    
-                match_idx = self._find_matching_event_index(
-                    result,
-                    candidate,
-                    posts,
-                )
-    
-                if match_idx is None:
-                    candidate_history = {
+
+            if match_idx is None:
+                candidate_history = {
+                    "title": str(
+                        candidate.get("headline_hint") or ""
+                    ).strip(),
+                    "summary": str(
+                        candidate.get("summary") or ""
+                    ).strip(),
+                    "published_at": "",
+                }
+
+                for idx, existing in enumerate(result):
+                    existing_history = {
                         "title": str(
-                            candidate.get("headline_hint") or ""
+                            existing.get("headline_hint") or ""
                         ).strip(),
                         "summary": str(
-                            candidate.get("summary") or ""
+                            existing.get("summary") or ""
                         ).strip(),
                         "published_at": "",
                     }
-    
-                    for idx, existing in enumerate(result):
-                        existing_history = {
-                            "title": str(
-                                existing.get("headline_hint") or ""
-                            ).strip(),
-                            "summary": str(
-                                existing.get("summary") or ""
-                            ).strip(),
-                            "published_at": "",
-                        }
-    
-                        if (
-                            self._event_matches_history_entry(
-                                candidate,
-                                existing_history,
-                            )
-                            or self._event_matches_history_entry(
-                                existing,
-                                candidate_history,
-                            )
-                        ):
-                            match_idx = idx
-                            break
-    
-                if match_idx is None:
-                    result.append(candidate)
-                    continue
-    
-                if self._should_keep_priority_events_separate(
-                    result[match_idx],
-                    candidate,
-                    posts,
-                ):
-                    logger.info(
-                        "Current-cycle dedup: не склеюємо різні manual events %s ↔ %s.",
-                        result[match_idx].get("event_id"),
-                        candidate.get("event_id"),
-                    )
-                    result.append(candidate)
-                    continue
-    
-                result[match_idx] = self._merge_events(
-                    result[match_idx],
-                    candidate,
-                    posts,
-                )
-                merged_count += 1
-    
-            if merged_count:
+
+                    if (
+                        self._event_matches_history_entry(
+                            candidate,
+                            existing_history,
+                        )
+                        or self._event_matches_history_entry(
+                            existing,
+                            candidate_history,
+                        )
+                    ):
+                        match_idx = idx
+                        break
+
+            if match_idx is None:
+                result.append(candidate)
+                continue
+
+            if self._should_keep_priority_events_separate(
+                result[match_idx],
+                candidate,
+                posts,
+            ):
                 logger.info(
-                    "Current-cycle dedup: змерджено %s дубльованих event(s).",
-                    merged_count,
+                    "Current-cycle dedup: не склеюємо різні manual events %s ↔ %s.",
+                    result[match_idx].get("event_id"),
+                    candidate.get("event_id"),
                 )
-    
-            return result
-    
-        def _apply_deterministic_history_guard(
-            self,
-            events: List[Dict[str, Any]],
-            posts: List[Dict[str, Any]],
-            past_events: Optional[
-                Union[
-                    List[str],
-                    List[Dict[str, str]],
-                ]
-            ],
-        ) -> List[Dict[str, Any]]:
-            """
-            Python-страховка від міжциклових дублів.
-    
-            LLM лишається відповідальним за силу нового розвитку. Python лише
-            примусово виставляє is_history_repeat=True для дуже схожої вже
-            опублікованої події. Повтор проходить далі лише через строгий
-            substantial-update gate (80+ і реальна зміна наслідків).
-            """
-            history_entries = self._prepare_history_entries(past_events)
-            if not history_entries:
-                return events
-    
-            result: List[Dict[str, Any]] = []
-            forced_matches = 0
-    
-            for raw_event in events or []:
-                if not isinstance(raw_event, dict):
-                    continue
-    
-                event = dict(raw_event)
-                source_ids = self._valid_source_ids(
-                    event.get("source_ids"),
+                result.append(candidate)
+                continue
+
+            result[match_idx] = self._merge_events(
+                result[match_idx],
+                candidate,
+                posts,
+            )
+            merged_count += 1
+
+        if merged_count:
+            logger.info(
+                "Current-cycle dedup: змерджено %s дубльованих event(s).",
+                merged_count,
+            )
+
+        return result
+
+    def _apply_deterministic_history_guard(
+        self,
+        events: List[Dict[str, Any]],
+        posts: List[Dict[str, Any]],
+        past_events: Optional[
+            Union[
+                List[str],
+                List[Dict[str, str]],
+            ]
+        ],
+    ) -> List[Dict[str, Any]]:
+        """
+        Python-страховка від міжциклових дублів.
+
+        LLM лишається відповідальним за силу нового розвитку. Python лише
+        примусово виставляє is_history_repeat=True для дуже схожої вже
+        опублікованої події. Повтор проходить далі лише через строгий
+        substantial-update gate (80+ і реальна зміна наслідків).
+        """
+        history_entries = self._prepare_history_entries(past_events)
+        if not history_entries:
+            return events
+
+        result: List[Dict[str, Any]] = []
+        forced_matches = 0
+
+        for raw_event in events or []:
+            if not isinstance(raw_event, dict):
+                continue
+
+            event = dict(raw_event)
+            source_ids = self._valid_source_ids(
+                event.get("source_ids"),
+                posts,
+            )
+            event["source_ids"] = source_ids
+
+            matched_history: Optional[Dict[str, str]] = None
+            hard_duplicate = False
+            match_method = ""
+            daily_air_defense_locked = False
+            daily_decision_story_locked = False
+
+            for history in history_entries:
+                if self._is_recent_air_defense_summary_duplicate(
+                    event,
                     posts,
-                )
-                event["source_ids"] = source_ids
-    
-                matched_history: Optional[Dict[str, str]] = None
-                hard_duplicate = False
-                match_method = ""
-                daily_air_defense_locked = False
-                daily_decision_story_locked = False
-    
-                for history in history_entries:
-                    if self._is_recent_air_defense_summary_duplicate(
-                        event,
-                        posts,
-                        history,
-                    ):
-                        matched_history = history
-                        hard_duplicate = True
-                        daily_air_defense_locked = True
-                        match_method = "daily_air_defense_summary_24h"
-                        break
-    
-                    if self._is_recent_decision_story_duplicate(
-                        event,
-                        posts,
-                        history,
-                    ):
-                        matched_history = history
-                        hard_duplicate = True
-                        daily_decision_story_locked = True
-                        match_method = "decision_story_24h"
-                        break
-    
-                    if self._is_recent_hard_duplicate(event, history):
-                        matched_history = history
-                        hard_duplicate = True
-                        match_method = "recent_hard_duplicate"
-                        break
-    
-                    if self._is_recent_attack_continuation(event, history):
-                        matched_history = history
-                        match_method = "recent_attack_continuation"
-                        break
-    
-                    if self._semantic_story_duplicate(event, history):
-                        matched_history = history
-                        match_method = "semantic_anchor"
-                        break
-    
-                    if self._event_matches_history_entry(
-                        event,
-                        history,
-                    ):
-                        matched_history = history
-                        match_method = "python_similarity"
-                        break
-    
-                if matched_history is not None:
-                    already_repeat = bool(
-                        event.get("is_history_repeat", False)
-                    )
-    
-                    # КРИТИЧНО ДЛЯ DISCOVERY-RECHECK:
-                    # deterministic guard може знову поставити soft history-match
-                    # уже після того, як перший HISTORY_REVIEW його правильно зняв.
-                    # У такому разі старий history_semantic_reviewed=True більше не
-                    # валідний: новий/повторно встановлений match ОБОВ'ЯЗКОВО має
-                    # ще раз пройти semantic adjudication, інакше ranking відкине
-                    # нормальну нову подію як repeat. Саме це обнулило ранковий
-                    # випуск 23.09 після discovery-pass.
-                    event["history_semantic_reviewed"] = False
-    
-                    event["is_history_repeat"] = True
-                    event["history_hard_duplicate"] = hard_duplicate
-                    event["daily_air_defense_summary_locked"] = (
-                        daily_air_defense_locked
-                    )
-                    event["daily_decision_story_locked"] = (
-                        daily_decision_story_locked
-                    )
-                    event["history_match_method"] = match_method
-                    event["history_match_title"] = matched_history.get(
-                        "title",
-                        "",
-                    )
-                    event["history_match_summary"] = matched_history.get(
-                        "summary",
-                        "",
-                    )
-                    event["history_match_published_at"] = matched_history.get(
-                        "published_at",
-                        "",
-                    )
-    
-                    if not already_repeat:
-                        forced_matches += 1
-    
-                    logger.info(
-                        "History guard: event_id=%s repeat=True hard=%s method=%s "
-                        "update=%.0f current='%s' matched='%s'.",
-                        event.get("event_id"),
-                        hard_duplicate,
-                        match_method,
-                        self._safe_score(
-                            event.get("history_update_strength")
-                        ),
-                        str(
-                            event.get("headline_hint")
-                            or event.get("summary")
-                            or ""
-                        )[:120],
-                        matched_history.get("title", "")[:120],
-                    )
-    
-                result.append(event)
-    
-            if forced_matches:
-                logger.info(
-                    "History guard примусово позначив %s подій як repeat.",
-                    forced_matches,
-                )
-    
-            return result
-    
-        def _history_candidate_score(
-            self,
-            event: Dict[str, Any],
-            history: Dict[str, str],
-        ) -> float:
-            current_text = self._event_text_bundle(event)
-            history_text = " ".join(
-                value
-                for value in [
-                    str(history.get("title") or ""),
-                    str(history.get("summary") or ""),
-                ]
-                if value
-            )
-            if not current_text or not history_text:
-                return 0.0
-    
-            stats = self._history_similarity_stats(current_text, history_text)
-            shared_entities = (
-                self._entity_signature(current_text)
-                & self._entity_signature(history_text)
-            )
-            shared_story = (
-                self._story_signature(current_text)
-                & self._story_signature(history_text)
-            )
-            shared_topics = (
-                self._topic_family_signature(current_text)
-                & self._topic_family_signature(history_text)
-            )
-    
-            current_attack = self._event_is_physical_attack(event)
-            history_attack = self._looks_like_attack_text(history_text)
-            if current_attack:
-                if (
-                    not history_attack
-                    or not self._attack_same_story_anchor_match(
-                        current_text,
-                        history_text,
-                    )
+                    history,
                 ):
-                    return 0.0
-    
-            score = (
-                stats["seq"] * 18.0
-                + stats["overlap"] * 18.0
-                + stats["jaccard"] * 12.0
-                + min(stats["common"], 12.0) * 1.6
-                + min(len(shared_entities), 3) * 14.0
-                + min(len(shared_story), 8) * 1.8
-                + min(len(shared_topics), 2) * 8.0
-            )
-    
-            age_hours = self._history_age_hours(history)
-            if age_hours is not None:
-                if age_hours <= 8:
-                    score += 5.0
-                elif age_hours <= self.SEMANTIC_HISTORY_LOOKBACK_HOURS:
-                    score += 2.0
-                elif age_hours > self.SEMANTIC_HISTORY_LOOKBACK_HOURS:
-                    score -= 8.0
-    
-            # Один спільний політик/бренд без спільної теми — не одна історія.
-            if (
-                len(shared_entities) <= 1
-                and not shared_topics
-                and len(shared_story) < 4
-                and stats["common"] < 6
-                and stats["seq"] < 0.58
-            ):
-                score *= 0.30
-    
-            # Широка тема без конкретної сутності теж не повинна домінувати.
-            if (
-                not shared_entities
-                and len(shared_story) < 5
-                and stats["common"] < 7
-                and stats["seq"] < 0.60
-            ):
-                score *= 0.45
-    
-            if (
-                shared_entities
-                and shared_topics
-                and len(shared_story) >= 2
-            ):
-                score += 10.0
-    
-            return round(max(0.0, score), 2)
-    
-        def _semantic_same_story_plausible(
-            self,
-            event: Dict[str, Any],
-            history: Dict[str, str],
-        ) -> bool:
-            """Sanity-check після HISTORY_REVIEW проти тематичних false-positive."""
-            current_text = self._event_text_bundle(event)
-            history_text = " ".join(
-                value
-                for value in [
-                    str(history.get("title") or ""),
-                    str(history.get("summary") or ""),
-                ]
-                if value
-            )
-            if not current_text or not history_text:
-                return False
-    
-            if self._event_is_physical_attack(event):
-                return (
-                    self._looks_like_attack_text(history_text)
-                    and self._attack_same_story_anchor_match(
-                        current_text,
-                        history_text,
-                    )
+                    matched_history = history
+                    hard_duplicate = True
+                    daily_air_defense_locked = True
+                    match_method = "daily_air_defense_summary_24h"
+                    break
+
+                if self._is_recent_decision_story_duplicate(
+                    event,
+                    posts,
+                    history,
+                ):
+                    matched_history = history
+                    hard_duplicate = True
+                    daily_decision_story_locked = True
+                    match_method = "decision_story_24h"
+                    break
+
+                if self._is_recent_hard_duplicate(event, history):
+                    matched_history = history
+                    hard_duplicate = True
+                    match_method = "recent_hard_duplicate"
+                    break
+
+                if self._is_recent_attack_continuation(event, history):
+                    matched_history = history
+                    match_method = "recent_attack_continuation"
+                    break
+
+                if self._semantic_story_duplicate(event, history):
+                    matched_history = history
+                    match_method = "semantic_anchor"
+                    break
+
+                if self._event_matches_history_entry(
+                    event,
+                    history,
+                ):
+                    matched_history = history
+                    match_method = "python_similarity"
+                    break
+
+            if matched_history is not None:
+                already_repeat = bool(
+                    event.get("is_history_repeat", False)
                 )
-    
+
+                # КРИТИЧНО ДЛЯ DISCOVERY-RECHECK:
+                # deterministic guard може знову поставити soft history-match
+                # уже після того, як перший HISTORY_REVIEW його правильно зняв.
+                # У такому разі старий history_semantic_reviewed=True більше не
+                # валідний: новий/повторно встановлений match ОБОВ'ЯЗКОВО має
+                # ще раз пройти semantic adjudication, інакше ranking відкине
+                # нормальну нову подію як repeat. Саме це обнулило ранковий
+                # випуск 23.09 після discovery-pass.
+                event["history_semantic_reviewed"] = False
+
+                event["is_history_repeat"] = True
+                event["history_hard_duplicate"] = hard_duplicate
+                event["daily_air_defense_summary_locked"] = (
+                    daily_air_defense_locked
+                )
+                event["daily_decision_story_locked"] = (
+                    daily_decision_story_locked
+                )
+                event["history_match_method"] = match_method
+                event["history_match_title"] = matched_history.get(
+                    "title",
+                    "",
+                )
+                event["history_match_summary"] = matched_history.get(
+                    "summary",
+                    "",
+                )
+                event["history_match_published_at"] = matched_history.get(
+                    "published_at",
+                    "",
+                )
+
+                if not already_repeat:
+                    forced_matches += 1
+
+                logger.info(
+                    "History guard: event_id=%s repeat=True hard=%s method=%s "
+                    "update=%.0f current='%s' matched='%s'.",
+                    event.get("event_id"),
+                    hard_duplicate,
+                    match_method,
+                    self._safe_score(
+                        event.get("history_update_strength")
+                    ),
+                    str(
+                        event.get("headline_hint")
+                        or event.get("summary")
+                        or ""
+                    )[:120],
+                    matched_history.get("title", "")[:120],
+                )
+
+            result.append(event)
+
+        if forced_matches:
+            logger.info(
+                "History guard примусово позначив %s подій як repeat.",
+                forced_matches,
+            )
+
+        return result
+
+    def _history_candidate_score(
+        self,
+        event: Dict[str, Any],
+        history: Dict[str, str],
+    ) -> float:
+        current_text = self._event_text_bundle(event)
+        history_text = " ".join(
+            value
+            for value in [
+                str(history.get("title") or ""),
+                str(history.get("summary") or ""),
+            ]
+            if value
+        )
+        if not current_text or not history_text:
+            return 0.0
+
+        stats = self._history_similarity_stats(current_text, history_text)
+        shared_entities = (
+            self._entity_signature(current_text)
+            & self._entity_signature(history_text)
+        )
+        shared_story = (
+            self._story_signature(current_text)
+            & self._story_signature(history_text)
+        )
+        shared_topics = (
+            self._topic_family_signature(current_text)
+            & self._topic_family_signature(history_text)
+        )
+
+        current_attack = self._event_is_physical_attack(event)
+        history_attack = self._looks_like_attack_text(history_text)
+        if current_attack:
             if (
-                self._looks_like_decision_story_text(current_text)
-                and self._looks_like_decision_story_text(history_text)
-            ):
-                return self._same_decision_story(
+                not history_attack
+                or not self._attack_same_story_anchor_match(
                     current_text,
                     history_text,
                 )
-    
-            stats = self._history_similarity_stats(current_text, history_text)
-            shared_entities = (
-                self._entity_signature(current_text)
-                & self._entity_signature(history_text)
+            ):
+                return 0.0
+
+        score = (
+            stats["seq"] * 18.0
+            + stats["overlap"] * 18.0
+            + stats["jaccard"] * 12.0
+            + min(stats["common"], 12.0) * 1.6
+            + min(len(shared_entities), 3) * 14.0
+            + min(len(shared_story), 8) * 1.8
+            + min(len(shared_topics), 2) * 8.0
+        )
+
+        age_hours = self._history_age_hours(history)
+        if age_hours is not None:
+            if age_hours <= 8:
+                score += 5.0
+            elif age_hours <= self.SEMANTIC_HISTORY_LOOKBACK_HOURS:
+                score += 2.0
+            elif age_hours > self.SEMANTIC_HISTORY_LOOKBACK_HOURS:
+                score -= 8.0
+
+        # Один спільний політик/бренд без спільної теми — не одна історія.
+        if (
+            len(shared_entities) <= 1
+            and not shared_topics
+            and len(shared_story) < 4
+            and stats["common"] < 6
+            and stats["seq"] < 0.58
+        ):
+            score *= 0.30
+
+        # Широка тема без конкретної сутності теж не повинна домінувати.
+        if (
+            not shared_entities
+            and len(shared_story) < 5
+            and stats["common"] < 7
+            and stats["seq"] < 0.60
+        ):
+            score *= 0.45
+
+        if (
+            shared_entities
+            and shared_topics
+            and len(shared_story) >= 2
+        ):
+            score += 10.0
+
+        return round(max(0.0, score), 2)
+
+    def _semantic_same_story_plausible(
+        self,
+        event: Dict[str, Any],
+        history: Dict[str, str],
+    ) -> bool:
+        """Sanity-check після HISTORY_REVIEW проти тематичних false-positive."""
+        current_text = self._event_text_bundle(event)
+        history_text = " ".join(
+            value
+            for value in [
+                str(history.get("title") or ""),
+                str(history.get("summary") or ""),
+            ]
+            if value
+        )
+        if not current_text or not history_text:
+            return False
+
+        if self._event_is_physical_attack(event):
+            return (
+                self._looks_like_attack_text(history_text)
+                and self._attack_same_story_anchor_match(
+                    current_text,
+                    history_text,
+                )
             )
-            shared_story = (
-                self._story_signature(current_text)
-                & self._story_signature(history_text)
+
+        if (
+            self._looks_like_decision_story_text(current_text)
+            and self._looks_like_decision_story_text(history_text)
+        ):
+            return self._same_decision_story(
+                current_text,
+                history_text,
             )
-            shared_topics = (
-                self._topic_family_signature(current_text)
-                & self._topic_family_signature(history_text)
-            )
-    
+
+        stats = self._history_similarity_stats(current_text, history_text)
+        shared_entities = (
+            self._entity_signature(current_text)
+            & self._entity_signature(history_text)
+        )
+        shared_story = (
+            self._story_signature(current_text)
+            & self._story_signature(history_text)
+        )
+        shared_topics = (
+            self._topic_family_signature(current_text)
+            & self._topic_family_signature(history_text)
+        )
+
+        if (
+            not shared_entities
+            and len(shared_story) < 5
+            and stats["common"] < 7
+            and stats["seq"] < 0.60
+        ):
+            return False
+
+        if (
+            len(shared_entities) <= 1
+            and not shared_topics
+            and len(shared_story) < 4
+            and stats["common"] < 6
+            and stats["seq"] < 0.58
+        ):
+            return False
+
+        event_type = str(event.get("event_type") or "").strip().lower()
+        if event_type == "science_tech":
             if (
                 not shared_entities
-                and len(shared_story) < 5
-                and stats["common"] < 7
-                and stats["seq"] < 0.60
+                and len(shared_story) < 6
+                and stats["common"] < 8
+                and stats["seq"] < 0.65
             ):
                 return False
-    
-            if (
-                len(shared_entities) <= 1
-                and not shared_topics
-                and len(shared_story) < 4
-                and stats["common"] < 6
-                and stats["seq"] < 0.58
-            ):
-                return False
-    
-            event_type = str(event.get("event_type") or "").strip().lower()
-            if event_type == "science_tech":
-                if (
-                    not shared_entities
-                    and len(shared_story) < 6
-                    and stats["common"] < 8
-                    and stats["seq"] < 0.65
-                ):
-                    return False
-    
-            return True
-    
-        def _semantic_review_source_excerpt(
-            self,
-            event: Dict[str, Any],
-            posts: List[Dict[str, Any]],
-        ) -> str:
-            chunks = []
-            total = 0
-            for source_id in self._valid_source_ids(event.get("source_ids"), posts)[:3]:
-                text = re.sub(
-                    r"\s+",
-                    " ",
-                    str(posts[source_id].get("text") or "").strip(),
-                )
-                if not text:
-                    continue
-                text = self._truncate_plain_text(text, 850)
-                if total + len(text) > 1800:
-                    break
-                chunks.append(text)
-                total += len(text)
-            return " | ".join(chunks)
-    
-        def _apply_semantic_history_review(
-            self,
-            events: List[Dict[str, Any]],
-            posts: List[Dict[str, Any]],
-            past_events: Optional[
-                Union[
-                    List[str],
-                    List[Dict[str, str]],
-                ]
-            ],
-            max_retries: int,
-        ) -> List[Dict[str, Any]]:
-            """
-            Точковий LLM-adjudicator для семантичних дублів.
-    
-            Він НЕ сканує весь архів моделлю. Python спочатку вибирає 1-3
-            найімовірніші history-кандидати. Це дешево, прозоро в логах і дає
-            моделі саме ту задачу, де lexical matcher найслабший: "та сама базова
-            історія чи справді нова подія?".
-            """
-            if not self.SEMANTIC_HISTORY_REVIEW_ENABLED or not events:
-                return events
-    
-            history_entries = self._prepare_history_entries(past_events)
-            if not history_entries:
-                return events
-    
-            result = [dict(ev) for ev in events if isinstance(ev, dict)]
-            cases = []
-            case_map: Dict[str, Dict[str, Any]] = {}
-    
-            for event_index, event in enumerate(result):
-                if event.get("history_semantic_reviewed"):
-                    continue
-    
-                source_ids = self._valid_source_ids(event.get("source_ids"), posts)
-                if any(posts[s].get("is_priority") for s in source_ids):
-                    event["history_semantic_reviewed"] = True
-                    continue
-    
-                forced_title = str(event.get("history_match_title") or "").strip()
-                forced_summary = str(event.get("history_match_summary") or "").strip()
-    
-                scored = []
-                for history_index, history in enumerate(history_entries):
-                    age_hours = self._history_age_hours(history)
-                    forced = bool(
-                        forced_title
-                        and str(history.get("title") or "").strip() == forced_title
-                        and (
-                            not forced_summary
-                            or str(history.get("summary") or "").strip() == forced_summary
-                        )
+
+        return True
+
+    def _semantic_review_source_excerpt(
+        self,
+        event: Dict[str, Any],
+        posts: List[Dict[str, Any]],
+    ) -> str:
+        chunks = []
+        total = 0
+        for source_id in self._valid_source_ids(event.get("source_ids"), posts)[:3]:
+            text = re.sub(
+                r"\s+",
+                " ",
+                str(posts[source_id].get("text") or "").strip(),
+            )
+            if not text:
+                continue
+            text = self._truncate_plain_text(text, 850)
+            if total + len(text) > 1800:
+                break
+            chunks.append(text)
+            total += len(text)
+        return " | ".join(chunks)
+
+    def _apply_semantic_history_review(
+        self,
+        events: List[Dict[str, Any]],
+        posts: List[Dict[str, Any]],
+        past_events: Optional[
+            Union[
+                List[str],
+                List[Dict[str, str]],
+            ]
+        ],
+        max_retries: int,
+    ) -> List[Dict[str, Any]]:
+        """
+        Точковий LLM-adjudicator для семантичних дублів.
+
+        Він НЕ сканує весь архів моделлю. Python спочатку вибирає 1-3
+        найімовірніші history-кандидати. Це дешево, прозоро в логах і дає
+        моделі саме ту задачу, де lexical matcher найслабший: "та сама базова
+        історія чи справді нова подія?".
+        """
+        if not self.SEMANTIC_HISTORY_REVIEW_ENABLED or not events:
+            return events
+
+        history_entries = self._prepare_history_entries(past_events)
+        if not history_entries:
+            return events
+
+        result = [dict(ev) for ev in events if isinstance(ev, dict)]
+        cases = []
+        case_map: Dict[str, Dict[str, Any]] = {}
+
+        for event_index, event in enumerate(result):
+            if event.get("history_semantic_reviewed"):
+                continue
+
+            source_ids = self._valid_source_ids(event.get("source_ids"), posts)
+            if any(posts[s].get("is_priority") for s in source_ids):
+                event["history_semantic_reviewed"] = True
+                continue
+
+            forced_title = str(event.get("history_match_title") or "").strip()
+            forced_summary = str(event.get("history_match_summary") or "").strip()
+
+            scored = []
+            for history_index, history in enumerate(history_entries):
+                age_hours = self._history_age_hours(history)
+                forced = bool(
+                    forced_title
+                    and str(history.get("title") or "").strip() == forced_title
+                    and (
+                        not forced_summary
+                        or str(history.get("summary") or "").strip() == forced_summary
                     )
-    
-                    # Для дуже старих записів review не потрібен, окрім already-matched.
-                    if (
-                        not forced
-                        and age_hours is not None
-                        and age_hours > self.SEMANTIC_HISTORY_LOOKBACK_HOURS
-                    ):
-                        continue
-    
-                    score = self._history_candidate_score(event, history)
-                    if forced:
-                        score = max(score, 999.0)
-    
-                    if (
-                        forced
-                        or score >= self.SEMANTIC_HISTORY_MIN_CANDIDATE_SCORE
-                    ):
-                        scored.append((score, history_index, history))
-    
-                if not scored:
-                    event["history_semantic_reviewed"] = True
-                    continue
-    
-                scored.sort(key=lambda item: item[0], reverse=True)
-                selected = scored[: self.SEMANTIC_HISTORY_CANDIDATES_PER_EVENT]
-    
-                case_id = f"C{len(cases) + 1}"
-                candidate_payload = []
-                candidate_map = {}
-                for candidate_number, (score, history_index, history) in enumerate(
-                    selected,
-                    start=1,
+                )
+
+                # Для дуже старих записів review не потрібен, окрім already-matched.
+                if (
+                    not forced
+                    and age_hours is not None
+                    and age_hours > self.SEMANTIC_HISTORY_LOOKBACK_HOURS
                 ):
-                    candidate_id = f"H{candidate_number}"
-                    candidate_payload.append({
-                        "candidate_id": candidate_id,
-                        "title": history.get("title", ""),
-                        "summary": history.get("summary", ""),
-                        "published_at": history.get("published_at", ""),
-                        "python_candidate_score": score,
-                    })
-                    candidate_map[candidate_id] = history
-    
-                cases.append({
-                    "case_id": case_id,
-                    "current": {
-                        "event_id": str(event.get("event_id") or ""),
-                        "headline": str(event.get("headline_hint") or ""),
-                        "summary": str(event.get("summary") or ""),
-                        "key_facts": event.get("key_facts", []),
-                        "category": str(event.get("category") or ""),
-                        "event_type": str(event.get("event_type") or ""),
-                        "source_excerpt": self._semantic_review_source_excerpt(
-                            event,
-                            posts,
-                        ),
-                    },
-                    "history_candidates": candidate_payload,
+                    continue
+
+                score = self._history_candidate_score(event, history)
+                if forced:
+                    score = max(score, 999.0)
+
+                if (
+                    forced
+                    or score >= self.SEMANTIC_HISTORY_MIN_CANDIDATE_SCORE
+                ):
+                    scored.append((score, history_index, history))
+
+            if not scored:
+                event["history_semantic_reviewed"] = True
+                continue
+
+            scored.sort(key=lambda item: item[0], reverse=True)
+            selected = scored[: self.SEMANTIC_HISTORY_CANDIDATES_PER_EVENT]
+
+            case_id = f"C{len(cases) + 1}"
+            candidate_payload = []
+            candidate_map = {}
+            for candidate_number, (score, history_index, history) in enumerate(
+                selected,
+                start=1,
+            ):
+                candidate_id = f"H{candidate_number}"
+                candidate_payload.append({
+                    "candidate_id": candidate_id,
+                    "title": history.get("title", ""),
+                    "summary": history.get("summary", ""),
+                    "published_at": history.get("published_at", ""),
+                    "python_candidate_score": score,
                 })
-                case_map[case_id] = {
-                    "event_index": event_index,
-                    "candidate_map": candidate_map,
-                    "previous_method": str(event.get("history_match_method") or ""),
-                }
-    
-                if len(cases) >= self.SEMANTIC_HISTORY_REVIEW_MAX_EVENTS:
-                    break
-    
-            # Все, що не потрапило в batch через limit/відсутність кандидатів,
-            # буде перевірене в наступному циклі. Позначаємо reviewed лише cases.
-            if not cases:
-                return result
-    
-            payload = json.dumps(cases, ensure_ascii=False)
-            prompt = f"""
-    Ти — вузький semantic-dedup суддя новинного дайджесту.
-    
-    Для кожного case порівняй CURRENT лише з його HISTORY_CANDIDATES.
-    Треба визначити, чи це ТА САМА БАЗОВА ІСТОРІЯ, а не просто схожа тема.
-    
-    SAME_STORY=true, якщо це той самий:
-    - інцидент / атака / аварія;
-    - офіційний звіт або розслідування;
-    - дослідження;
-    - оголошення / рішення / угода;
-    - операція;
-    - конкретний бізнес/технологічний сюжет.
-    
-    НЕ Є НОВОЮ ПОДІЄЮ:
-    - інший заголовок або інше джерело;
-    - нове фото/відео;
-    - інший кут подачі;
-    - розширений список деталей, методів, можливостей або прикладів із того самого
-      первинного звіту/розслідування;
-    - переказ того самого факту іншими словами.
-    
-    КРИТИЧНО ДЛЯ АТАК:
-    Той самий нападник, тип зброї, область теми або близький час НЕ достатні.
-    SAME_STORY=true лише якщо це та сама конкретна локація/ціль/хвиля атаки
-    або інша чітка унікальна прив'язка. Звягель ≠ Луцьк. Рівненщина ≠ будь-яка
-    інша атака на заході лише через схожі слова.
-    
-    КРИТИЧНО ДЛЯ ПОЛІТИКИ / МІЖНАРОДНИХ / ТЕХНОЛОГІЙ:
-    - одна й та сама людина НЕ означає ту саму історію:
-      "Трамп про НПЗ РФ" ≠ "Зеленський зустрінеться з Трампом";
-    - одна країна або організація НЕ означає ту саму історію;
-    - одна широка тема НЕ означає ту саму історію:
-      "український дрон-перехоплювач" ≠ "в'єтнамський сіткомет проти дронів";
-    - для SAME_STORY має збігатися конкретний предмет: той самий документ,
-      продукт/проєкт, операція, звіт, дослідження, домовленість або інцидент.
-    
-    MATERIAL_UPDATE=true лише коли ПІСЛЯ попередньої публікації з'явився факт,
-    який реально змінює картину: нові значні жертви/наслідки, нове офіційне
-    рішення або юридичний статус, підтверджений результат операції, новий великий
-    об'єкт/результат, фактичний запуск/набуття чинності тощо.
-    
-    КРИТИЧНО ДЛЯ ЗАКОНІВ / САНКЦІЙ / УГОД:
-    - "ухвалили" і "остаточно схвалили/проголосували" — та сама стадія approved;
-    - "передадуть на підпис", "готовий підписати", "планує підписати",
-      "підпише" або "очікує підпису" НЕ означають signed;
-    - signed=true як material update лише якщо документ ФАКТИЧНО підписано;
-    - наступний material update після signed — фактичне набуття чинності/
-      фактичне запровадження санкцій, мит чи інших правил;
-    - повторний переказ того самого пакета з новою цитатою або деталями
-      протягом доби — НЕ material update.
-    
+                candidate_map[candidate_id] = history
+
+            cases.append({
+                "case_id": case_id,
+                "current": {
+                    "event_id": str(event.get("event_id") or ""),
+                    "headline": str(event.get("headline_hint") or ""),
+                    "summary": str(event.get("summary") or ""),
+                    "key_facts": event.get("key_facts", []),
+                    "category": str(event.get("category") or ""),
+                    "event_type": str(event.get("event_type") or ""),
+                    "source_excerpt": self._semantic_review_source_excerpt(
+                        event,
+                        posts,
+                    ),
+                },
+                "history_candidates": candidate_payload,
+            })
+            case_map[case_id] = {
+                "event_index": event_index,
+                "candidate_map": candidate_map,
+                "previous_method": str(event.get("history_match_method") or ""),
+            }
+
+            if len(cases) >= self.SEMANTIC_HISTORY_REVIEW_MAX_EVENTS:
+                break
+
+        # Все, що не потрапило в batch через limit/відсутність кандидатів,
+        # буде перевірене в наступному циклі. Позначаємо reviewed лише cases.
+        if not cases:
+            return result
+
+        payload = json.dumps(cases, ensure_ascii=False)
+        prompt = f"""
+Ти — вузький semantic-dedup суддя новинного дайджесту.
+
+Для кожного case порівняй CURRENT лише з його HISTORY_CANDIDATES.
+Треба визначити, чи це ТА САМА БАЗОВА ІСТОРІЯ, а не просто схожа тема.
+
+SAME_STORY=true, якщо це той самий:
+- інцидент / атака / аварія;
+- офіційний звіт або розслідування;
+- дослідження;
+- оголошення / рішення / угода;
+- операція;
+- конкретний бізнес/технологічний сюжет.
+
+НЕ Є НОВОЮ ПОДІЄЮ:
+- інший заголовок або інше джерело;
+- нове фото/відео;
+- інший кут подачі;
+- розширений список деталей, методів, можливостей або прикладів із того самого
+  первинного звіту/розслідування;
+- переказ того самого факту іншими словами.
+
+КРИТИЧНО ДЛЯ АТАК:
+Той самий нападник, тип зброї, область теми або близький час НЕ достатні.
+SAME_STORY=true лише якщо це та сама конкретна локація/ціль/хвиля атаки
+або інша чітка унікальна прив'язка. Звягель ≠ Луцьк. Рівненщина ≠ будь-яка
+інша атака на заході лише через схожі слова.
+
+КРИТИЧНО ДЛЯ ПОЛІТИКИ / МІЖНАРОДНИХ / ТЕХНОЛОГІЙ:
+- одна й та сама людина НЕ означає ту саму історію:
+  "Трамп про НПЗ РФ" ≠ "Зеленський зустрінеться з Трампом";
+- одна країна або організація НЕ означає ту саму історію;
+- одна широка тема НЕ означає ту саму історію:
+  "український дрон-перехоплювач" ≠ "в'єтнамський сіткомет проти дронів";
+- для SAME_STORY має збігатися конкретний предмет: той самий документ,
+  продукт/проєкт, операція, звіт, дослідження, домовленість або інцидент.
+
+MATERIAL_UPDATE=true лише коли ПІСЛЯ попередньої публікації з'явився факт,
+який реально змінює картину: нові значні жертви/наслідки, нове офіційне
+рішення або юридичний статус, підтверджений результат операції, новий великий
+об'єкт/результат, фактичний запуск/набуття чинності тощо.
+
+КРИТИЧНО ДЛЯ ЗАКОНІВ / САНКЦІЙ / УГОД:
+- "ухвалили" і "остаточно схвалили/проголосували" — та сама стадія approved;
+- "передадуть на підпис", "готовий підписати", "планує підписати",
+  "підпише" або "очікує підпису" НЕ означають signed;
+- signed=true як material update лише якщо документ ФАКТИЧНО підписано;
+- наступний material update після signed — фактичне набуття чинності/
+  фактичне запровадження санкцій, мит чи інших правил;
+- повторний переказ того самого пакета з новою цитатою або деталями
+  протягом доби — НЕ material update.
+
 НЕ MATERIAL_UPDATE:
 - більше деталей із того самого звіту;
 - новий список способів застосування тієї самої технології;
@@ -9114,14 +9114,14 @@
 ВІДПОВІДЬ ТІЛЬКИ JSON:
 {{
   "decisions": [
-    {{
-      "case_id": "C1",
-      "same_story": true,
-      "matched_candidate_id": "H1",
-      "material_update": false,
-      "update_strength": 20,
-      "reason": "Коротко, який саме базовий сюжет збігається або чому ні."
-    }}
+{{
+  "case_id": "C1",
+  "same_story": true,
+  "matched_candidate_id": "H1",
+  "material_update": false,
+  "update_strength": 20,
+  "reason": "Коротко, який саме базовий сюжет збігається або чому ні."
+}}
   ]
 }}
 
@@ -9477,3 +9477,4 @@ CASES:
         )
 
         return text.strip()
+
