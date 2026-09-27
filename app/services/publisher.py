@@ -4,6 +4,7 @@ import json
 import logging
 import mimetypes
 import re
+import time
 from pathlib import Path
 from urllib.parse import quote
 
@@ -48,6 +49,13 @@ class NewsPublisher:
             "gemini-3.1-flash-lite",
         ]
         self.media_validation_fail_closed = True
+        # Video validation: small clips go inline; larger clips use Gemini Files
+        # API. On validator/API failure we fail open for AUTO video because the
+        # Summarizer already applies a stricter event-consistency gate. Clear
+        # high-confidence mismatches are still rejected.
+        self.video_validation_inline_max_bytes = 12 * 1024 * 1024
+        self.video_validation_processing_timeout = 45
+        self.video_validation_fail_closed = False
 
     async def publish_telegram_post(
         self,
@@ -172,16 +180,29 @@ class NewsPublisher:
             return verdict
 
         if media_type == "video":
-            # Поточний Vision-gate створений для фото. Не змінюємо
-            # поведінку відео цим невеликим патчем.
-            return {
-                "is_relevant": True,
-                "confidence": 100,
-                "has_prominent_text": False,
-                "conflicting_text": False,
-                "reason": "video_validation_not_enabled",
-                "media_type": "video",
-            }
+            verdict = await self._validate_video_relevance(
+                text=text,
+                media_path=media_path,
+            )
+            verdict["media_type"] = "video"
+
+            if not verdict.get("is_relevant", False):
+                logger.warning(
+                    "VIDEO MEDIA REJECTED: path=%s confidence=%s "
+                    "conflicting_context=%s reason=%s",
+                    media_path,
+                    verdict.get("confidence"),
+                    verdict.get("conflicting_context"),
+                    verdict.get("reason"),
+                )
+            else:
+                logger.info(
+                    "VIDEO MEDIA OK: path=%s confidence=%s reason=%s",
+                    media_path,
+                    verdict.get("confidence"),
+                    verdict.get("reason"),
+                )
+            return verdict
 
         return {
             "is_relevant": False,
@@ -191,6 +212,191 @@ class NewsPublisher:
             "reason": f"unsupported_media_type: {media_type}",
             "media_type": media_type,
         }
+
+    async def _validate_video_relevance(
+        self,
+        text: str,
+        media_path: str,
+    ) -> dict:
+        try:
+            return await asyncio.to_thread(
+                self._validate_video_relevance_sync,
+                text,
+                media_path,
+            )
+        except Exception as e:
+            logger.error(
+                "Помилка video media validation для %s: %s",
+                media_path,
+                e,
+                exc_info=True,
+            )
+            return {
+                "is_relevant": not self.video_validation_fail_closed,
+                "confidence": 0,
+                "conflicting_context": False,
+                "reason": f"video_validation_error: {e}",
+            }
+
+    def _validate_video_relevance_sync(
+        self,
+        text: str,
+        media_path: str,
+    ) -> dict:
+        path = Path(media_path)
+        clean_text = self._strip_html(text)
+        mime_type = mimetypes.guess_type(path.name)[0] or "video/mp4"
+        size = path.stat().st_size
+
+        prompt = f"""
+Ти — суворий відеоредактор українського новинного Telegram-каналу.
+
+Порівняй ФАКТИЧНЕ ВІДЕО з текстом новини нижче. Потрібно визначити, чи
+цей ролик справді стосується тієї самої конкретної події.
+
+Особливо для ударів/пожеж/аварій:
+- інше місто, район, об'єкт або очевидно інший інцидент = reject;
+- загальні кадри вибуху/диму без ознак суперечності можна дозволити, але з
+  нижчою confidence;
+- водяні знаки каналу самі по собі НЕ є конфліктом;
+- якщо в кадрі/аудіо/плашках видно назву іншого міста, об'єкта, компанії чи
+  іншої новини — conflicting_context=true;
+- не вимагай, щоб відео показувало всі факти тексту: достатньо, щоб воно
+  чесно ілюструвало саме цю подію;
+- якщо не можеш встановити відповідність, не вигадуй деталей.
+
+НОВИНА:
+{clean_text[:1800]}
+
+confidence — ціле число 0-100.
+Відповідь ТІЛЬКИ JSON:
+{{
+  "is_relevant": true,
+  "confidence": 90,
+  "conflicting_context": false,
+  "video_summary": "коротко, що реально видно/чути",
+  "reason": "коротке пояснення"
+}}
+"""
+
+        uploaded = None
+        last_error = None
+        try:
+            for model in self.media_validation_models:
+                try:
+                    if size <= self.video_validation_inline_max_bytes:
+                        video_bytes = path.read_bytes()
+                        video_part = types.Part.from_bytes(
+                            data=video_bytes,
+                            mime_type=mime_type,
+                        )
+                        contents = [video_part, prompt]
+                    else:
+                        if uploaded is None:
+                            uploaded = self.media_validation_client.files.upload(
+                                file=str(path)
+                            )
+                            deadline = (
+                                time.monotonic()
+                                + self.video_validation_processing_timeout
+                            )
+                            while (
+                                getattr(getattr(uploaded, "state", None), "name", "")
+                                not in {"ACTIVE", "FAILED"}
+                                and time.monotonic() < deadline
+                            ):
+                                time.sleep(2)
+                                uploaded = self.media_validation_client.files.get(
+                                    name=uploaded.name
+                                )
+
+                            state_name = getattr(
+                                getattr(uploaded, "state", None),
+                                "name",
+                                "",
+                            )
+                            if state_name != "ACTIVE":
+                                raise TimeoutError(
+                                    f"video file processing state={state_name or 'unknown'}"
+                                )
+                        contents = [uploaded, prompt]
+
+                    response = self.media_validation_client.models.generate_content(
+                        model=model,
+                        contents=contents,
+                        config=types.GenerateContentConfig(
+                            response_mime_type="application/json",
+                            temperature=0.05,
+                        ),
+                    )
+
+                    raw = self._clean_json_response(
+                        (response.text or "").strip()
+                    )
+                    data = json.loads(raw)
+                    if not isinstance(data, dict):
+                        raise ValueError("video validator returned non-object JSON")
+
+                    try:
+                        raw_confidence = float(data.get("confidence", 0) or 0)
+                    except (TypeError, ValueError):
+                        raw_confidence = 0.0
+                    if 0.0 <= raw_confidence <= 1.0:
+                        raw_confidence *= 100.0
+                    confidence = max(0, min(100, int(round(raw_confidence))))
+
+                    model_relevant = bool(data.get("is_relevant", False))
+                    conflicting = bool(data.get("conflicting_context", False))
+
+                    # Reject only a clear mismatch. Ambiguous video is allowed
+                    # because text-based source gating already ran upstream.
+                    clear_mismatch = (
+                        (not model_relevant and confidence >= 70)
+                        or (conflicting and confidence >= 55)
+                    )
+                    is_relevant = not clear_mismatch
+
+                    reason = str(data.get("reason") or "")[:500]
+                    if not clear_mismatch and not model_relevant:
+                        reason = (reason + " | allowed: low-confidence mismatch").strip()
+
+                    return {
+                        "is_relevant": is_relevant,
+                        "confidence": confidence,
+                        "has_prominent_text": False,
+                        "conflicting_text": False,
+                        "conflicting_context": conflicting,
+                        "video_summary": str(data.get("video_summary") or "")[:300],
+                        "reason": reason,
+                    }
+
+                except Exception as e:
+                    last_error = e
+                    logger.warning(
+                        "Video validation failed via %s for %s: %s",
+                        model,
+                        media_path,
+                        e,
+                    )
+
+            return {
+                "is_relevant": not self.video_validation_fail_closed,
+                "confidence": 0,
+                "has_prominent_text": False,
+                "conflicting_text": False,
+                "conflicting_context": False,
+                "reason": f"all_video_validation_models_failed: {last_error}",
+            }
+        finally:
+            if uploaded is not None and getattr(uploaded, "name", None):
+                try:
+                    self.media_validation_client.files.delete(name=uploaded.name)
+                except Exception as cleanup_error:
+                    logger.warning(
+                        "Не вдалося видалити тимчасовий Gemini video file %s: %s",
+                        getattr(uploaded, "name", ""),
+                        cleanup_error,
+                    )
 
     async def _validate_photo_relevance(
         self,

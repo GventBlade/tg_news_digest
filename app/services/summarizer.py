@@ -3058,6 +3058,13 @@ MANUAL POSTS:
         right: Dict[str, Any],
         posts: List[Dict[str, Any]],
     ) -> bool:
+        # Якщо Telegram document_id однаковий, це фактично те саме медіа,
+        # навіть коли два канали переписали caption зовсім по-різному.
+        left_media_ids = self._event_media_document_ids(left, posts)
+        right_media_ids = self._event_media_document_ids(right, posts)
+        if left_media_ids and right_media_ids and (left_media_ids & right_media_ids):
+            return True
+
         left_texts = self._event_reference_texts(left, posts)
         right_texts = self._event_reference_texts(right, posts)
 
@@ -3066,7 +3073,32 @@ MANUAL POSTS:
                 if self._texts_same_event(left_text, right_text):
                     return True
 
+        # Для фізичних атак звичайний text-similarity часто слабкий: один канал
+        # пише коротко "момент прильоту", інший — повний список наслідків.
+        # Використовуємо вже наявний консервативний attack-anchor matcher, який
+        # вимагає конкретний спільний топонім/об'єкт/ціль, а не слово "удар".
+        for left_text in left_texts[:8]:
+            if not self._looks_like_attack_text(left_text):
+                continue
+            for right_text in right_texts[:8]:
+                if self._attack_same_story_anchor_match(left_text, right_text):
+                    return True
+
         return False
+
+    def _event_media_document_ids(
+        self,
+        event: Dict[str, Any],
+        posts: List[Dict[str, Any]],
+    ) -> set:
+        result = set()
+        for source_id in self._valid_source_ids(event.get("source_ids"), posts):
+            value = posts[source_id].get("media_document_id")
+            if isinstance(value, int) and value:
+                result.add(value)
+            elif isinstance(value, str) and value.strip():
+                result.add(value.strip())
+        return result
 
     def _event_reference_texts(
         self,
@@ -3424,12 +3456,19 @@ MANUAL POSTS:
             posts[source_id].get("has_media")
             for source_id in source_ids
         )
+        manual_media_source = self._manual_locked_media_source(
+            source_ids,
+            posts,
+            text_source_id,
+        )
 
         return {
             "event_id": f"P_SYNTH_{sequence}",
             "source_ids": source_ids,
             "best_factual_source_id": text_source_id,
-            "best_media_source_id": None,
+            "best_media_source_id": manual_media_source,
+            "manual_media_locked": manual_media_source is not None,
+            "manual_media_source_id": manual_media_source,
             "eligible_for_digest": True,
             "rejection_reason": "",
             "digest_role": (
@@ -5212,6 +5251,13 @@ MANUAL POSTS:
                     else factual_source
                 )
 
+                manual_media_locked = bool(
+                    media_source is not None
+                    and posts[media_source].get("is_priority")
+                    and posts[media_source].get("manual_media_path")
+                    and posts[media_source].get("manual_media_type") in {"photo", "video"}
+                )
+
                 discovery_score = self._calculate_discovery_score(
                     cur,
                     nov,
@@ -5227,6 +5273,8 @@ MANUAL POSTS:
                     "best_factual_source_id": factual_source,
                     "best_media_source_id": media_source,
                     "best_source_id": publishing_source,
+                    "manual_media_locked": manual_media_locked,
+                    "manual_media_source_id": media_source if manual_media_locked else None,
                     "is_priority": is_priority,
                     "eligible_for_digest": True,
                     "event_type": event_type,
@@ -6140,6 +6188,14 @@ discovery-блок.
                 continue
 
             ev = event_map[event_id]
+            locked_source = ev.get("manual_media_source_id")
+            if (
+                bool(ev.get("manual_media_locked"))
+                and isinstance(locked_source, int)
+                and 0 <= locked_source < len(posts)
+            ):
+                source_id = locked_source
+
             reference_url, reference_label = self._select_reference_link(
                 ev, posts
             )
@@ -6164,6 +6220,8 @@ discovery-блок.
                 "is_priority": bool(ev.get("is_priority")),
                 "priority_source_ids": self._priority_source_ids_for_event(ev, posts),
                 "manual_merge_verified": bool(ev.get("manual_merge_verified", True)),
+                "manual_media_locked": bool(ev.get("manual_media_locked", False)),
+                "manual_media_source_id": ev.get("manual_media_source_id"),
                 "reference_url": reference_url,
                 "reference_label": reference_label,
             })
@@ -6413,6 +6471,14 @@ discovery-блок.
         posts: List[Dict[str, Any]],
     ) -> Optional[Dict[str, Any]]:
         source_id = ev.get("best_source_id")
+        locked_source = ev.get("manual_media_source_id")
+        if (
+            bool(ev.get("manual_media_locked"))
+            and isinstance(locked_source, int)
+            and 0 <= locked_source < len(posts)
+        ):
+            source_id = locked_source
+
         if (
             not isinstance(source_id, int)
             or not (0 <= source_id < len(posts))
@@ -6529,6 +6595,8 @@ discovery-блок.
             "is_priority": bool(ev.get("is_priority")),
             "priority_source_ids": self._priority_source_ids_for_event(ev, posts),
             "manual_merge_verified": bool(ev.get("manual_merge_verified", True)),
+            "manual_media_locked": bool(ev.get("manual_media_locked", False)),
+            "manual_media_source_id": ev.get("manual_media_source_id"),
             "reference_url": reference_url,
             "reference_label": reference_label,
         }
@@ -6969,6 +7037,113 @@ discovery-блок.
             ),
         )
 
+    def _manual_locked_media_source(
+        self,
+        source_ids: List[int],
+        posts: List[Dict[str, Any]],
+        preferred_id: Any = None,
+    ) -> Optional[int]:
+        """
+        Manual media is immutable: якщо адмін надіслав фото/відео, жоден
+        автоматичний source не має права замінити цей файл. Інші source_ids
+        можуть лише збагачувати факти/текст події.
+        """
+        locked = []
+        for source_id in source_ids:
+            post = posts[source_id]
+            media_path = str(post.get("manual_media_path") or "").strip()
+            media_type = str(post.get("manual_media_type") or "").strip().lower()
+            if (
+                bool(post.get("is_priority"))
+                and media_path
+                and media_type in {"photo", "video"}
+            ):
+                locked.append(source_id)
+
+        if not locked:
+            return None
+        if isinstance(preferred_id, int) and preferred_id in locked:
+            return preferred_id
+        return locked[0]
+
+    def _media_source_matches_event(
+        self,
+        source_id: int,
+        posts: List[Dict[str, Any]],
+        event: Dict[str, Any],
+        relevance: float,
+    ) -> bool:
+        """
+        Conservative pre-download gate for AUTO media. It is intentionally
+        stricter than the old relevance>=0.10 rule: better no media than a
+        convincing photo/video from a neighbouring story.
+        """
+        post_text = str(posts[source_id].get("text") or "").strip()
+        event_text = self._event_text_bundle(event)
+        if not post_text or not event_text:
+            return False
+
+        factual_id = event.get("best_factual_source_id")
+        factual_text = ""
+        if (
+            isinstance(factual_id, int)
+            and 0 <= factual_id < len(posts)
+            and factual_id != source_id
+        ):
+            factual_text = str(posts[factual_id].get("text") or "").strip()
+
+        reference_text = " ".join(
+            part for part in (event_text, factual_text) if part
+        )
+
+        # Same factual source is naturally a strong media candidate.
+        if source_id == factual_id and relevance >= 0.10:
+            return True
+
+        post_entities = self._entity_signature(post_text)
+        ref_entities = self._entity_signature(reference_text)
+        shared_entities = post_entities & ref_entities
+        shared_story = self._story_signature(post_text) & self._story_signature(reference_text)
+
+        post_is_attack = self._looks_like_attack_text(post_text)
+        ref_is_attack = self._looks_like_attack_text(reference_text)
+
+        if post_is_attack or ref_is_attack:
+            post_centers = self._regional_center_names(post_text)
+            ref_centers = self._regional_center_names(reference_text)
+            if post_centers and ref_centers and post_centers.isdisjoint(ref_centers):
+                return False
+
+            if self._attack_same_story_anchor_match(post_text, reference_text):
+                return True
+
+            shared_anchors = (
+                self._attack_anchor_signature(post_text)
+                & self._attack_anchor_signature(reference_text)
+            )
+
+            # Short direct-impact captions are often only a few words. A
+            # concrete shared target/location is enough, but generic attack
+            # vocabulary is not.
+            if (
+                bool(posts[source_id].get("has_video"))
+                and self._is_direct_impact_video_post(posts[source_id])
+                and (shared_entities or len(shared_anchors) >= 2)
+                and relevance >= 0.16
+            ):
+                return True
+
+            return bool(
+                relevance >= 0.34
+                and (shared_entities or len(shared_anchors) >= 2 or len(shared_story) >= 3)
+            )
+
+        if relevance >= 0.36:
+            return True
+        if relevance >= 0.24 and (shared_entities or len(shared_story) >= 3):
+            return True
+        return False
+
     def _select_media_source(
         self,
         source_ids: List[int],
@@ -6977,15 +7152,23 @@ discovery-блок.
         preferred_id: Any = None,
     ) -> Optional[int]:
         """
-        Обирає media-source лише серед текстово сумісних source-постів.
-
-        Це перша лінія захисту від чужого фото: якщо Analyzer випадково
-        об'єднав два близькі сюжети або запропонував медіа з поста, текст
-        якого слабко відповідає конкретній події, такий source не беремо.
-
-        ВАЖЛИВО: ця перевірка не бачить сам піксельний вміст картинки.
-        Остаточну перевірку зображення виконує NewsPublisher перед публікацією.
+        Manual media is locked. For automatic events, choose media only among
+        source-posts that are semantically consistent with the concrete event.
         """
+        locked_manual = self._manual_locked_media_source(
+            source_ids,
+            posts,
+            preferred_id,
+        )
+        if locked_manual is not None:
+            logger.info(
+                "MANUAL MEDIA LOCK: event_id=%s source_id=%s type=%s",
+                event.get("event_id"),
+                locked_manual,
+                posts[locked_manual].get("manual_media_type"),
+            )
+            return locked_manual
+
         media_ids = [
             s
             for s in source_ids
@@ -7004,25 +7187,35 @@ discovery-блок.
         for source_id in media_ids:
             post_text = str(posts[source_id].get("text") or "").strip()
             relevance = self._media_text_relevance(event_text, post_text)
-            score = self._media_source_score(posts[source_id])
 
-            # Низька текстова релевантність означає ризик, що джерело
-            # стосується іншого сюжету. Не забороняємо дуже короткі пости,
-            # але даємо їм пройти лише якщо є хоча б мінімальний збіг.
-            if relevance < 0.10:
+            if not self._media_source_matches_event(
+                source_id,
+                posts,
+                event,
+                relevance,
+            ):
+                logger.info(
+                    "Auto media candidate rejected: event_id=%s source_id=%s "
+                    "relevance=%.2f type=%s",
+                    event.get("event_id"),
+                    source_id,
+                    relevance,
+                    "video" if posts[source_id].get("has_video") else "photo",
+                )
                 continue
 
+            score = self._media_source_score(posts[source_id])
             score += relevance * 35.0
 
             if source_id == preferred_id:
-                # LLM preference — лише бонус, а не безумовний override.
+                # LLM preference is only a bonus after deterministic safety.
                 score += 8.0
 
             scored.append((score, relevance, source_id))
 
         if not scored:
             logger.info(
-                "Media source rejected by text relevance: event_id=%s",
+                "Media source rejected by event-consistency gate: event_id=%s",
                 event.get("event_id"),
             )
             return None

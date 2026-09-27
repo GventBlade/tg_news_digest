@@ -519,6 +519,47 @@ def _ensure_manual_items_before_publish(
     return result
 
 
+def _locked_manual_media_source_for_item(
+    item: dict,
+    posts: list,
+) -> int | None:
+    """Independent publication-level manual media lock."""
+    candidates = []
+
+    preferred = item.get("manual_media_source_id")
+    if isinstance(preferred, int):
+        candidates.append(preferred)
+
+    source_id = item.get("source_id")
+    if isinstance(source_id, int):
+        candidates.append(source_id)
+
+    for value in (item.get("priority_source_ids") or []):
+        if isinstance(value, int):
+            candidates.append(value)
+
+    source_ids = item.get("source_ids")
+    if isinstance(source_ids, list):
+        candidates.extend(value for value in source_ids if isinstance(value, int))
+
+    seen = set()
+    for source_idx in candidates:
+        if source_idx in seen or not (0 <= source_idx < len(posts)):
+            continue
+        seen.add(source_idx)
+        post = posts[source_idx]
+        media_path = str(post.get("manual_media_path") or "").strip()
+        media_type = str(post.get("manual_media_type") or "").strip().lower()
+        if (
+            bool(post.get("is_priority"))
+            and media_path
+            and media_type in {"photo", "video"}
+        ):
+            return source_idx
+
+    return None
+
+
 async def process_and_publish_news_cycle():
     cycle_started_at = datetime.now(
         timezone.utc
@@ -606,6 +647,11 @@ async def process_and_publish_news_cycle():
                 ],
                 "manual_queue_id": queue_id,
                 "is_priority": True,
+                # Media attached by admin is immutable. Summarizer may enrich
+                # text from other sources, but publication must use this file.
+                "media_locked": bool(manual["media_path"]),
+                "media_document_id": None,
+                "video_duration": None,
                 "message_obj": None,
 
                 # Унікальний negative ID замість 0 для всіх
@@ -716,6 +762,21 @@ async def process_and_publish_news_cycle():
                 "source_id"
             )
 
+            manual_media_source_idx = _locked_manual_media_source_for_item(
+                item,
+                posts,
+            )
+            manual_media_locked = manual_media_source_idx is not None
+            if manual_media_locked:
+                source_idx = manual_media_source_idx
+                logger.info(
+                    "MANUAL MEDIA LOCK (publish): news_index=%s event_id=%s "
+                    "source_id=%s",
+                    index,
+                    item.get("event_id"),
+                    source_idx,
+                )
+
             target_post = (
                 posts[source_idx]
                 if (
@@ -773,6 +834,23 @@ async def process_and_publish_news_cycle():
                         f"для новини #{index}: {dl_err}"
                     )
 
+            if manual_media_locked and (
+                not media_path
+                or media_type not in {"photo", "video"}
+                or not os.path.exists(media_path)
+            ):
+                logger.error(
+                    "MANUAL MEDIA LOCK FAILED: news_index=%s event_id=%s "
+                    "source_id=%s path=%s type=%s. Не публікуємо цей manual "
+                    "текстом без вибраного адміном медіа; queue лишається pending.",
+                    index,
+                    item.get("event_id"),
+                    source_idx,
+                    media_path,
+                    media_type,
+                )
+                continue
+
             # Зберігаємо початковий media-state для read-only audit.
             # Audit не запускає Vision вдруге; він лише перевірить,
             # що відхилене медіа не залишилось у фінальному pipeline.
@@ -782,18 +860,28 @@ async def process_and_publish_news_cycle():
             media_reject_reason = ""
 
             # ЄДИНИЙ media-gate для ОБОХ платформ.
-            # Verdict отримуємо ДО публікації.
+            # Manual media is an explicit admin choice: it is NEVER replaced or
+            # dropped by automatic Vision. AUTO media still passes validation.
+            media_verdict = {}
             if (
                 media_path
                 and media_type in {"photo", "video"}
             ):
-                media_verdict = (
-                    await publisher.validate_media_for_news(
-                        text=item["text"],
-                        media_path=media_path,
-                        media_type=media_type,
+                if manual_media_locked:
+                    media_verdict = {
+                        "is_relevant": True,
+                        "confidence": 100,
+                        "reason": "manual_media_locked",
+                        "media_type": media_type,
+                    }
+                else:
+                    media_verdict = (
+                        await publisher.validate_media_for_news(
+                            text=item["text"],
+                            media_path=media_path,
+                            media_type=media_type,
+                        )
                     )
-                )
 
                 if not media_verdict.get(
                     "is_relevant",
@@ -847,6 +935,9 @@ async def process_and_publish_news_cycle():
                 continue
 
             published_item = dict(item)
+            # source_id in audit/runtime must reflect the media source actually
+            # published after the independent manual-media lock.
+            published_item["source_id"] = source_idx
             published_item["text"] = (
                 publication_text
             )
@@ -902,8 +993,17 @@ async def process_and_publish_news_cycle():
                 "original_type": original_media_type,
                 "rejected": media_rejected,
                 "reject_reason": media_reject_reason,
+                "validation_reason": str(media_verdict.get("reason") or ""),
+                "validation_confidence": media_verdict.get("confidence"),
                 "final_path": media_path,
                 "final_type": media_type,
+                "manual_locked": manual_media_locked,
+                "manual_expected_path": (
+                    str(target_post.get("manual_media_path") or "")
+                    if manual_media_locked
+                    else ""
+                ),
+                "selected_source_id": source_idx,
             }
 
             published_news.append(

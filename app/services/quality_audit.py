@@ -1143,6 +1143,26 @@ CASES:
                 or ""
             ).strip()
 
+            manual_locked = bool(audit.get("manual_locked"))
+            manual_expected_path = str(
+                audit.get("manual_expected_path") or ""
+            ).strip()
+
+            if (
+                manual_locked
+                and manual_expected_path
+                and final_path != manual_expected_path
+            ):
+                issues.append({
+                    "type": "manual_media_lock_issue",
+                    "event_id": str(item.get("event_id") or ""),
+                    "confidence": 100,
+                    "reason": (
+                        "Manual media було замінено/втрачено: "
+                        f"expected={manual_expected_path}, final={final_path or 'none'}."
+                    ),
+                })
+
             if (
                 rejected
                 and (

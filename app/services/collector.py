@@ -138,6 +138,10 @@ class NewsCollector:
                         "forwards": forwards,
                         "replies": replies,
                         "media_size": self._get_media_size(message),
+                        # Telegram document id catches exact media reuse across
+                        # channels/forwards even when captions are rewritten.
+                        "media_document_id": self._get_media_document_id(message),
+                        "video_duration": self._get_video_duration(message),
                         "date": message.date,
                         "is_priority": False,
                         # Зовнішні посилання НЕ є Telegram source URL.
@@ -392,6 +396,37 @@ class NewsCollector:
         return int(
             getattr(file_obj, "size", 0) or 0
         )
+
+
+    @staticmethod
+    def _get_media_document_id(message) -> Optional[int]:
+        document = getattr(message, "document", None)
+        value = getattr(document, "id", None)
+        try:
+            return int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _get_video_duration(message) -> Optional[float]:
+        file_obj = getattr(message, "file", None)
+        direct = getattr(file_obj, "duration", None)
+        if direct is not None:
+            try:
+                return float(direct)
+            except (TypeError, ValueError):
+                pass
+
+        document = getattr(message, "document", None)
+        for attribute in (getattr(document, "attributes", None) or []):
+            duration = getattr(attribute, "duration", None)
+            if duration is None:
+                continue
+            try:
+                return float(duration)
+            except (TypeError, ValueError):
+                continue
+        return None
 
     async def close(self):
         if self.client.is_connected():
