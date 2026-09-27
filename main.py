@@ -967,6 +967,9 @@ async def process_and_publish_news_cycle():
                         text=item["text"],
                         media_path=media_path,
                         media_type=media_type,
+                        video_validation_needed=bool(
+                            item.get("video_validation_needed", False)
+                        ),
                     )
                 )
 

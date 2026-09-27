@@ -195,6 +195,7 @@ class NewsPublisher:
         text: str,
         media_path: str | None,
         media_type: str | None,
+        video_validation_needed: bool = False,
     ) -> dict:
         """
         Єдина перевірка медіа перед публікацією на будь-якій платформі.
@@ -242,6 +243,32 @@ class NewsPublisher:
             return verdict
 
         if media_type == "video":
+            # Normal AUTO video no longer goes through Gemini. In production
+            # this was the biggest latency source (often 1-3 minutes per clip)
+            # while the final policy was fail-open anyway. Summarizer already
+            # applies a cheap text/location consistency gate. Gemini is reserved
+            # only for rare borderline candidates explicitly marked suspicious.
+            if not video_validation_needed:
+                verdict = {
+                    "is_relevant": True,
+                    "confidence": 0,
+                    "has_prominent_text": False,
+                    "conflicting_text": False,
+                    "conflicting_context": False,
+                    "reason": "auto_video_fast_path_no_gemini",
+                    "media_type": "video",
+                }
+                logger.info(
+                    "VIDEO MEDIA FAST-PASS: path=%s reason=%s",
+                    media_path,
+                    verdict["reason"],
+                )
+                return verdict
+
+            logger.info(
+                "VIDEO MEDIA BORDERLINE CHECK: path=%s",
+                media_path,
+            )
             verdict = await self._validate_video_relevance(
                 text=text,
                 media_path=media_path,
