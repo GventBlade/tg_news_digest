@@ -139,12 +139,38 @@ class NewsSummarizer:
     # контексті. Це зберігає широкий пошук 10-16 кандидатів і повноцінність
     # випуску, але поступово зменшує ризик malformed JSON.
     FULL_ANALYZER_RECOVERY_CHAR_LIMITS = (40000, 30000)
-    FULL_ANALYZER_RECOVERY_RETRIES_PER_MODEL = 1
+
+    # Технічний 503/429 не повинен спалювати весь cascade за 1-2 хвилини.
+    # Для 4-годинного дайджесту краще запізнитися на кілька хвилин, ніж
+    # перейти на грубий Python fallback під час короткого outage Gemini.
+    #
+    # Бюджет каскаду:
+    #   50k primary  -> до 2 хв
+    #   40k recovery -> до 2 хв
+    #   30k recovery -> до 2 хв
+    #   26k emergency-> решта часу до ~10 хв від старту Analyzer
+    #
+    # retry_budget_seconds є верхньою межею, а не обов'язковим sleep:
+    # якщо модель ожила раніше, продовжуємо цикл одразу.
+    PRIMARY_ANALYZER_RETRIES_PER_MODEL = 8
+    PRIMARY_ANALYZER_RETRY_BUDGET_SECONDS = 120.0
+
+    FULL_ANALYZER_RECOVERY_RETRIES_PER_MODEL = 8
+    FULL_ANALYZER_RECOVERY_RETRY_BUDGET_SECONDS = 120.0
 
     # Emergency лишається останньою LLM-страховкою після 50k -> 40k -> 30k.
     EMERGENCY_ANALYZER_MAX_CHARS = 26000
     EMERGENCY_ANALYZER_MAX_EVENTS = 6
-    EMERGENCY_SYNTHETIC_MAX_EVENTS = 3
+    EMERGENCY_ANALYZER_RETRIES_PER_MODEL = 16
+    EMERGENCY_ANALYZER_MIN_BUDGET_SECONDS = 180.0
+
+    # Python synthetic fallback запускаємо лише після тривалого технічного
+    # outage. За нормального valid JSON (навіть events=[]) чекати 10 хв не треба.
+    ANALYZER_PYTHON_FALLBACK_MIN_ELAPSED_SECONDS = 600.0
+
+    # Якщо вже дійшли до Python fallback, даємо йому ширший пул, щоб 2-3
+    # history rejects не перетворили денний випуск на одну новину.
+    EMERGENCY_SYNTHETIC_MAX_EVENTS = 8
 
     # Discovery теж трохи розвантажуємо. У логах контекст ~44.8k двічі дав
     # malformed JSON на 3.5-flash-lite, тому тримаємо його ближче до 40k.
@@ -252,10 +278,19 @@ class NewsSummarizer:
         if not posts_context:
             return []
 
+        # Відраховуємо один загальний technical-outage budget від самого
+        # старту primary Analyzer. Він потрібен, щоб Python fallback не
+        # запускався через короткий 503-spike раніше приблизно 10-ї хвилини.
+        analyzer_cascade_started = time.monotonic()
+        primary_retries = max(
+            int(max_retries_per_model or 1),
+            self.PRIMARY_ANALYZER_RETRIES_PER_MODEL,
+        )
         analyzed_events = self._analyze_events(
             posts_context,
             past_events,
-            max_retries_per_model,
+            primary_retries,
+            retry_budget_seconds=self.PRIMARY_ANALYZER_RETRY_BUDGET_SECONDS,
         )
 
         # ВАЖЛИВО: None означає технічний провал cascade, а [] — валідну
@@ -271,6 +306,7 @@ class NewsSummarizer:
                 posts,
                 past_events,
                 max_retries_per_model,
+                cascade_started_at=analyzer_cascade_started,
             )
 
         if not analyzed_events:
@@ -1823,6 +1859,7 @@ TELEGRAM POSTS FOR DISCOVERY SEARCH:
             ]
         ],
         max_retries: int,
+        retry_budget_seconds: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
         history_block = self._build_history_block(
             past_events
@@ -2289,6 +2326,7 @@ TELEGRAM POSTS:
             max_retries,
             "ANALYZER",
             temperature=0.15,
+            retry_budget_seconds=retry_budget_seconds,
         )
 
         # None = технічний failure cascade. Порожній list = валідна
@@ -2309,25 +2347,31 @@ TELEGRAM POSTS:
             ]
         ],
         max_retries: int,
+        cascade_started_at: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
         """
         Recovery після ТЕХНІЧНОГО провалу основного 50k Analyzer.
 
-        Градація навмисно м'яка:
-        1) повний Analyzer на 40k;
-        2) повний Analyzer на 30k;
-        3) лише потім emergency 26k / max 6 events;
-        4) Python synthetic fallback — тільки якщо Gemini недоступний і там.
+        Важлива різниця від старого cascade: короткий 503-spike більше не
+        спалює 50k -> 40k -> 30k -> emergency за хвилину-півтори.
 
-        40k/30k використовують ТОЙ САМИЙ широкий prompt, тому це не аварійний
-        скорочений випуск, а спроба зберегти нормальні 10-16 кандидатів.
+        Орієнтовний technical-outage budget:
+        1) primary 50k: до 2 хв;
+        2) full Analyzer 40k: ще до 2 хв;
+        3) full Analyzer 30k: ще до 2 хв;
+        4) emergency 26k: використовує решту часу приблизно до 10-ї хвилини;
+        5) Python synthetic fallback — лише після цього, якщо Gemini так і
+           не повернув валідний JSON.
+
+        Valid JSON із events=[] не вважається outage: у такому разі чекати
+        десять хвилин штучно не потрібно.
         """
+        if cascade_started_at is None:
+            cascade_started_at = time.monotonic()
+
         compact_retries = max(
-            1,
-            min(
-                int(max_retries or 1),
-                self.FULL_ANALYZER_RECOVERY_RETRIES_PER_MODEL,
-            ),
+            int(max_retries or 1),
+            self.FULL_ANALYZER_RECOVERY_RETRIES_PER_MODEL,
         )
 
         for char_limit in self.FULL_ANALYZER_RECOVERY_CHAR_LIMITS:
@@ -2338,17 +2382,24 @@ TELEGRAM POSTS:
             if not compact_context:
                 continue
 
+            elapsed = max(0.0, time.monotonic() - cascade_started_at)
             logger.warning(
                 "FULL ANALYZER RECOVERY: повторюємо повний Analyzer "
-                "на контексті до %s символів (retries/model=%s).",
+                "на контексті до %s символів (retries/model=%s, "
+                "budget<=%.0fs, elapsed=%.0fs).",
                 char_limit,
                 compact_retries,
+                self.FULL_ANALYZER_RECOVERY_RETRY_BUDGET_SECONDS,
+                elapsed,
             )
 
             recovered = self._analyze_events(
                 compact_context,
                 past_events,
                 compact_retries,
+                retry_budget_seconds=(
+                    self.FULL_ANALYZER_RECOVERY_RETRY_BUDGET_SECONDS
+                ),
             )
 
             if recovered:
@@ -2380,17 +2431,39 @@ TELEGRAM POSTS:
         )
 
         if emergency_context:
+            elapsed = max(0.0, time.monotonic() - cascade_started_at)
+            remaining_to_python = max(
+                0.0,
+                self.ANALYZER_PYTHON_FALLBACK_MIN_ELAPSED_SECONDS - elapsed,
+            )
+            # Саме emergency-stage розтягуємо, якщо попередні рівні через
+            # швидкі 503 вичерпались раніше свого nominal budget. Тобто ми
+            # не спимо без діла, а продовжуємо пробувати обидві Gemini-моделі.
+            emergency_budget = max(
+                self.EMERGENCY_ANALYZER_MIN_BUDGET_SECONDS,
+                remaining_to_python,
+            )
+            emergency_retries = max(
+                int(max_retries or 1),
+                self.EMERGENCY_ANALYZER_RETRIES_PER_MODEL,
+            )
+
             logger.warning(
                 "EMERGENCY ANALYZER: 50k -> 40k -> 30k не дали подій. "
-                "Запускаємо останній компактний recovery (ліміт=%s, max_events=%s).",
+                "Запускаємо останній compact recovery (ліміт=%s, "
+                "max_events=%s, retries/model=%s, budget<=%.0fs, elapsed=%.0fs).",
                 self.EMERGENCY_ANALYZER_MAX_CHARS,
                 self.EMERGENCY_ANALYZER_MAX_EVENTS,
+                emergency_retries,
+                emergency_budget,
+                elapsed,
             )
 
             recovered = self._analyze_emergency_events(
                 emergency_context,
                 past_events,
-                max_retries,
+                emergency_retries,
+                retry_budget_seconds=emergency_budget,
             )
 
             if recovered is not None:
@@ -2408,21 +2481,25 @@ TELEGRAM POSTS:
                 )
                 return []
 
+        total_elapsed = max(0.0, time.monotonic() - cascade_started_at)
         synthetic = self._build_emergency_synthetic_events(posts)
         if synthetic:
             logger.error(
-                "EMERGENCY PYTHON FALLBACK: Gemini недоступний і для recovery. "
-                "Створено %s synthetic candidate(s); вони ще пройдуть "
-                "звичайні history/ranking gates.",
+                "EMERGENCY PYTHON FALLBACK: Gemini технічно недоступний "
+                "після %.1f хв recovery. Створено %s synthetic candidate(s); "
+                "вони ще пройдуть звичайні history/ranking gates.",
+                total_elapsed / 60.0,
                 len(synthetic),
             )
         else:
             logger.error(
-                "EMERGENCY PYTHON FALLBACK: не вдалося сформувати жодного "
-                "безпечного synthetic candidate."
+                "EMERGENCY PYTHON FALLBACK: після %.1f хв recovery не вдалося "
+                "сформувати жодного безпечного synthetic candidate.",
+                total_elapsed / 60.0,
             )
 
         return synthetic
+
 
     def _analyze_emergency_events(
         self,
@@ -2434,6 +2511,7 @@ TELEGRAM POSTS:
             ]
         ],
         max_retries: int,
+        retry_budget_seconds: Optional[float] = None,
     ) -> Optional[List[Dict[str, Any]]]:
         history_block = self._build_history_block(past_events)
 
@@ -2503,6 +2581,7 @@ TELEGRAM POSTS:
             max_retries,
             "EMERGENCY_ANALYZER",
             temperature=0.08,
+            retry_budget_seconds=retry_budget_seconds,
         )
 
         if data is None:
@@ -2518,8 +2597,9 @@ TELEGRAM POSTS:
         """
         Остання страховка без LLM.
 
-        Вона не публікує сирі пости напряму: лише створює до трьох candidate
-        events. Далі їх обов'язково перевіряють current dedup, history guard,
+        Вона не публікує сирі пости напряму: лише створює обмежений пул
+        candidate events (до EMERGENCY_SYNTHETIC_MAX_EVENTS). Далі їх обов'язково
+        перевіряють current dedup, history guard,
         semantic review (якщо API ожив), ranking та Editor/fallback.
         """
         now_utc = datetime.now(timezone.utc)
@@ -2697,7 +2777,9 @@ TELEGRAM POSTS:
         posts: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
         post = posts[source_id]
-        source_text = str(post.get("text") or "").strip()
+        source_text = self._clean_source_text_for_fallback(
+            str(post.get("text") or "")
+        )
         sentences = self._extract_sentences(source_text)
         if not sentences and source_text:
             sentences = [source_text]
@@ -3729,9 +3811,9 @@ MANUAL POSTS:
                 posts[source_id].get("text") or ""
             ),
         )
-        source_text = (
+        source_text = self._clean_source_text_for_fallback(
             posts[text_source_id].get("text") or ""
-        ).strip()
+        )
 
         sentences = self._extract_sentences(source_text)
         if not sentences and source_text:
@@ -3818,13 +3900,59 @@ MANUAL POSTS:
             "summary": summary,
         }
 
+    @staticmethod
+    def _clean_source_text_for_fallback(
+        text: str,
+    ) -> str:
+        """
+        Детерміноване очищення сирого Telegram source для Python fallback.
+
+        Воно не переписує факти: лише прибирає URL/markdown/HTML, службові
+        заклики підписатися та декоративний шум, який не повинен потрапляти
+        у фінальний пост, якщо Editor тимчасово недоступний.
+        """
+        clean = str(text or "")
+
+        # Нормальний Markdown-link -> лишаємо лише видимий label.
+        clean = re.sub(
+            r"\[([^\]]+)\]\((?:https?://|t\.me/)[^)]+\)",
+            r"\1",
+            clean,
+            flags=re.IGNORECASE,
+        )
+        # Telegram часто дає link без https.
+        clean = re.sub(
+            r"\[([^\]]+)\]\(t\.me/[^)]+\)",
+            r"\1",
+            clean,
+            flags=re.IGNORECASE,
+        )
+        clean = re.sub(r"https?://\S+|t\.me/\S+", " ", clean, flags=re.IGNORECASE)
+        clean = re.sub(r"<[^>]+>", " ", clean)
+
+        # Знімаємо markdown-обгортку, не сам текст.
+        clean = clean.replace("**", " ").replace("__", " ")
+        clean = clean.replace("`", " ")
+
+        # Типові рекламні хвости джерел. Видаляємо саме короткі promo-fragments,
+        # а не будь-яке речення зі словом "канал".
+        clean = re.sub(
+            r"(?i)(?:^|[\n.!?]\s*)"
+            r"(?:\[?підписатися\]?|підписуй(?:ся|тесь)|subscribe)"
+            r"[^\n.!?]{0,180}(?=$|[\n.!?])",
+            " ",
+            clean,
+        )
+
+        clean = re.sub(r"\s+", " ", clean).strip(" -–—|")
+        return clean
+
+
     def _priority_headline_from_text(
         self,
         text: str,
     ) -> str:
-        clean = re.sub(r"https?://\S+|t\.me/\S+", " ", text or "")
-        clean = re.sub(r"<[^>]+>", " ", clean)
-        clean = re.sub(r"\s+", " ", clean).strip()
+        clean = self._clean_source_text_for_fallback(text)
 
         if not clean:
             return "Пріоритетна подія"
@@ -6858,13 +6986,16 @@ discovery-блок.
                 return None
             source_id = source_ids[0]
 
-        headline = (
-            str(ev.get("headline_hint") or "").strip()
-            or self._priority_headline_from_text(
-                posts[source_id].get("text") or ""
-            )
-            or "Важлива подія"
+        headline = self._clean_source_text_for_fallback(
+            str(ev.get("headline_hint") or "")
         )
+        if not headline:
+            headline = (
+                self._priority_headline_from_text(
+                    posts[source_id].get("text") or ""
+                )
+                or "Важлива подія"
+            )
 
         category = ev.get("category", "other")
         if category not in self.ALLOWED_CATEGORIES:
@@ -6886,16 +7017,20 @@ discovery-блок.
         key_facts = ev.get("key_facts", [])
         facts = (
             [
-                str(x).strip()
+                self._clean_source_text_for_fallback(str(x))
                 for x in key_facts
-                if str(x).strip()
+                if self._clean_source_text_for_fallback(str(x))
             ]
             if isinstance(key_facts, list)
             else []
         )
 
-        summary = str(ev.get("summary") or "").strip()
-        why = str(ev.get("why_it_matters") or "").strip()
+        summary = self._clean_source_text_for_fallback(
+            str(ev.get("summary") or "")
+        )
+        why = self._clean_source_text_for_fallback(
+            str(ev.get("why_it_matters") or "")
+        )
 
         sentences: List[str] = []
 
@@ -6914,7 +7049,9 @@ discovery-блок.
             if sentence and sentence not in sentences:
                 sentences.append(sentence)
 
-        original_text = posts[source_id].get("text") or ""
+        original_text = self._clean_source_text_for_fallback(
+            posts[source_id].get("text") or ""
+        )
         if len(sentences) < 3 and original_text:
             for sentence in self._extract_sentences(original_text):
                 clean_sentence = self._ensure_sentence_end(sentence)
@@ -7955,28 +8092,201 @@ discovery-блок.
         max_retries: int,
         op_name: str,
         temperature: float = 0.15,
+        retry_budget_seconds: Optional[float] = None,
     ) -> Optional[Dict[str, Any]]:
+        """
+        JSON-call cascade across Gemini models.
+
+        За замовчуванням зберігає стару коротку retry-поведінку для Editor,
+        history review, discovery тощо.
+
+        Якщо передано retry_budget_seconds, вмикається budgeted mode:
+        кожен retry-round спочатку пробує ВСІ доступні моделі, а вже потім
+        робить backoff. Це важливо під час 503-spike: fallback-модель
+        перевіряється одразу, але Python fallback не запускається через кілька
+        секунд, якщо весь сервіс тимчасово перевантажений.
+        """
         max_retries = max(1, int(max_retries or 1))
 
-        for model in self.models_priority:
-            for attempt in range(1, max_retries + 1):
+        # Старий fast-path лишаємо для звичайних операцій, щоб не перетворити
+        # кожен history/fact-check у багатохвилинне очікування.
+        if retry_budget_seconds is None:
+            for model in self.models_priority:
+                for attempt in range(1, max_retries + 1):
+                    retry_hint = ""
+                    if attempt > 1:
+                        retry_hint = (
+                            "\n\nКРИТИЧНО: попередня відповідь не пройшла "
+                            "машинний JSON-парсер. Поверни ЛИШЕ один валідний "
+                            "JSON-об'єкт: подвійні лапки для ключів і рядків, "
+                            "без trailing commas, без Markdown і без пояснень."
+                        )
+
+                    try:
+                        logger.info(
+                            f"{op_name}: спроба "
+                            f"{attempt}/{max_retries} "
+                            f"через {model} "
+                            f"(temperature={temperature})"
+                        )
+
+                        response = self.client.models.generate_content(
+                            model=model,
+                            contents=prompt + retry_hint,
+                            config=types.GenerateContentConfig(
+                                response_mime_type="application/json",
+                                temperature=temperature,
+                            ),
+                        )
+
+                        raw_text = self._clean_json_response(
+                            (response.text or "").strip()
+                        )
+
+                        if not raw_text:
+                            raise ValueError("Модель повернула порожню відповідь")
+
+                        try:
+                            data = json.loads(raw_text)
+                        except json.JSONDecodeError as json_error:
+                            logger.warning(
+                                "%s: невалідний JSON від %s, спроба %s/%s: %s",
+                                op_name,
+                                model,
+                                attempt,
+                                max_retries,
+                                json_error,
+                            )
+
+                            if attempt < max_retries:
+                                time.sleep(min(4 * attempt, 8))
+                                continue
+                            break
+
+                        if isinstance(data, dict):
+                            return data
+
+                        logger.warning(
+                            "%s: %s повернув JSON типу %s замість object.",
+                            op_name,
+                            model,
+                            type(data).__name__,
+                        )
+
+                        if attempt < max_retries:
+                            time.sleep(min(attempt, 2))
+                            continue
+                        break
+
+                    except Exception as e:
+                        err = str(e)
+
+                        transient_error = any(
+                            x in err
+                            for x in [
+                                "503",
+                                "429",
+                                "UNAVAILABLE",
+                                "ResourceExhausted",
+                            ]
+                        )
+
+                        model_unavailable = any(
+                            x in err
+                            for x in [
+                                "NOT_FOUND",
+                                "404",
+                            ]
+                        )
+
+                        if transient_error:
+                            logger.warning(
+                                "%s: тимчасова помилка моделі %s, спроба %s/%s: %s",
+                                op_name,
+                                model,
+                                attempt,
+                                max_retries,
+                                e,
+                            )
+                            if attempt < max_retries:
+                                time.sleep(min(5 * attempt, 10))
+                                continue
+                            break
+
+                        if model_unavailable:
+                            logger.warning(
+                                "%s: модель %s недоступна: %s. "
+                                "Переходимо до наступної.",
+                                op_name,
+                                model,
+                                e,
+                            )
+                            break
+
+                        logger.error(
+                            "Помилка "
+                            f"{op_name} "
+                            f"({model}), спроба {attempt}/{max_retries}: {e}"
+                        )
+
+                        if attempt < max_retries:
+                            time.sleep(min(2 * attempt, 4))
+                            continue
+
+                        break
+
+            return None
+
+        # Budgeted retry mode для primary/full/emergency Analyzer.
+        try:
+            budget_seconds = max(1.0, float(retry_budget_seconds))
+        except (TypeError, ValueError):
+            budget_seconds = 1.0
+
+        deadline = time.monotonic() + budget_seconds
+        disabled_models = set()
+        json_failed_models = set()
+        attempted_calls = 0
+
+        for round_no in range(1, max_retries + 1):
+            if time.monotonic() >= deadline:
+                break
+
+            attempted_this_round = False
+
+            for model in self.models_priority:
+                if model in disabled_models:
+                    continue
+
+                remaining_before_call = deadline - time.monotonic()
+                if remaining_before_call <= 0:
+                    break
+
+                attempted_this_round = True
+                attempted_calls += 1
+
                 retry_hint = ""
-                if attempt > 1:
+                if model in json_failed_models:
                     retry_hint = (
-                        "\n\nКРИТИЧНО: попередня відповідь не пройшла "
-                        "машинний JSON-парсер. Поверни ЛИШЕ один валідний "
-                        "JSON-об'єкт: подвійні лапки для ключів і рядків, "
-                        "без trailing commas, без Markdown і без пояснень."
+                        "\n\nКРИТИЧНО: попередня відповідь цієї моделі не "
+                        "пройшла машинний JSON-парсер. Поверни ЛИШЕ один "
+                        "валідний JSON-об'єкт: подвійні лапки для ключів і "
+                        "рядків, без trailing commas, без Markdown і без пояснень."
                     )
+
+                logger.info(
+                    "%s: budgeted спроба %s/%s через %s "
+                    "(round=%s, temperature=%s, budget_left=%.0fs)",
+                    op_name,
+                    round_no,
+                    max_retries,
+                    model,
+                    round_no,
+                    temperature,
+                    max(0.0, remaining_before_call),
+                )
 
                 try:
-                    logger.info(
-                        f"{op_name}: спроба "
-                        f"{attempt}/{max_retries} "
-                        f"через {model} "
-                        f"(temperature={temperature})"
-                    )
-
                     response = self.client.models.generate_content(
                         model=model,
                         contents=prompt + retry_hint,
@@ -7989,45 +8299,43 @@ discovery-блок.
                     raw_text = self._clean_json_response(
                         (response.text or "").strip()
                     )
-
                     if not raw_text:
                         raise ValueError("Модель повернула порожню відповідь")
 
                     try:
                         data = json.loads(raw_text)
                     except json.JSONDecodeError as json_error:
+                        json_failed_models.add(model)
                         logger.warning(
-                            "%s: невалідний JSON від %s, спроба %s/%s: %s",
+                            "%s: невалідний JSON від %s, budgeted round %s/%s: %s",
                             op_name,
                             model,
-                            attempt,
+                            round_no,
                             max_retries,
                             json_error,
                         )
-
-                        if attempt < max_retries:
-                            time.sleep(min(4 * attempt, 8))
-                            continue
-
-                        # Після вичерпання спроб цього model переходимо
-                        # до наступного model у cascade.
-                        break
+                        continue
 
                     if isinstance(data, dict):
+                        elapsed = max(0.0, budget_seconds - (deadline - time.monotonic()))
+                        logger.info(
+                            "%s: budgeted cascade успішний через %.1fs "
+                            "після %s API call(s).",
+                            op_name,
+                            elapsed,
+                            attempted_calls,
+                        )
                         return data
 
                     logger.warning(
-                        "%s: %s повернув JSON типу %s замість object.",
+                        "%s: %s повернув JSON типу %s замість object "
+                        "(budgeted round %s/%s).",
                         op_name,
                         model,
                         type(data).__name__,
+                        round_no,
+                        max_retries,
                     )
-
-                    if attempt < max_retries:
-                        time.sleep(min(attempt, 2))
-                        continue
-
-                    break
 
                 except Exception as e:
                     err = str(e)
@@ -8041,7 +8349,6 @@ discovery-блок.
                             "ResourceExhausted",
                         ]
                     )
-
                     model_unavailable = any(
                         x in err
                         for x in [
@@ -8052,43 +8359,72 @@ discovery-блок.
 
                     if transient_error:
                         logger.warning(
-                            "%s: тимчасова помилка моделі %s, спроба %s/%s: %s",
+                            "%s: тимчасова помилка моделі %s, "
+                            "budgeted round %s/%s: %s",
                             op_name,
                             model,
-                            attempt,
+                            round_no,
                             max_retries,
                             e,
                         )
-                        if attempt < max_retries:
-                            time.sleep(min(5 * attempt, 10))
-                            continue
-                        break
+                        continue
 
                     if model_unavailable:
+                        disabled_models.add(model)
                         logger.warning(
                             "%s: модель %s недоступна: %s. "
-                            "Переходимо до наступної.",
+                            "Вимикаємо її до кінця цього budgeted cascade.",
                             op_name,
                             model,
                             e,
                         )
-                        break
-
-                    logger.error(
-                        "Помилка "
-                        f"{op_name} "
-                        f"({model}), спроба {attempt}/{max_retries}: {e}"
-                    )
-
-                    # Для неочікуваної локальної/SDK помилки одна повторна
-                    # спроба теж корисна. Раніше тут був break уже після 1/2.
-                    if attempt < max_retries:
-                        time.sleep(min(2 * attempt, 4))
                         continue
 
-                    break
+                    logger.error(
+                        "%s: неочікувана помилка %s у budgeted round %s/%s: %s",
+                        op_name,
+                        model,
+                        round_no,
+                        max_retries,
+                        e,
+                    )
 
+            if not attempted_this_round:
+                break
+
+            if round_no >= max_retries:
+                break
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+
+            # Backoff після повного round, а не після кожної моделі:
+            # так fallback-модель перевіряється одразу. На довгому outage
+            # пауза росте 10 -> 15 -> 20 -> ... -> 30 с.
+            backoff = min(10.0 + (round_no - 1) * 5.0, 30.0)
+            sleep_for = min(backoff, max(0.0, remaining))
+            if sleep_for > 0:
+                logger.info(
+                    "%s: обидві доступні моделі не дали валідний JSON; "
+                    "чекаємо %.0fs перед наступним round (budget_left=%.0fs).",
+                    op_name,
+                    sleep_for,
+                    max(0.0, remaining),
+                )
+                time.sleep(sleep_for)
+
+        elapsed = max(0.0, budget_seconds - max(0.0, deadline - time.monotonic()))
+        logger.warning(
+            "%s: budgeted cascade вичерпано без валідного JSON "
+            "(elapsed=%.1fs, calls=%s, budget=%.0fs).",
+            op_name,
+            elapsed,
+            attempted_calls,
+            budget_seconds,
+        )
         return None
+
 
     @staticmethod
     def _history_item_parts(
@@ -9705,6 +10041,28 @@ CASES:
         text: str,
     ) -> str:
         text = text.strip()
+
+        # Фінальний fail-safe: навіть якщо Editor/Python fallback приніс
+        # Telegram/Markdown-посилання, у новинний текст вони не потрапляють.
+        text = re.sub(
+            r"\[([^\]]+)\]\((?:https?://|t\.me/)[^)]+\)",
+            r"\1",
+            text,
+            flags=re.IGNORECASE,
+        )
+        text = re.sub(
+            r"https?://\S+|t\.me/\S+",
+            " ",
+            text,
+            flags=re.IGNORECASE,
+        )
+        text = re.sub(
+            r"(?i)(?:^|[\n.!?]\s*)"
+            r"(?:підписатися|підписуй(?:ся|тесь)|subscribe)"
+            r"[^\n.!?]{0,180}(?=$|[\n.!?])",
+            " ",
+            text,
+        )
 
         text = re.sub(
             r"\[(?:ФОТО|ВІДЕО|ТЕКСТ|PHOTO|VIDEO|TEXT)\]\s*",
