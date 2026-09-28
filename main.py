@@ -872,6 +872,207 @@ async def _resolve_auto_media_for_item(
     return result
 
 
+
+async def _prepare_publication_item(
+    *,
+    item: dict,
+    posts: list,
+    collector,
+    publisher,
+    history,
+    reserved_media_fingerprints: set,
+    news_index: int,
+) -> dict | None:
+    """
+    PREPARE-фаза для одного елемента дайджесту.
+
+    Тут виконується все повільне й потенційно нестабільне ДО першої публікації:
+    - manual media lock;
+    - AUTO download;
+    - photo/video validation;
+    - fallback між media-кандидатами;
+    - same-cycle media reservation.
+
+    Після повернення цього dict Telegram-публікація вже не повинна чекати Gemini
+    або перебирати інші медіа. Вона лише відправляє зафіксований результат.
+    """
+    source_idx = item.get("source_id")
+
+    manual_media_source_idx = _locked_manual_media_source_for_item(
+        item,
+        posts,
+    )
+    manual_media_locked = manual_media_source_idx is not None
+    if manual_media_locked:
+        source_idx = manual_media_source_idx
+        logger.info(
+            "MANUAL MEDIA LOCK (prepare): news_index=%s event_id=%s source_id=%s",
+            news_index,
+            item.get("event_id"),
+            source_idx,
+        )
+
+    target_post = (
+        posts[source_idx]
+        if (
+            isinstance(source_idx, int)
+            and 0 <= source_idx < len(posts)
+        )
+        else None
+    )
+
+    if not target_post:
+        logger.warning(
+            "PUBLICATION PREP SKIP: news_index=%s event_id=%s "
+            "некоректний source_id=%r",
+            news_index,
+            item.get("event_id"),
+            source_idx,
+        )
+        return None
+
+    media_path = None
+    media_type = None
+    media_file_id = None
+    media_verdict = {}
+    media_rejected = False
+    media_reject_reason = ""
+    media_reuse_suppressed = False
+    media_fingerprint = None
+    original_media_path = None
+    original_media_file_id = None
+    original_media_type = None
+    attempted_media_source_ids = []
+
+    if manual_media_locked:
+        media_type = str(
+            target_post.get("manual_media_type") or ""
+        ).strip().lower()
+        candidate_path = str(
+            target_post.get("manual_media_path") or ""
+        ).strip()
+        if candidate_path and os.path.exists(candidate_path):
+            media_path = candidate_path
+
+        media_file_id = str(
+            target_post.get("manual_telegram_file_id")
+            or target_post.get("telegram_file_id")
+            or ""
+        ).strip() or None
+
+        # Manual media не має права тихо деградувати до text-only. Якщо файл
+        # справді втрачено, item не входить до prepared batch, а queue лишається
+        # pending для наступного циклу/повторної відправки.
+        if (
+            media_type not in {"photo", "video"}
+            or not (media_path or media_file_id)
+        ):
+            logger.error(
+                "MANUAL MEDIA LOCK FAILED DURING PREP: news_index=%s event_id=%s "
+                "source_id=%s path=%s file_id=%s type=%s. Queue лишається pending.",
+                news_index,
+                item.get("event_id"),
+                source_idx,
+                media_path,
+                bool(media_file_id),
+                media_type,
+            )
+            return None
+
+        original_media_path = media_path
+        original_media_file_id = media_file_id
+        original_media_type = media_type
+        media_verdict = {
+            "is_relevant": True,
+            "confidence": 100,
+            "reason": "manual_media_locked_no_validation",
+            "media_type": media_type,
+        }
+    else:
+        auto_media = await _resolve_auto_media_for_item(
+            item=item,
+            posts=posts,
+            collector=collector,
+            publisher=publisher,
+            history=history,
+            used_media_fingerprints=reserved_media_fingerprints,
+            news_index=news_index,
+        )
+
+        selected_source_idx = auto_media.get("source_idx")
+        if isinstance(selected_source_idx, int):
+            source_idx = selected_source_idx
+            target_post = posts[source_idx]
+
+        media_path = auto_media.get("media_path")
+        media_type = auto_media.get("media_type")
+        media_file_id = auto_media.get("media_file_id")
+        media_verdict = auto_media.get("media_verdict") or {}
+        media_rejected = bool(auto_media.get("media_rejected"))
+        media_reject_reason = str(
+            auto_media.get("media_reject_reason") or ""
+        )
+        media_reuse_suppressed = bool(
+            auto_media.get("media_reuse_suppressed")
+        )
+        media_fingerprint = auto_media.get("media_fingerprint")
+        original_media_path = auto_media.get("original_media_path")
+        original_media_type = auto_media.get("original_media_type")
+        attempted_media_source_ids = list(
+            auto_media.get("attempted_source_ids") or []
+        )
+
+        # Резервуємо медіа вже під час PREPARE, а не після publish. Інакше дві
+        # новини, підготовлені до старту випуску, могли б вибрати той самий файл.
+        # У persistent history записуємо лише ПІСЛЯ фактичної Telegram-публікації.
+        if (
+            media_path
+            and media_type in {"photo", "video"}
+            and media_fingerprint
+        ):
+            reserved_media_fingerprints.add(
+                (media_type, media_fingerprint)
+            )
+
+    # Посилання додаємо ПІСЛЯ media validation, щоб службовий рядок не впливав
+    # на Vision/video gate.
+    publication_text = append_reference_link(
+        item["text"],
+        item.get("reference_url"),
+        item.get("reference_label"),
+    )
+
+    logger.info(
+        "PUBLICATION PREP READY: news_index=%s event_id=%s media=%s "
+        "manual_locked=%s attempts=%s",
+        news_index,
+        item.get("event_id"),
+        media_type or "text-only",
+        manual_media_locked,
+        len(attempted_media_source_ids),
+    )
+
+    return {
+        "news_index": news_index,
+        "item": item,
+        "source_idx": source_idx,
+        "target_post": target_post,
+        "manual_media_locked": manual_media_locked,
+        "publication_text": publication_text,
+        "media_path": media_path,
+        "media_type": media_type,
+        "media_file_id": media_file_id,
+        "media_verdict": media_verdict,
+        "media_rejected": media_rejected,
+        "media_reject_reason": media_reject_reason,
+        "media_reuse_suppressed": media_reuse_suppressed,
+        "media_fingerprint": media_fingerprint,
+        "original_media_path": original_media_path,
+        "original_media_file_id": original_media_file_id,
+        "original_media_type": original_media_type,
+        "attempted_media_source_ids": attempted_media_source_ids,
+    }
+
 async def process_and_publish_news_cycle():
     cycle_started_at = datetime.now(
         timezone.utc
@@ -1052,213 +1253,140 @@ async def process_and_publish_news_cycle():
             )
             return
 
-        # 4. Header Telegram.
-        header_text = (
-            get_slot_header_text(
-                len(top_news)
-            )
+        # 4. PREPARE ALL: спочатку повністю готуємо ВЕСЬ Telegram batch.
+        #
+        # Раніше header + news #1 виходили одразу, а news #2 могла потім на 5 хв
+        # зависнути на download/Gemini media validation. Тепер читач не бачить
+        # внутрішню підготовку: Telegram стартує лише коли для кожної новини вже
+        # зафіксовано video/photo/text-only.
+        prepare_started = time.monotonic()
+        prepared_news = []
+        reserved_media_fingerprints = set()
+
+        logger.info(
+            "PUBLICATION PREP START: готуємо %s новин ДО першого Telegram-поста.",
+            len(top_news),
         )
 
-        header_published = (
-            await publisher.publish_telegram_post(
-                text=header_text
-            )
-        )
-
-        if not header_published:
-            logger.error(
-                "Не вдалося опублікувати header. "
-                "Цикл зупинено."
-            )
-            return
-
-        await asyncio.sleep(2)
-
-        # 5. Telegram-пости та медіа.
-        ig_media_items = []
-        published_news = []
-        published_manual_ids = set()
-        used_media_fingerprints = set()
-
-        for index, item in enumerate(
-            top_news,
-            start=1,
-        ):
-            source_idx = item.get(
-                "source_id"
-            )
-
-            manual_media_source_idx = _locked_manual_media_source_for_item(
-                item,
-                posts,
-            )
-            manual_media_locked = manual_media_source_idx is not None
-            if manual_media_locked:
-                source_idx = manual_media_source_idx
-                logger.info(
-                    "MANUAL MEDIA LOCK (publish): news_index=%s event_id=%s "
-                    "source_id=%s",
-                    index,
-                    item.get("event_id"),
-                    source_idx,
-                )
-
-            target_post = (
-                posts[source_idx]
-                if (
-                    isinstance(
-                        source_idx,
-                        int,
-                    )
-                    and 0
-                    <= source_idx
-                    < len(posts)
-                )
-                else None
-            )
-
-            if not target_post:
-                logger.warning(
-                    "Новина #%s пропущена: "
-                    "некоректний source_id=%r",
-                    index,
-                    source_idx,
-                )
-                continue
-
-            media_path = None
-            media_type = None
-            media_file_id = None
-            media_verdict = {}
-            media_rejected = False
-            media_reject_reason = ""
-            media_reuse_suppressed = False
-            media_fingerprint = None
-            original_media_path = None
-            original_media_file_id = None
-            original_media_type = None
-            attempted_media_source_ids = []
-
-            if manual_media_locked:
-                media_type = str(
-                    target_post.get("manual_media_type") or ""
-                ).strip().lower()
-                candidate_path = str(
-                    target_post.get("manual_media_path") or ""
-                ).strip()
-                if candidate_path and os.path.exists(candidate_path):
-                    media_path = candidate_path
-
-                media_file_id = str(
-                    target_post.get("manual_telegram_file_id")
-                    or target_post.get("telegram_file_id")
-                    or ""
-                ).strip() or None
-
-                # Manual media має дві рівноправні форми: локальний файл або
-                # Telegram file_id. Якщо немає обох — НЕ публікуємо текстом і
-                # НЕ позначаємо queue processed.
-                if (
-                    media_type not in {"photo", "video"}
-                    or not (media_path or media_file_id)
-                ):
-                    logger.error(
-                        "MANUAL MEDIA LOCK FAILED: news_index=%s event_id=%s "
-                        "source_id=%s path=%s file_id=%s type=%s. "
-                        "Queue лишається pending.",
-                        index,
-                        item.get("event_id"),
-                        source_idx,
-                        media_path,
-                        bool(media_file_id),
-                        media_type,
-                    )
-                    continue
-
-                original_media_path = media_path
-                original_media_file_id = media_file_id
-                original_media_type = media_type
-                media_verdict = {
-                    "is_relevant": True,
-                    "confidence": 100,
-                    "reason": "manual_media_locked_no_validation",
-                    "media_type": media_type,
-                }
-            else:
-                # AUTO media is now resilient: if the first attachment is wrong,
-                # missing or recently reused, try the next safe media source from
-                # the SAME event before giving up and publishing text-only.
-                auto_media = await _resolve_auto_media_for_item(
+        for index, item in enumerate(top_news, start=1):
+            try:
+                prepared = await _prepare_publication_item(
                     item=item,
                     posts=posts,
                     collector=collector,
                     publisher=publisher,
                     history=history,
-                    used_media_fingerprints=used_media_fingerprints,
+                    reserved_media_fingerprints=reserved_media_fingerprints,
                     news_index=index,
                 )
-
-                selected_source_idx = auto_media.get("source_idx")
-                if isinstance(selected_source_idx, int):
-                    source_idx = selected_source_idx
-                    target_post = posts[source_idx]
-
-                media_path = auto_media.get("media_path")
-                media_type = auto_media.get("media_type")
-                media_file_id = auto_media.get("media_file_id")
-                media_verdict = auto_media.get("media_verdict") or {}
-                media_rejected = bool(auto_media.get("media_rejected"))
-                media_reject_reason = str(
-                    auto_media.get("media_reject_reason") or ""
+            except Exception as prep_exc:
+                # AUTO item краще пропустити/залишити manual pending, ніж почати
+                # напівготовий випуск і зависнути посередині.
+                logger.error(
+                    "PUBLICATION PREP FAILED: news_index=%s event_id=%s error=%s",
+                    index,
+                    item.get("event_id"),
+                    prep_exc,
+                    exc_info=True,
                 )
-                media_reuse_suppressed = bool(
-                    auto_media.get("media_reuse_suppressed")
-                )
-                media_fingerprint = auto_media.get("media_fingerprint")
-                original_media_path = auto_media.get("original_media_path")
-                original_media_type = auto_media.get("original_media_type")
-                attempted_media_source_ids = list(
-                    auto_media.get("attempted_source_ids") or []
-                )
+                prepared = None
 
-            # Посилання додаємо ПІСЛЯ Vision-перевірки,
-            # щоб службовий рядок не впливав на media-gate.
-            publication_text = append_reference_link(
-                item["text"],
-                item.get("reference_url"),
-                item.get("reference_label"),
+            if prepared is not None:
+                prepared_news.append(prepared)
+
+        prepare_elapsed = time.monotonic() - prepare_started
+        logger.info(
+            "PUBLICATION PREP COMPLETE: ready=%s/%s elapsed=%.1fs. "
+            "Тепер запускаємо безперервну Telegram-публікацію.",
+            len(prepared_news),
+            len(top_news),
+            prepare_elapsed,
+        )
+
+        if not prepared_news:
+            logger.error(
+                "Після PREPARE-фази немає жодної готової новини. "
+                "Header не публікуємо."
+            )
+            return
+
+        # 5. PUBLISH ALL: header + уже повністю підготовлені новини по черзі.
+        # Ніяких Gemini/media-selection між Telegram-постами тут більше немає.
+        header_text = get_slot_header_text(len(prepared_news))
+        header_published = await publisher.publish_telegram_post(
+            text=header_text
+        )
+
+        if not header_published:
+            logger.error(
+                "Не вдалося опублікувати header. Цикл зупинено."
+            )
+            return
+
+        await asyncio.sleep(2)
+
+        ig_media_items = []
+        published_news = []
+        published_manual_ids = set()
+
+        for publish_position, prepared in enumerate(prepared_news, start=1):
+            item = prepared["item"]
+            original_index = prepared["news_index"]
+            source_idx = prepared["source_idx"]
+            target_post = prepared["target_post"]
+            manual_media_locked = prepared["manual_media_locked"]
+            publication_text = prepared["publication_text"]
+            media_path = prepared["media_path"]
+            media_type = prepared["media_type"]
+            media_file_id = prepared["media_file_id"]
+            media_verdict = prepared["media_verdict"]
+            media_rejected = prepared["media_rejected"]
+            media_reject_reason = prepared["media_reject_reason"]
+            media_reuse_suppressed = prepared["media_reuse_suppressed"]
+            media_fingerprint = prepared["media_fingerprint"]
+            original_media_path = prepared["original_media_path"]
+            original_media_file_id = prepared["original_media_file_id"]
+            original_media_type = prepared["original_media_type"]
+            attempted_media_source_ids = prepared["attempted_media_source_ids"]
+
+            logger.info(
+                "PUBLISH READY ITEM: position=%s/%s original_index=%s event_id=%s "
+                "media=%s",
+                publish_position,
+                len(prepared_news),
+                original_index,
+                item.get("event_id"),
+                media_type or "text-only",
             )
 
-            published = (
-                await publisher.publish_telegram_post(
-                    text=publication_text,
-                    media_path=media_path,
-                    media_type=media_type,
-                    media_file_id=media_file_id,
-
-                    # Уже перевірили вище; manual взагалі bypass.
-                    validate_media=False,
-                    # Manual не має права тихо впасти до text-only.
-                    require_media=manual_media_locked,
-                )
+            published = await publisher.publish_telegram_post(
+                text=publication_text,
+                media_path=media_path,
+                media_type=media_type,
+                media_file_id=media_file_id,
+                # Усе вже перевірено під час PREPARE; manual взагалі bypass.
+                validate_media=False,
+                # Manual не має права тихо впасти до text-only.
+                require_media=manual_media_locked,
             )
 
             if not published:
                 logger.warning(
-                    f"Новина #{index} не опублікована."
+                    "Новина position=%s original_index=%s не опублікована.",
+                    publish_position,
+                    original_index,
                 )
                 await asyncio.sleep(3)
                 continue
 
+            # Same-cycle fingerprint уже зарезервовано у PREPARE. У persistent
+            # history записуємо лише реально опубліковане AUTO media.
             if (
                 not manual_media_locked
                 and media_path
                 and media_type in {"photo", "video"}
                 and media_fingerprint
             ):
-                used_media_fingerprints.add(
-                    (media_type, media_fingerprint)
-                )
                 history.record_media_used(
                     media_fingerprint,
                     media_type,
@@ -1269,9 +1397,7 @@ async def process_and_publish_news_cycle():
             # source_id in audit/runtime must reflect the media source actually
             # published after the independent manual-media lock.
             published_item["source_id"] = source_idx
-            published_item["text"] = (
-                publication_text
-            )
+            published_item["text"] = publication_text
 
             all_manual_ids, safe_manual_ids = _manual_queue_ids_for_item(
                 item,
@@ -1295,8 +1421,7 @@ async def process_and_publish_news_cycle():
                 )
 
             # Manual queue_id стає processed ОДРАЗУ після успішної Telegram-
-            # публікації конкретного item. Instagram/history помилка пізніше в
-            # циклі вже не повинна змусити цю ручну новину вийти вдруге.
+            # публікації конкретного item. PREPARE сам по собі state не змінює.
             if safe_manual_ids:
                 try:
                     history.mark_manual_posts_processed(
@@ -1317,8 +1442,6 @@ async def process_and_publish_news_cycle():
                     )
 
             # Runtime telemetry лише для post-publication audit.
-            # Ці службові поля не публікуються в Telegram і не
-            # записуються у semantic history.
             published_item["_audit_media"] = {
                 "original_path": original_media_path,
                 "original_file_id": bool(original_media_file_id),
@@ -1353,16 +1476,16 @@ async def process_and_publish_news_cycle():
                     and source_idx != item.get("source_id")
                     and media_path
                 ),
+                # Нове поле для audit/debug: це медіа було підготовлено до старту
+                # Telegram batch, а не вибиралося вже між постами.
+                "prepared_before_batch": True,
             }
 
-            published_news.append(
-                published_item
-            )
+            published_news.append(published_item)
 
             if (
                 media_path
-                and media_type
-                in {"photo", "video"}
+                and media_type in {"photo", "video"}
             ):
                 ig_media_items.append({
                     "path": media_path,
@@ -1370,113 +1493,60 @@ async def process_and_publish_news_cycle():
                 })
 
                 logger.info(
-                    "Instagram media "
-                    f"#{index}: {media_type} "
-                    f"→ {media_path}"
+                    "Instagram media #%s: %s → %s",
+                    publish_position,
+                    media_type,
+                    media_path,
                 )
 
-            first_line = (
-                publication_text
-                .strip()
-                .split("\n")[0]
-            )
+            first_line = publication_text.strip().split("\n")[0]
 
             # Зберігаємо в історію ВСІ source_ids події,
             # а не тільки пост, з якого взяли медіа.
-            source_ids = item.get(
-                "source_ids"
-            )
-
-            if not isinstance(
-                source_ids,
-                list,
-            ):
-                source_ids = [
-                    source_idx
-                ]
+            source_ids = item.get("source_ids")
+            if not isinstance(source_ids, list):
+                source_ids = [source_idx]
+            else:
+                # Не мутуємо item із top_news під час history bookkeeping.
+                source_ids = list(source_ids)
 
             if source_idx not in source_ids:
-                source_ids.append(
-                    source_idx
-                )
+                source_ids.append(source_idx)
 
             seen_source_ids = set()
-
             for event_source_idx in source_ids:
                 if (
-                    not isinstance(
-                        event_source_idx,
-                        int,
-                    )
-                    or event_source_idx
-                    in seen_source_ids
-                    or not (
-                        0
-                        <= event_source_idx
-                        < len(posts)
-                    )
+                    not isinstance(event_source_idx, int)
+                    or event_source_idx in seen_source_ids
+                    or not (0 <= event_source_idx < len(posts))
                 ):
                     continue
 
-                seen_source_ids.add(
-                    event_source_idx
-                )
-
-                event_post = posts[
-                    event_source_idx
-                ]
+                seen_source_ids.add(event_source_idx)
+                event_post = posts[event_source_idx]
 
                 history_channel = (
-                    event_post.get(
-                        "channel_username"
-                    )
-                    or event_post.get(
-                        "channel_name"
-                    )
-                    or event_post.get(
-                        "channel_title"
-                    )
+                    event_post.get("channel_username")
+                    or event_post.get("channel_name")
+                    or event_post.get("channel_title")
                     or "unknown"
                 )
-
-                history_message_id = (
-                    event_post.get(
-                        "message_id"
-                    )
-                )
-
-                if not isinstance(
-                    history_message_id,
-                    int,
-                ):
+                history_message_id = event_post.get("message_id")
+                if not isinstance(history_message_id, int):
                     continue
 
                 history.mark_as_published(
                     channel_name=history_channel,
                     message_id=history_message_id,
                     title=first_line,
-
-                    # Зберігаємо повний редакторський текст
-                    # без URL, щоб наступні цикли мали
-                    # сильніший semantic history context.
+                    # Зберігаємо повний редакторський текст без URL, щоб наступні
+                    # цикли мали сильніший semantic history context.
                     summary=item.get(
                         "text",
-                        item.get(
-                            "summary",
-                            "",
-                        ),
+                        item.get("summary", ""),
                     ),
-
-                    category=item.get(
-                        "category",
-                        "",
-                    ),
+                    category=item.get("category", ""),
                 )
-
-                # processed-state оновлюємо нижче з safe_manual_ids конкретного
-                # УСПІШНО опублікованого item. Не позначаємо всі source_ids
-                # автоматично: це й було причиною хибного "3 processed" після
-                # одного невдалого multi-manual merge.
 
             await asyncio.sleep(3)
 
@@ -1695,4 +1765,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
