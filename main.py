@@ -503,6 +503,8 @@ def _build_manual_publication_fallback(
         "is_priority": True,
         "priority_source_ids": [source_idx],
         "manual_merge_verified": True,
+        "manual_fact_locked": True,
+        "manual_fact_source_ids": [source_idx],
         "reference_url": None,
         "reference_label": None,
         "_main_manual_fallback": True,
@@ -571,6 +573,116 @@ def _ensure_manual_items_before_publish(
         )
         result.insert(insert_at, fallback)
         covered.add(queue_id)
+
+    return result
+
+
+def _manual_source_indexes_for_item(
+    item: dict,
+    posts: list,
+) -> list[int]:
+    """Return concrete admin/manual source indexes referenced by one final item."""
+    ordered = []
+    for value in (
+        item.get("manual_fact_source_ids") or []
+    ):
+        if isinstance(value, int):
+            ordered.append(value)
+    for value in (item.get("priority_source_ids") or []):
+        if isinstance(value, int):
+            ordered.append(value)
+    if isinstance(item.get("source_id"), int):
+        ordered.append(item.get("source_id"))
+    raw_sources = item.get("source_ids")
+    if isinstance(raw_sources, list):
+        ordered.extend(value for value in raw_sources if isinstance(value, int))
+
+    result = []
+    seen = set()
+    for source_idx in ordered:
+        if source_idx in seen or not (0 <= source_idx < len(posts)):
+            continue
+        seen.add(source_idx)
+        if bool(posts[source_idx].get("is_priority")):
+            result.append(source_idx)
+    return result
+
+
+def _enforce_manual_fact_lock_before_publish(
+    top_news: list,
+    posts: list,
+) -> list:
+    """
+    Publication-boundary invariant for manual news.
+
+    New Summarizer versions mark manual items as manual_fact_locked and rebuild
+    them from admin-only sources. If an older/regressed code path ever reaches
+    main without that marker, do NOT trust the mixed Editor text: replace it
+    with a raw-safe manual-only fallback before any media preparation starts.
+    """
+    result = []
+    for item in top_news or []:
+        if not isinstance(item, dict):
+            continue
+        item_copy = dict(item)
+        manual_sources = _manual_source_indexes_for_item(item_copy, posts)
+        if not manual_sources:
+            result.append(item_copy)
+            continue
+
+        source_ids = item_copy.get("source_ids")
+        source_ids = source_ids if isinstance(source_ids, list) else []
+        foreign_sources = [
+            sid for sid in source_ids
+            if isinstance(sid, int)
+            and 0 <= sid < len(posts)
+            and not bool(posts[sid].get("is_priority"))
+        ]
+
+        if bool(item_copy.get("manual_fact_locked")) and not foreign_sources:
+            item_copy["source_ids"] = list(manual_sources)
+            item_copy["priority_source_ids"] = list(manual_sources)
+            item_copy["manual_fact_source_ids"] = list(manual_sources)
+            logger.info(
+                "PRE-PUBLISH MANUAL FACT LOCK OK: event_id=%s source_ids=%s",
+                item_copy.get("event_id"),
+                manual_sources,
+            )
+            result.append(item_copy)
+            continue
+
+        # Last-resort fail-safe: use exactly one concrete manual source. If an
+        # unverified multi-manual merge slipped through, publishing one clean
+        # admin item is safer than one post containing several unrelated stories.
+        preferred = item_copy.get("source_id")
+        source_idx = (
+            preferred
+            if isinstance(preferred, int) and preferred in manual_sources
+            else manual_sources[0]
+        )
+        fallback = _build_manual_publication_fallback(posts[source_idx], source_idx)
+        if not fallback:
+            logger.error(
+                "PRE-PUBLISH MANUAL FACT LOCK FAILED: event_id=%s source_id=%s",
+                item_copy.get("event_id"),
+                source_idx,
+            )
+            result.append(item_copy)
+            continue
+
+        # Keep the existing event_id so history/order/audit still refer to the
+        # same selected event, but factual text/source are manual-only.
+        fallback["event_id"] = str(
+            item_copy.get("event_id") or fallback.get("event_id") or ""
+        )
+        logger.error(
+            "PRE-PUBLISH MANUAL FACT LOCK REBUILT: event_id=%s manual_source=%s "
+            "foreign_sources=%s. Mixed text was discarded.",
+            fallback.get("event_id"),
+            source_idx,
+            foreign_sources,
+        )
+        result.append(fallback)
 
     return result
 
@@ -1239,6 +1351,13 @@ async def process_and_publish_news_cycle():
             top_news,
             posts,
             expected_manual_ids,
+        )
+
+        # Hard publication boundary: a manual story must contain ONLY facts from
+        # its admin source(s). This is independent of Analyzer/Editor correctness.
+        top_news = _enforce_manual_fact_lock_before_publish(
+            top_news,
+            posts,
         )
 
         logger.info(

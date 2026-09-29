@@ -673,8 +673,20 @@ class NewsSummarizer:
             effective_count,
         )
 
+        # Manual-події редагуємо ОКРЕМИМ single-event редактором.
+        # Він бачить тільки тексти конкретних manual source IDs цієї події,
+        # тому може нормально переписати/скорочувати пост, але фізично не має
+        # доступу до сусідніх AUTO-новин і не може домішати їхні факти.
+        validated = self._edit_manual_news_in_final(
+            validated,
+            ranked_events,
+            posts,
+            max_retries_per_model,
+        )
+
         # Фінальний factual pass після всіх fallback/priority/mix/manual guard.
-        # Тепер перевіряються всі фактичні 7-10 постів.
+        # Manual тут навмисно пропускаються: вони вже пройшли ізольований
+        # MANUAL_EDITOR, а batch-перевірка не повинна знову змішувати кейси.
         validated = self._fact_check_final_news(
             validated,
             ranked_events,
@@ -2976,6 +2988,92 @@ TELEGRAM POSTS:
             for b in right_ids
         )
 
+    def _lock_manual_event_facts(
+        self,
+        event: Dict[str, Any],
+        posts: List[Dict[str, Any]],
+        *,
+        sequence: int = 1,
+    ) -> Dict[str, Any]:
+        """
+        Hard invariant for admin/manual news.
+
+        If an event contains at least one priority source, the factual payload of
+        that event is rebuilt ONLY from the priority source(s). AUTO sources may
+        never enrich headline/summary/key_facts for a manual event, because a
+        broad Analyzer merge can otherwise leak facts from a neighbouring story.
+
+        This intentionally prefers a shorter manual-only item over a richer but
+        potentially contaminated item. The admin already selected the story; the
+        safest contract is: manual text + manual media are immutable facts.
+        """
+        if not isinstance(event, dict):
+            return event
+
+        priority_ids = self._priority_source_ids_for_event(event, posts)
+        if not priority_ids:
+            return dict(event)
+
+        # If several manual posts ended up in one event, keep together only the
+        # group already verified as the same real event. Distinct manuals are
+        # split earlier by _separate_distinct_priority_events.
+        if (
+            len(priority_ids) > 1
+            and not self._priority_group_is_verified_duplicate(priority_ids, posts)
+        ):
+            logger.error(
+                "MANUAL FACT LOCK received unverified multi-manual event_id=%s ids=%s; "
+                "using the first manual as the factual anchor.",
+                event.get("event_id"),
+                priority_ids,
+            )
+            priority_ids = priority_ids[:1]
+
+        original_ids = self._valid_source_ids(event.get("source_ids"), posts)
+        dropped_auto = [sid for sid in original_ids if sid not in priority_ids]
+
+        locked = self._build_synthetic_priority_event(
+            priority_ids,
+            posts,
+            sequence,
+        )
+        locked["event_id"] = str(
+            event.get("event_id") or locked.get("event_id") or f"P_LOCK_{sequence}"
+        )
+        locked["manual_fact_locked"] = True
+        locked["manual_fact_source_ids"] = list(priority_ids)
+        locked["manual_merge_verified"] = (
+            len(priority_ids) <= 1
+            or self._priority_group_is_verified_duplicate(priority_ids, posts)
+        )
+
+        # Manual override remains publishable even when it resembles history.
+        # Preserve only history telemetry, never foreign factual text/scores.
+        locked["is_history_repeat"] = bool(event.get("is_history_repeat", False))
+        locked["history_hard_duplicate"] = bool(event.get("history_hard_duplicate", False))
+        locked["history_update_strength"] = self._safe_score(
+            event.get("history_update_strength")
+        )
+        locked["eligible_for_digest"] = True
+        locked["rejection_reason"] = ""
+
+        if dropped_auto:
+            logger.warning(
+                "MANUAL FACT LOCK: event_id=%s kept manual source_ids=%s; "
+                "detached AUTO source_ids=%s to prevent cross-story contamination.",
+                locked.get("event_id"),
+                priority_ids,
+                dropped_auto,
+            )
+        else:
+            logger.info(
+                "MANUAL FACT LOCK: event_id=%s source_ids=%s.",
+                locked.get("event_id"),
+                priority_ids,
+            )
+
+        return locked
+
     def _separate_distinct_priority_events(
         self,
         events: List[Dict[str, Any]],
@@ -2989,7 +3087,16 @@ TELEGRAM POSTS:
                 continue
             event = dict(raw_event)
             priority_ids = self._priority_source_ids_for_event(event, posts)
-            if len(priority_ids) <= 1:
+            if len(priority_ids) == 1:
+                result.append(
+                    self._lock_manual_event_facts(
+                        event,
+                        posts,
+                        sequence=len(result) + 1,
+                    )
+                )
+                continue
+            if not priority_ids:
                 event["manual_merge_verified"] = True
                 result.append(event)
                 continue
@@ -3009,8 +3116,13 @@ TELEGRAM POSTS:
                     groups.append([source_id])
 
             if len(groups) == 1:
-                event["manual_merge_verified"] = True
-                result.append(event)
+                result.append(
+                    self._lock_manual_event_facts(
+                        event,
+                        posts,
+                        sequence=len(result) + 1,
+                    )
+                )
                 continue
 
             split_count += len(groups) - 1
@@ -3036,6 +3148,8 @@ TELEGRAM POSTS:
                     len(group) <= 1
                     or self._priority_group_is_verified_duplicate(group, posts)
                 )
+                synthetic["manual_fact_locked"] = True
+                synthetic["manual_fact_source_ids"] = list(group)
                 result.append(synthetic)
 
         if split_count:
@@ -3737,6 +3851,15 @@ MANUAL POSTS:
                     or incoming.get("rejection_reason")
                     or ""
                 ).strip()
+
+        if has_priority:
+            # Hard boundary: no later recovery/discovery merge may re-introduce
+            # AUTO facts into an admin-selected story.
+            return self._lock_manual_event_facts(
+                merged,
+                posts,
+                sequence=1,
+            )
 
         return merged
 
@@ -5862,6 +5985,184 @@ MANUAL POSTS:
 
         return ranked
 
+    def _edit_manual_news_in_final(
+        self,
+        news: List[Dict[str, Any]],
+        ranked_events: List[Dict[str, Any]],
+        posts: List[Dict[str, Any]],
+        max_retries: int,
+    ) -> List[Dict[str, Any]]:
+        """
+        Isolated editor for admin/manual news.
+
+        The general Editor may see dozens of events at once, which is useful for
+        selecting and ordering a digest but unsafe for a manual story: a model can
+        accidentally pull a detail from a neighbouring event. Here every manual
+        item is rewritten in a separate request that contains ONLY the manual
+        source text(s) belonging to that event.
+
+        On any model/JSON failure we keep the deterministic manual-only fallback,
+        so a manual item is never lost merely because Gemini is unavailable.
+        """
+        if not news:
+            return news
+
+        event_map = {
+            str(ev.get("event_id") or ""): ev
+            for ev in ranked_events
+            if isinstance(ev, dict) and ev.get("event_id")
+        }
+
+        result: List[Dict[str, Any]] = []
+
+        for raw_item in news:
+            if not isinstance(raw_item, dict):
+                continue
+
+            item = dict(raw_item)
+            if not item.get("is_priority"):
+                result.append(item)
+                continue
+
+            event_id = str(item.get("event_id") or "")
+            ev = event_map.get(event_id)
+            if not ev:
+                logger.error(
+                    "MANUAL_EDITOR skipped: event_id=%s absent from ranked_events.",
+                    event_id,
+                )
+                result.append(item)
+                continue
+
+            manual_ids = self._valid_source_ids(
+                ev.get("manual_fact_source_ids"),
+                posts,
+            )
+            manual_ids = [
+                sid
+                for sid in manual_ids
+                if bool(posts[sid].get("is_priority"))
+            ]
+            if not manual_ids:
+                manual_ids = self._priority_source_ids_for_event(ev, posts)
+
+            # Absolute safety: never expose AUTO sources to MANUAL_EDITOR.
+            manual_ids = [
+                sid
+                for sid in self._valid_source_ids(manual_ids, posts)
+                if bool(posts[sid].get("is_priority"))
+            ]
+
+            if not manual_ids:
+                logger.error(
+                    "MANUAL_EDITOR has no manual-only source_ids for event_id=%s; "
+                    "keeping deterministic fallback text.",
+                    event_id,
+                )
+                result.append(item)
+                continue
+
+            source_blocks = []
+            for seq, source_id in enumerate(manual_ids, start=1):
+                source_text = self._clean_source_text_for_fallback(
+                    str(posts[source_id].get("text") or "")
+                )
+                if not source_text:
+                    continue
+                source_blocks.append(
+                    f"MANUAL SOURCE {seq}:\n{source_text[:self.MAX_EVENT_SOURCE_CHARS]}"
+                )
+
+            if not source_blocks:
+                logger.warning(
+                    "MANUAL_EDITOR empty source text for event_id=%s; "
+                    "keeping deterministic fallback.",
+                    event_id,
+                )
+                result.append(item)
+                continue
+
+            category = str(ev.get("category") or "other")
+            prompt = f"""
+Ти — редактор українського Telegram-дайджесту.
+
+Перед тобою ОДНА ручна новина адміністратора. Твоє завдання — лише
+нормально відредагувати її для публікації: зробити природний короткий
+заголовок, прибрати сирі формулювання/повтори й скласти 2-6 завершених
+речень у стилі сучасного новинного Telegram-каналу.
+
+КРИТИЧНО:
+- використовуй ТІЛЬКИ факти з MANUAL SOURCE нижче;
+- НЕ додавай контекст з інших новин, навіть якщо він здається логічним;
+- НЕ домислюй причини, наслідки, цифри, імена, місця чи статуси;
+- зберігай модальність: "може/заявив/за даними" не перетворюй на факт;
+- якщо джерело коротке, зроби короткий пост — не заповнюй обсяг водою;
+- прибери Telegram-рекламу, посилання, "підписатися" та службові фрази;
+- не згадуй, що це ручна новина або що ти її редагував;
+- максимум {self.MAX_NEWS_CHARS} символів;
+- формат: один тематичний емодзі + <b>Заголовок</b>, порожній рядок,
+  потім 2-6 речень. Якщо факт один і дуже короткий — дозволено 1-2 речення.
+
+Категорія (лише для вибору нейтрального емодзі): {category}
+
+{chr(10).join(source_blocks)}
+
+ВІДПОВІДЬ ТІЛЬКИ JSON:
+{{"text":"📰 <b>Заголовок</b>\\n\\nВідредагований текст."}}
+"""
+
+            data = self._call_json_with_cascade(
+                prompt,
+                max_retries,
+                "MANUAL_EDITOR",
+                temperature=0.22,
+            )
+
+            edited_text = ""
+            if isinstance(data, dict):
+                edited_text = str(data.get("text") or "").strip()
+                if not edited_text:
+                    raw_news = data.get("news")
+                    if isinstance(raw_news, list) and raw_news:
+                        first = raw_news[0]
+                        if isinstance(first, dict):
+                            edited_text = str(first.get("text") or "").strip()
+
+            if edited_text:
+                cleaned = self._clean_generated_news_text(edited_text)
+            else:
+                cleaned = ""
+
+            if not cleaned:
+                # Do not lose the manual item on an LLM outage/malformed JSON.
+                fallback = self._build_fallback_news_item(ev, posts)
+                if fallback and str(fallback.get("text") or "").strip():
+                    item["text"] = str(fallback["text"]).strip()
+                    item["manual_editor_applied"] = False
+                    item["manual_editor_fallback"] = True
+                    logger.warning(
+                        "MANUAL_EDITOR fallback used for event_id=%s source_ids=%s.",
+                        event_id,
+                        manual_ids,
+                    )
+                result.append(item)
+                continue
+
+            item["text"] = cleaned
+            item["manual_editor_applied"] = True
+            item["manual_editor_fallback"] = False
+            item["manual_fact_locked"] = True
+            item["manual_fact_source_ids"] = list(manual_ids)
+            logger.info(
+                "MANUAL_EDITOR OK: event_id=%s manual_source_ids=%s chars=%s.",
+                event_id,
+                manual_ids,
+                len(cleaned),
+            )
+            result.append(item)
+
+        return result
+
     def _fact_check_final_news(
         self,
         news: List[Dict[str, Any]],
@@ -5897,6 +6198,12 @@ MANUAL POSTS:
             text = str(item.get("text") or "").strip()
             ev = event_map.get(event_id)
             if not event_id or not text or not ev:
+                continue
+
+            if ev.get("is_priority"):
+                # Manual items are rebuilt from manual-only sources and are not
+                # sent through a multi-case LLM rewrite. This prevents facts from
+                # neighbouring cases leaking back into the admin story.
                 continue
 
             source_ids = self._valid_source_ids(ev.get("source_ids"), posts)
@@ -6453,6 +6760,12 @@ discovery-блок.
 
             ev = event_map[event_id]
 
+            if ev.get("is_priority"):
+                manual_item = self._build_fallback_news_item(ev, posts)
+                if manual_item:
+                    final_list.append(manual_item)
+                continue
+
             final_list.append({
                 "event_id": event_id,
                 "source_id": ev["best_source_id"],
@@ -6676,6 +6989,18 @@ discovery-блок.
                 continue
 
             ev = event_map[event_id]
+
+            if ev.get("is_priority"):
+                manual_item = self._build_fallback_news_item(ev, posts)
+                if not manual_item:
+                    logger.error(
+                        "MANUAL FACT LOCK final rebuild failed event_id=%s",
+                        event_id,
+                    )
+                    continue
+                text = str(manual_item.get("text") or "").strip()
+                source_id = manual_item.get("source_id")
+
             locked_source = ev.get("manual_media_source_id")
             if (
                 bool(ev.get("manual_media_locked"))
@@ -6715,6 +7040,8 @@ discovery-блок.
                 "manual_merge_verified": bool(ev.get("manual_merge_verified", True)),
                 "manual_media_locked": bool(ev.get("manual_media_locked", False)),
                 "manual_media_source_id": ev.get("manual_media_source_id"),
+                "manual_fact_locked": bool(ev.get("manual_fact_locked", False)),
+                "manual_fact_source_ids": list(ev.get("manual_fact_source_ids", []) or []),
                 "video_validation_needed": bool(ev.get("video_validation_needed", False)),
                 "visual_media_required": bool(ev.get("visual_media_required", False)),
                 "reference_url": reference_url,
@@ -7106,6 +7433,8 @@ discovery-блок.
             "manual_merge_verified": bool(ev.get("manual_merge_verified", True)),
             "manual_media_locked": bool(ev.get("manual_media_locked", False)),
             "manual_media_source_id": ev.get("manual_media_source_id"),
+            "manual_fact_locked": bool(ev.get("manual_fact_locked", False)),
+            "manual_fact_source_ids": list(ev.get("manual_fact_source_ids", []) or []),
             "video_validation_needed": bool(ev.get("video_validation_needed", False)),
             "visual_media_required": bool(ev.get("visual_media_required", False)),
             "reference_url": reference_url,
