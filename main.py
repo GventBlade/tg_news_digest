@@ -1428,6 +1428,7 @@ async def _prepare_publication_item(
 
     Тут виконується все повільне й потенційно нестабільне ДО першої публікації:
     - manual media lock;
+    - manual album resolve;
     - AUTO download;
     - photo/video validation;
     - fallback між media-кандидатами;
@@ -1438,11 +1439,58 @@ async def _prepare_publication_item(
     """
     source_idx = item.get("source_id")
 
+    # УСІ локальні змінні ініціалізуємо до будь-якої гілки. Це важливо:
+    # AUTO text/photo/video та manual photo/video/album повинні мати однаковий
+    # контракт повернення і не можуть падати через нестворену змінну.
+    target_post = (
+        posts[source_idx]
+        if isinstance(source_idx, int) and 0 <= source_idx < len(posts)
+        else None
+    )
+    media_path = None
+    media_type = None
+    media_file_id = None
+    media_items = []
+    media_verdict = {}
+    media_rejected = False
+    media_reject_reason = ""
+    media_reuse_suppressed = False
+    media_fingerprint = None
+    original_media_path = None
+    original_media_file_id = None
+    original_media_type = None
+    attempted_media_source_ids = []
+
     manual_media_source_idx = _locked_manual_media_source_for_item(
         item,
         posts,
     )
     manual_media_locked = manual_media_source_idx is not None
+
+    if manual_media_locked:
+        source_idx = manual_media_source_idx
+        target_post = (
+            posts[source_idx]
+            if isinstance(source_idx, int) and 0 <= source_idx < len(posts)
+            else None
+        )
+        logger.info(
+            "MANUAL MEDIA LOCK (prepare): news_index=%s event_id=%s source_id=%s",
+            news_index,
+            item.get("event_id"),
+            source_idx,
+        )
+
+    if not target_post:
+        logger.warning(
+            "PUBLICATION PREP SKIP: news_index=%s event_id=%s "
+            "некоректний source_id=%r",
+            news_index,
+            item.get("event_id"),
+            source_idx,
+        )
+        return None
+
     if manual_media_locked:
         media_type = str(
             target_post.get("manual_media_type") or ""
@@ -1460,6 +1508,8 @@ async def _prepare_publication_item(
                     continue
                 if item_path and not os.path.exists(item_path):
                     item_path = None
+                # Telegram file_id достатньо для повторної відправки, тому
+                # локальний download не є обов'язковим для Telegram album.
                 if not (item_path or item_file_id):
                     continue
                 media_items.append({
@@ -1480,7 +1530,9 @@ async def _prepare_publication_item(
                 )
                 return None
 
-            original_media_path = str(target_post.get("manual_media_path") or "") or None
+            original_media_path = (
+                str(target_post.get("manual_media_path") or "").strip() or None
+            )
             original_media_type = "album"
             media_verdict = {
                 "is_relevant": True,
@@ -1488,6 +1540,7 @@ async def _prepare_publication_item(
                 "reason": "manual_album_locked_no_validation",
                 "media_type": "album",
             }
+
         else:
             candidate_path = str(
                 target_post.get("manual_media_path") or ""
@@ -1501,9 +1554,7 @@ async def _prepare_publication_item(
                 or ""
             ).strip() or None
 
-            # Manual media не має права тихо деградувати до text-only. Якщо файл
-            # справді втрачено, item не входить до prepared batch, а queue лишається
-            # pending для наступного циклу/повторної відправки.
+            # Manual media не має права тихо деградувати до text-only.
             if (
                 media_type not in {"photo", "video"}
                 or not (media_path or media_file_id)
@@ -1529,6 +1580,7 @@ async def _prepare_publication_item(
                 "reason": "manual_media_locked_no_validation",
                 "media_type": media_type,
             }
+
     else:
         auto_media = await _resolve_auto_media_for_item(
             item=item,
@@ -1541,7 +1593,7 @@ async def _prepare_publication_item(
         )
 
         selected_source_idx = auto_media.get("source_idx")
-        if isinstance(selected_source_idx, int):
+        if isinstance(selected_source_idx, int) and 0 <= selected_source_idx < len(posts):
             source_idx = selected_source_idx
             target_post = posts[source_idx]
 
@@ -1563,9 +1615,7 @@ async def _prepare_publication_item(
             auto_media.get("attempted_source_ids") or []
         )
 
-        # Резервуємо медіа вже під час PREPARE, а не після publish. Інакше дві
-        # новини, підготовлені до старту випуску, могли б вибрати той самий файл.
-        # У persistent history записуємо лише ПІСЛЯ фактичної Telegram-публікації.
+        # Резервуємо медіа вже під час PREPARE, а не після publish.
         if (
             media_path
             and media_type in {"photo", "video"}
@@ -1575,20 +1625,23 @@ async def _prepare_publication_item(
                 (media_type, media_fingerprint)
             )
 
-    # Посилання додаємо ПІСЛЯ media validation, щоб службовий рядок не впливав
-    # на Vision/video gate.
     publication_text = append_reference_link(
         item["text"],
         item.get("reference_url"),
         item.get("reference_label"),
     )
 
+    prepared_media_label = (
+        f"album[{len(media_items)}]"
+        if media_items
+        else (media_type or "text-only")
+    )
     logger.info(
         "PUBLICATION PREP READY: news_index=%s event_id=%s media=%s "
         "manual_locked=%s attempts=%s",
         news_index,
         item.get("event_id"),
-        media_type or "text-only",
+        prepared_media_label,
         manual_media_locked,
         len(attempted_media_source_ids),
     )
