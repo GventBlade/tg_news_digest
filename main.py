@@ -295,6 +295,159 @@ async def _capture_manual_media_part(message) -> dict | None:
     }
 
 
+MANUAL_ALBUM_QUIET_SECONDS = 5.0
+MANUAL_ALBUM_DOWNLOAD_TIMEOUT_SECONDS = 90.0
+
+
+def _manual_media_part_stub(message) -> dict | None:
+    """
+    Register an album part immediately, without waiting for file download.
+
+    Telegram file_id is enough to re-send the media later, so the album can be
+    counted correctly even when several large videos are still downloading in
+    the background. This is the key invariant that prevents a fast pair of
+    videos from closing a 9-10 item album prematurely.
+    """
+    media = None
+    media_type = None
+    if message.photo:
+        media = message.photo[-1]
+        media_type = "photo"
+    elif message.video:
+        media = message.video
+        media_type = "video"
+
+    if media is None or media_type is None:
+        return None
+
+    file_id = str(getattr(media, "file_id", "") or "").strip()
+    file_unique_id = str(getattr(media, "file_unique_id", "") or "").strip()
+    file_size = int(getattr(media, "file_size", 0) or 0)
+
+    # For album buffering we require at least the Telegram file_id. Local path
+    # is only an optional optimization for Instagram / re-upload fallback.
+    if not file_id:
+        return None
+
+    return {
+        "type": media_type,
+        "path": None,
+        "file_id": file_id,
+        "file_unique_id": file_unique_id,
+        "file_size": file_size,
+        "message_id": int(message.message_id),
+    }
+
+
+def _manual_album_item_key(item: dict) -> str:
+    return str(
+        item.get("file_unique_id")
+        or item.get("file_id")
+        or item.get("message_id")
+        or item.get("path")
+        or ""
+    )
+
+
+def _persist_manual_album_manifest(path: str, media_group_id: str, items: list[dict]) -> None:
+    """Rewrite one album manifest atomically enough for the single event loop."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    payload = {
+        "version": 2,
+        "media_group_id": str(media_group_id),
+        "items": list(items)[:10],
+    }
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, path)
+    os.chmod(path, 0o644)
+
+
+async def _download_manual_album_part(
+    application,
+    media_group_id: str,
+    part_key: str,
+    message,
+) -> None:
+    """
+    Download one album part in background.
+
+    The part is already present in the buffer via file_id before this coroutine
+    starts. Therefore a slow/failed download can never reduce the album count.
+    """
+    captured = None
+    error = None
+    try:
+        captured = await asyncio.wait_for(
+            _capture_manual_media_part(message),
+            timeout=MANUAL_ALBUM_DOWNLOAD_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        error = "download_timeout"
+    except Exception as exc:
+        error = str(exc)
+    finally:
+        buffers = application.bot_data.setdefault("manual_album_buffers", {})
+        bundle = buffers.get(str(media_group_id))
+        if not bundle:
+            # Queue may already be finalized and the process may have cleaned the
+            # in-memory bundle. The Telegram file_id stored in the manifest is
+            # still sufficient for publication.
+            return
+
+        if isinstance(captured, dict):
+            for item in bundle.get("items", []):
+                if _manual_album_item_key(item) == part_key:
+                    # Preserve the immediately captured file_id, enrich only with
+                    # the finished local download / metadata.
+                    if captured.get("path"):
+                        item["path"] = captured.get("path")
+                    if captured.get("file_id"):
+                        item["file_id"] = captured.get("file_id")
+                    if captured.get("file_unique_id"):
+                        item["file_unique_id"] = captured.get("file_unique_id")
+                    if captured.get("file_size"):
+                        item["file_size"] = int(captured.get("file_size") or 0)
+                    break
+
+        bundle["inflight_downloads"] = max(
+            0,
+            int(bundle.get("inflight_downloads") or 0) - 1,
+        )
+
+        manifest_path = str(bundle.get("manifest_path") or "").strip()
+        if manifest_path:
+            try:
+                _persist_manual_album_manifest(
+                    manifest_path,
+                    str(media_group_id),
+                    list(bundle.get("items") or [])[:10],
+                )
+            except Exception as manifest_exc:
+                logger.warning(
+                    "MANUAL ALBUM manifest refresh failed group=%s part=%s: %s",
+                    media_group_id,
+                    part_key,
+                    manifest_exc,
+                )
+
+        logger.info(
+            "MANUAL ALBUM download finished: media_group_id=%s part=%s "
+            "path=%s inflight=%s%s",
+            media_group_id,
+            part_key,
+            bool(captured and captured.get("path")),
+            bundle.get("inflight_downloads"),
+            f" error={error}" if error else "",
+        )
+
+        # Once a finalized album has no background downloads left, it no longer
+        # needs to occupy bot_data. The manifest already contains all file_ids.
+        if bundle.get("finalized") and int(bundle.get("inflight_downloads") or 0) == 0:
+            buffers.pop(str(media_group_id), None)
+
+
 def _manual_forward_source_info(message) -> tuple[str, str]:
     channel_title = "Пріоритет (Адмін)"
     channel_username = ""
@@ -310,14 +463,7 @@ def _write_manual_album_manifest(media_group_id: str, items: list[dict]) -> str:
     safe_group = "".join(ch for ch in str(media_group_id) if ch.isalnum() or ch in "-_")
     safe_group = (safe_group or "group")[:80]
     path = f"downloads/manual_album_{safe_group}_{int(time.time() * 1000)}.json"
-    payload = {
-        "version": 1,
-        "media_group_id": str(media_group_id),
-        "items": items[:10],
-    }
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump(payload, fh, ensure_ascii=False, indent=2)
-    os.chmod(path, 0o644)
+    _persist_manual_album_manifest(path, str(media_group_id), list(items)[:10])
     return path
 
 
@@ -362,16 +508,39 @@ def _read_manual_album_manifest(path: str | None) -> list[dict]:
 
 
 async def _finalize_manual_album(application, media_group_id: str):
-    """Debounce Telegram album updates and create exactly ONE manual queue row."""
+    """
+    Finalize exactly one manual queue row after the Telegram media group is quiet.
+
+    Important: all album parts are registered synchronously via file_id BEFORE
+    any local download starts. The quiet timer therefore measures Telegram
+    delivery, not download speed. Slow videos can keep downloading after the
+    queue row is created; they only enrich the manifest with local paths.
+    """
+    key = str(media_group_id)
     try:
-        await asyncio.sleep(1.6)
+        while True:
+            buffers = application.bot_data.setdefault("manual_album_buffers", {})
+            bundle = buffers.get(key)
+            if not bundle:
+                return
+
+            last_update = float(bundle.get("last_update_monotonic") or time.monotonic())
+            idle_for = time.monotonic() - last_update
+            remaining = MANUAL_ALBUM_QUIET_SECONDS - idle_for
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(max(remaining, 0.05), MANUAL_ALBUM_QUIET_SECONDS))
     except asyncio.CancelledError:
         return
 
     buffers = application.bot_data.setdefault("manual_album_buffers", {})
-    bundle = buffers.pop(str(media_group_id), None)
-    if not bundle:
+    bundle = buffers.get(key)
+    if not bundle or bundle.get("finalized"):
         return
+
+    # Mark finalized BEFORE any await below so no second finalizer can create a
+    # duplicate queue row for the same Telegram media_group_id.
+    bundle["finalized"] = True
 
     raw_text = str(bundle.get("raw_text") or "").strip()
     chat_id = bundle.get("chat_id")
@@ -379,8 +548,9 @@ async def _finalize_manual_album(application, media_group_id: str):
 
     if not raw_text:
         logger.warning(
-            "MANUAL ALBUM rejected: media_group_id=%s has no caption/text.",
+            "MANUAL ALBUM rejected: media_group_id=%s has no caption/text; items=%s.",
             media_group_id,
+            len(items),
         )
         if chat_id is not None:
             await application.bot.send_message(
@@ -390,6 +560,8 @@ async def _finalize_manual_album(application, media_group_id: str):
                     "Додай короткий текст до альбому й надішли ще раз."
                 ),
             )
+        if int(bundle.get("inflight_downloads") or 0) == 0:
+            buffers.pop(key, None)
         return
 
     if not items:
@@ -405,9 +577,13 @@ async def _finalize_manual_album(application, media_group_id: str):
                     "Новину не додано — надішли її ще раз."
                 ),
             )
+        if int(bundle.get("inflight_downloads") or 0) == 0:
+            buffers.pop(key, None)
         return
 
-    manifest_path = _write_manual_album_manifest(str(media_group_id), items)
+    manifest_path = _write_manual_album_manifest(key, items)
+    bundle["manifest_path"] = manifest_path
+
     history = NewsHistory()
     queue_id = history.add_manual_post(
         raw_text=raw_text,
@@ -421,27 +597,42 @@ async def _finalize_manual_album(application, media_group_id: str):
         telegram_file_unique_id=f"album:{media_group_id}",
         telegram_file_size=sum(int(item.get("file_size") or 0) for item in items),
     )
+    bundle["queue_id"] = queue_id
+    finalized_groups = application.bot_data.setdefault(
+        "manual_album_finalized_groups", {}
+    )
+    finalized_groups[key] = time.monotonic() + 60.0
 
     photos = sum(1 for item in items if item.get("type") == "photo")
     videos = sum(1 for item in items if item.get("type") == "video")
+    local_ready = sum(1 for item in items if item.get("path") and os.path.exists(str(item.get("path"))))
     logger.info(
         "✅ Ручний альбом додано як ОДНУ новину "
-        "(queue_id=%s, media_group_id=%s, photos=%s, videos=%s).",
+        "(queue_id=%s, media_group_id=%s, photos=%s, videos=%s, "
+        "items=%s, local_ready=%s, inflight=%s).",
         queue_id,
         media_group_id,
         photos,
         videos,
+        len(items),
+        local_ready,
+        int(bundle.get("inflight_downloads") or 0),
     )
     if chat_id is not None:
         await application.bot.send_message(
             chat_id=chat_id,
             text=(
                 "✅ Альбом збережено як одну ручну новину. "
-                f"Зафіксовано медіа: {photos} фото, {videos} відео. "
+                f"Зафіксовано медіа: {photos} фото, {videos} відео "
+                f"(усього {len(items)}). "
                 "У найближчому слоті вони підуть разом; факти беруться "
                 "лише з твого підпису."
             ),
         )
+
+    # Keep bundle only while background downloads enrich local paths for IG.
+    if int(bundle.get("inflight_downloads") or 0) == 0:
+        buffers.pop(key, None)
 
 
 async def handle_admin_forwarded_message(
@@ -471,13 +662,32 @@ async def handle_admin_forwarded_message(
     channel_title, channel_username = _manual_forward_source_info(message)
     media_group_id = getattr(message, "media_group_id", None)
 
-    # Telegram sends one album as several updates. Buffer every part and create
-    # one queue row only after the group has settled. Caption may exist only on
-    # the first element, therefore blank secondary parts are accepted here.
+    # Telegram sends one album as several updates. IMPORTANT: register every
+    # part immediately from Telegram file_id, then download local files in the
+    # background. The handler must return quickly so all 2-10 updates can enter
+    # the same buffer before the quiet timer closes the group.
     if media_group_id:
-        media_part = await _capture_manual_media_part(message)
         buffers = context.application.bot_data.setdefault("manual_album_buffers", {})
         key = str(media_group_id)
+        now_mono = time.monotonic()
+
+        # Short tombstone prevents an extremely late Telegram update from
+        # creating a second queue row after the album was already finalized.
+        finalized_groups = context.application.bot_data.setdefault(
+            "manual_album_finalized_groups", {}
+        )
+        for old_key, expires_at in list(finalized_groups.items()):
+            if float(expires_at or 0) <= now_mono:
+                finalized_groups.pop(old_key, None)
+        if key in finalized_groups:
+            logger.warning(
+                "MANUAL ALBUM late Telegram part ignored (already finalized): "
+                "media_group_id=%s message_id=%s",
+                key,
+                message.message_id,
+            )
+            return
+
         bundle = buffers.setdefault(key, {
             "raw_text": "",
             "channel_title": channel_title,
@@ -485,26 +695,61 @@ async def handle_admin_forwarded_message(
             "chat_id": message.chat_id,
             "items": [],
             "task": None,
+            "inflight_downloads": 0,
+            "first_update_monotonic": now_mono,
+            "last_update_monotonic": now_mono,
+            "finalized": False,
+            "manifest_path": None,
         })
 
+        # A same media_group_id should never be reused after finalization, but if
+        # Telegram delivers an extremely late update while local downloads are
+        # still running, do not create a second queue row silently.
+        if bundle.get("finalized"):
+            logger.error(
+                "MANUAL ALBUM late part ignored after finalization: "
+                "media_group_id=%s message_id=%s",
+                key,
+                message.message_id,
+            )
+            return
+
+        bundle["last_update_monotonic"] = now_mono
         if raw_text.strip():
             bundle["raw_text"] = raw_text.strip()
         if channel_title and channel_title != "Пріоритет (Адмін)":
             bundle["channel_title"] = channel_title
         if channel_username:
             bundle["channel_username"] = channel_username
-        if media_part:
+
+        media_stub = _manual_media_part_stub(message)
+        if media_stub:
+            part_key = _manual_album_item_key(media_stub)
             known = {
-                str(item.get("file_unique_id") or item.get("file_id") or item.get("path"))
+                _manual_album_item_key(item)
                 for item in bundle["items"]
             }
-            part_key = str(
-                media_part.get("file_unique_id")
-                or media_part.get("file_id")
-                or media_part.get("path")
+            if part_key and part_key not in known and len(bundle["items"]) < 10:
+                # Register FIRST. Count is now correct regardless of download speed.
+                bundle["items"].append(media_stub)
+                bundle["inflight_downloads"] = int(
+                    bundle.get("inflight_downloads") or 0
+                ) + 1
+                asyncio.create_task(
+                    _download_manual_album_part(
+                        context.application,
+                        key,
+                        part_key,
+                        message,
+                    )
+                )
+        else:
+            logger.warning(
+                "MANUAL ALBUM unsupported/empty media part: "
+                "media_group_id=%s message_id=%s",
+                key,
+                message.message_id,
             )
-            if part_key not in known and len(bundle["items"]) < 10:
-                bundle["items"].append(media_part)
 
         previous_task = bundle.get("task")
         if previous_task and not previous_task.done():
@@ -513,11 +758,12 @@ async def handle_admin_forwarded_message(
             _finalize_manual_album(context.application, key)
         )
         logger.info(
-            "MANUAL ALBUM part buffered: media_group_id=%s message_id=%s "
-            "items=%s caption=%s",
+            "MANUAL ALBUM part registered: media_group_id=%s message_id=%s "
+            "items=%s inflight=%s caption=%s",
             key,
             message.message_id,
             len(bundle["items"]),
+            int(bundle.get("inflight_downloads") or 0),
             bool(bundle.get("raw_text")),
         )
         return
