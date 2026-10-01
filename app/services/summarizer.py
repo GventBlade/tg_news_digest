@@ -5985,6 +5985,135 @@ MANUAL POSTS:
 
         return ranked
 
+    def _build_manual_source_only_text(
+        self,
+        manual_ids: List[int],
+        posts: List[Dict[str, Any]],
+        category: str = "other",
+    ) -> str:
+        """Deterministic last-resort text built ONLY from admin source text."""
+        ids = [
+            sid
+            for sid in self._valid_source_ids(manual_ids, posts)
+            if bool(posts[sid].get("is_priority"))
+        ]
+        if not ids:
+            return ""
+
+        source_id = max(
+            ids,
+            key=lambda sid: len(str(posts[sid].get("text") or "")),
+        )
+        raw = self._clean_source_text_for_fallback(
+            str(posts[source_id].get("text") or "")
+        )
+        if not raw:
+            return ""
+
+        headline = self._priority_headline_from_text(raw) or ""
+        if not headline:
+            first_sentence = next(iter(self._extract_sentences(raw)), raw)
+            headline = str(first_sentence).strip()
+        headline = re.sub(r"\s+", " ", headline).strip()
+        if len(headline) > 150:
+            headline = headline[:147].rstrip() + "…"
+
+        emoji_map = {
+            "war": "💥",
+            "politics": "🏛",
+            "economy": "💰",
+            "international": "🌍",
+            "society": "🇺🇦",
+            "technology": "⚡",
+            "science": "🔬",
+            "culture": "🎭",
+            "other": "📰",
+        }
+        emoji = emoji_map.get(category, "📰")
+
+        sentences = []
+        for sentence in self._extract_sentences(raw):
+            clean_sentence = self._ensure_sentence_end(
+                self._clean_source_text_for_fallback(str(sentence))
+            )
+            if clean_sentence and clean_sentence not in sentences:
+                sentences.append(clean_sentence)
+            if len(sentences) >= 5:
+                break
+        if not sentences:
+            sentences = [self._ensure_sentence_end(raw)]
+
+        text = f"{emoji} <b>{headline}</b>\n\n{' '.join(sentences[:5])}"
+        return self._clean_generated_news_text(text)
+
+    def _verify_manual_editor_output(
+        self,
+        *,
+        source_text: str,
+        candidate_text: str,
+        max_retries: int,
+        event_id: str,
+    ) -> tuple[bool, str]:
+        """Fail-closed source-entailment check for edited manual news."""
+        source_text = self._clean_source_text_for_fallback(source_text)
+        candidate_text = self._clean_generated_news_text(candidate_text)
+        if not source_text or not candidate_text:
+            return False, "empty_source_or_candidate"
+
+        prompt = f"""
+Ти — суворий фактчекер РУЧНОЇ новини адміністратора.
+
+Є лише одне дозволене джерело SOURCE і відредагований CANDIDATE.
+Виріши, чи КОЖЕН фактичний зміст CANDIDATE прямо міститься у SOURCE
+або є його очевидним нейтральним перефразуванням.
+
+КРИТИЧНІ ПРАВИЛА:
+- НЕ використовуй зовнішні знання, пам'ять, інші новини чи актуальні події;
+- заголовок теж перевіряй як фактичне твердження;
+- будь-яка нова людина, місце, цифра, наслідок, причина, статус або розвиток
+  події, якого немає у SOURCE, означає supported=false;
+- зміна модальності теж означає false: "немає підтверджень" НЕ дорівнює
+  "спростував", "за даними джерела" НЕ дорівнює встановленому факту;
+- пізніше спростування/підтвердження, якого SOURCE не містить, ЗАБОРОНЕНО;
+- стилістичне скорочення та перестановка речень дозволені лише без нових фактів.
+
+SOURCE:
+{source_text[:5000]}
+
+CANDIDATE:
+{candidate_text[:3000]}
+
+ВІДПОВІДЬ ТІЛЬКИ JSON:
+{{"supported":true,"reason":"коротко","unsupported_claims":[]}}
+"""
+        data = self._call_json_with_cascade(
+            prompt,
+            max(1, min(int(max_retries or 1), 2)),
+            "MANUAL_EDITOR_VERIFY",
+            temperature=0.0,
+        )
+        if not isinstance(data, dict):
+            return False, "verifier_unavailable_or_invalid_json"
+
+        supported = data.get("supported")
+        if supported is None:
+            supported = data.get("is_supported")
+        supported = bool(supported)
+        reason = str(data.get("reason") or "").strip()[:500]
+        claims = data.get("unsupported_claims")
+        if isinstance(claims, list) and claims:
+            rendered = "; ".join(str(x).strip() for x in claims if str(x).strip())
+            if rendered:
+                reason = (reason + " | " + rendered).strip(" |")[:700]
+
+        if not supported:
+            logger.warning(
+                "MANUAL_EDITOR VERIFY REJECTED: event_id=%s reason=%s",
+                event_id,
+                reason or "unsupported_claim",
+            )
+        return supported, reason or ("supported" if supported else "unsupported")
+
     def _edit_manual_news_in_final(
         self,
         news: List[Dict[str, Any]],
@@ -5993,16 +6122,12 @@ MANUAL POSTS:
         max_retries: int,
     ) -> List[Dict[str, Any]]:
         """
-        Isolated editor for admin/manual news.
+        Isolated source-locked editor for admin/manual news.
 
-        The general Editor may see dozens of events at once, which is useful for
-        selecting and ordering a digest but unsafe for a manual story: a model can
-        accidentally pull a detail from a neighbouring event. Here every manual
-        item is rewritten in a separate request that contains ONLY the manual
-        source text(s) belonging to that event.
-
-        On any model/JSON failure we keep the deterministic manual-only fallback,
-        so a manual item is never lost merely because Gemini is unavailable.
+        A manual item is detected from its actual priority source IDs, not only
+        from the fragile `is_priority` flag. Gemini may copy-edit it, but the
+        result is accepted only after a second source-only entailment check.
+        On any doubt/outage we fail closed to deterministic manual-source text.
         """
         if not news:
             return news
@@ -6012,56 +6137,57 @@ MANUAL POSTS:
             for ev in ranked_events
             if isinstance(ev, dict) and ev.get("event_id")
         }
-
         result: List[Dict[str, Any]] = []
 
         for raw_item in news:
             if not isinstance(raw_item, dict):
                 continue
-
             item = dict(raw_item)
-            if not item.get("is_priority"):
-                result.append(item)
-                continue
-
             event_id = str(item.get("event_id") or "")
             ev = event_map.get(event_id)
-            if not ev:
-                logger.error(
-                    "MANUAL_EDITOR skipped: event_id=%s absent from ranked_events.",
-                    event_id,
+
+            candidate_ids = []
+            for value in (item.get("manual_fact_source_ids") or []):
+                if isinstance(value, int):
+                    candidate_ids.append(value)
+            for value in (item.get("priority_source_ids") or []):
+                if isinstance(value, int):
+                    candidate_ids.append(value)
+            if isinstance(item.get("source_id"), int):
+                candidate_ids.append(item.get("source_id"))
+            if isinstance(item.get("source_ids"), list):
+                candidate_ids.extend(
+                    sid for sid in item.get("source_ids") if isinstance(sid, int)
                 )
+            if ev:
+                candidate_ids.extend(
+                    self._valid_source_ids(ev.get("manual_fact_source_ids"), posts)
+                )
+                candidate_ids.extend(self._priority_source_ids_for_event(ev, posts))
+
+            manual_ids = []
+            seen = set()
+            for sid in self._valid_source_ids(candidate_ids, posts):
+                if sid in seen:
+                    continue
+                seen.add(sid)
+                if bool(posts[sid].get("is_priority")):
+                    manual_ids.append(sid)
+
+            if not manual_ids:
                 result.append(item)
                 continue
 
-            manual_ids = self._valid_source_ids(
-                ev.get("manual_fact_source_ids"),
-                posts,
-            )
-            manual_ids = [
-                sid
-                for sid in manual_ids
-                if bool(posts[sid].get("is_priority"))
-            ]
-            if not manual_ids:
-                manual_ids = self._priority_source_ids_for_event(ev, posts)
+            # From this point the item is unquestionably manual, even if some
+            # previous transformation accidentally dropped the boolean flag.
+            item["is_priority"] = True
+            item["manual_fact_locked"] = True
+            item["manual_fact_source_ids"] = list(manual_ids)
+            item["priority_source_ids"] = list(manual_ids)
+            item["source_ids"] = list(manual_ids)
 
-            # Absolute safety: never expose AUTO sources to MANUAL_EDITOR.
-            manual_ids = [
-                sid
-                for sid in self._valid_source_ids(manual_ids, posts)
-                if bool(posts[sid].get("is_priority"))
-            ]
-
-            if not manual_ids:
-                logger.error(
-                    "MANUAL_EDITOR has no manual-only source_ids for event_id=%s; "
-                    "keeping deterministic fallback text.",
-                    event_id,
-                )
-                result.append(item)
-                continue
-
+            category = str((ev or {}).get("category") or item.get("category") or "other")
+            source_texts = []
             source_blocks = []
             for seq, source_id in enumerate(manual_ids, start=1):
                 source_text = self._clean_source_text_for_fallback(
@@ -6069,53 +6195,59 @@ MANUAL POSTS:
                 )
                 if not source_text:
                     continue
+                source_texts.append(source_text)
                 source_blocks.append(
                     f"MANUAL SOURCE {seq}:\n{source_text[:self.MAX_EVENT_SOURCE_CHARS]}"
                 )
 
+            fallback_text = self._build_manual_source_only_text(
+                manual_ids, posts, category
+            )
             if not source_blocks:
+                if fallback_text:
+                    item["text"] = fallback_text
+                item["manual_editor_applied"] = False
+                item["manual_editor_fallback"] = True
+                item["manual_editor_verified"] = False
                 logger.warning(
-                    "MANUAL_EDITOR empty source text for event_id=%s; "
-                    "keeping deterministic fallback.",
+                    "MANUAL_EDITOR empty manual source for event_id=%s; source-only fallback.",
                     event_id,
                 )
                 result.append(item)
                 continue
 
-            category = str(ev.get("category") or "other")
             prompt = f"""
 Ти — редактор українського Telegram-дайджесту.
 
-Перед тобою ОДНА ручна новина адміністратора. Твоє завдання — лише
-нормально відредагувати її для публікації: зробити природний короткий
-заголовок, прибрати сирі формулювання/повтори й скласти 2-6 завершених
-речень у стилі сучасного новинного Telegram-каналу.
+Перед тобою ОДНА ручна новина адміністратора. Зроби ЛИШЕ легке
+редакторське опрацювання: природний короткий заголовок, чиста мова,
+без повторів і реклами. Зміст і набір фактів повинні залишитися ТИМИ САМИМИ.
 
 КРИТИЧНО:
 - використовуй ТІЛЬКИ факти з MANUAL SOURCE нижче;
-- НЕ додавай контекст з інших новин, навіть якщо він здається логічним;
-- НЕ домислюй причини, наслідки, цифри, імена, місця чи статуси;
-- зберігай модальність: "може/заявив/за даними" не перетворюй на факт;
-- якщо джерело коротке, зроби короткий пост — не заповнюй обсяг водою;
-- прибери Telegram-рекламу, посилання, "підписатися" та службові фрази;
-- не згадуй, що це ручна новина або що ти її редагував;
+- НЕ доповнюй новину пізнішими подіями, спростуваннями чи підтвердженнями;
+- НЕ використовуй свої знання про тему;
+- НЕ додавай нові причини, наслідки, цифри, імена, місця або статуси;
+- зберігай невизначеність і модальність дослівно за змістом;
+- якщо джерело каже "офіційних підтверджень немає", так і залишай —
+  не перетворюй це на "інформацію спростували";
+- краще майже зберегти формулювання джерела, ніж зробити красивіший,
+  але фактично ширший текст;
 - максимум {self.MAX_NEWS_CHARS} символів;
-- формат: один тематичний емодзі + <b>Заголовок</b>, порожній рядок,
-  потім 2-6 речень. Якщо факт один і дуже короткий — дозволено 1-2 речення.
+- формат: один емодзі + <b>Заголовок</b>, порожній рядок, 1-5 речень.
 
-Категорія (лише для вибору нейтрального емодзі): {category}
+Категорія (лише для нейтрального емодзі): {category}
 
 {chr(10).join(source_blocks)}
 
 ВІДПОВІДЬ ТІЛЬКИ JSON:
-{{"text":"📰 <b>Заголовок</b>\\n\\nВідредагований текст."}}
+{{"text":"📰 <b>Заголовок</b>\n\nВідредагований текст."}}
 """
-
             data = self._call_json_with_cascade(
                 prompt,
                 max_retries,
                 "MANUAL_EDITOR",
-                temperature=0.22,
+                temperature=0.08,
             )
 
             edited_text = ""
@@ -6127,34 +6259,41 @@ MANUAL POSTS:
                         first = raw_news[0]
                         if isinstance(first, dict):
                             edited_text = str(first.get("text") or "").strip()
+            cleaned = self._clean_generated_news_text(edited_text) if edited_text else ""
 
-            if edited_text:
-                cleaned = self._clean_generated_news_text(edited_text)
-            else:
-                cleaned = ""
+            verified = False
+            verify_reason = "editor_empty"
+            if cleaned:
+                verified, verify_reason = self._verify_manual_editor_output(
+                    source_text="\n\n".join(source_texts),
+                    candidate_text=cleaned,
+                    max_retries=max_retries,
+                    event_id=event_id,
+                )
 
-            if not cleaned:
-                # Do not lose the manual item on an LLM outage/malformed JSON.
-                fallback = self._build_fallback_news_item(ev, posts)
-                if fallback and str(fallback.get("text") or "").strip():
-                    item["text"] = str(fallback["text"]).strip()
-                    item["manual_editor_applied"] = False
-                    item["manual_editor_fallback"] = True
-                    logger.warning(
-                        "MANUAL_EDITOR fallback used for event_id=%s source_ids=%s.",
-                        event_id,
-                        manual_ids,
-                    )
+            if not cleaned or not verified:
+                if fallback_text:
+                    item["text"] = fallback_text
+                item["manual_editor_applied"] = False
+                item["manual_editor_fallback"] = True
+                item["manual_editor_verified"] = False
+                item["manual_editor_verify_reason"] = verify_reason
+                logger.warning(
+                    "MANUAL_EDITOR SAFE FALLBACK: event_id=%s source_ids=%s reason=%s",
+                    event_id,
+                    manual_ids,
+                    verify_reason,
+                )
                 result.append(item)
                 continue
 
             item["text"] = cleaned
             item["manual_editor_applied"] = True
             item["manual_editor_fallback"] = False
-            item["manual_fact_locked"] = True
-            item["manual_fact_source_ids"] = list(manual_ids)
+            item["manual_editor_verified"] = True
+            item["manual_editor_verify_reason"] = verify_reason
             logger.info(
-                "MANUAL_EDITOR OK: event_id=%s manual_source_ids=%s chars=%s.",
+                "MANUAL_EDITOR VERIFIED: event_id=%s manual_source_ids=%s chars=%s.",
                 event_id,
                 manual_ids,
                 len(cleaned),
@@ -6200,10 +6339,14 @@ MANUAL POSTS:
             if not event_id or not text or not ev:
                 continue
 
-            if ev.get("is_priority"):
-                # Manual items are rebuilt from manual-only sources and are not
-                # sent through a multi-case LLM rewrite. This prevents facts from
-                # neighbouring cases leaking back into the admin story.
+            if (
+                ev.get("is_priority")
+                or self._priority_source_ids_for_event(ev, posts)
+                or item.get("manual_fact_source_ids")
+            ):
+                # Manual items are source-locked and separately verified. Never
+                # expose them to the multi-case batch fact-check, even if some
+                # earlier step accidentally dropped the is_priority flag.
                 continue
 
             source_ids = self._valid_source_ids(ev.get("source_ids"), posts)

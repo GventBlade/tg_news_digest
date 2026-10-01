@@ -639,17 +639,38 @@ def _enforce_manual_fact_lock_before_publish(
             and not bool(posts[sid].get("is_priority"))
         ]
 
-        if bool(item_copy.get("manual_fact_locked")) and not foreign_sources:
+        manual_text_safe = bool(
+            item_copy.get("manual_editor_verified")
+            or item_copy.get("manual_editor_fallback")
+            or item_copy.get("_main_manual_fallback")
+        )
+
+        if (
+            bool(item_copy.get("manual_fact_locked"))
+            and not foreign_sources
+            and manual_text_safe
+        ):
             item_copy["source_ids"] = list(manual_sources)
             item_copy["priority_source_ids"] = list(manual_sources)
             item_copy["manual_fact_source_ids"] = list(manual_sources)
             logger.info(
-                "PRE-PUBLISH MANUAL FACT LOCK OK: event_id=%s source_ids=%s",
+                "PRE-PUBLISH MANUAL FACT LOCK OK: event_id=%s source_ids=%s "
+                "editor_verified=%s fallback=%s",
                 item_copy.get("event_id"),
                 manual_sources,
+                bool(item_copy.get("manual_editor_verified")),
+                bool(item_copy.get("manual_editor_fallback")),
             )
             result.append(item_copy)
             continue
+
+        if bool(item_copy.get("manual_fact_locked")) and not foreign_sources:
+            logger.error(
+                "PRE-PUBLISH MANUAL TEXT UNVERIFIED: event_id=%s source_ids=%s. "
+                "Discarding edited text and rebuilding from the admin source.",
+                item_copy.get("event_id"),
+                manual_sources,
+            )
 
         # Last-resort fail-safe: use exactly one concrete manual source. If an
         # unverified multi-manual merge slipped through, publishing one clean
