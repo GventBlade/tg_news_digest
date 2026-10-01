@@ -926,9 +926,9 @@ CASES:
         """
         Перевіряє telemetry FINAL_FACT_CHECK.
 
-        Це НЕ другий fact-check.
-        Ми лише дивимось, чи всі фінальні items
-        реально були передані в попередній factual pass.
+        Manual-новини навмисно НЕ входять у batch FINAL_FACT_CHECK:
+        вони проходять окремий MANUAL_EDITOR_VERIFY. Тому audit не повинен
+        трактувати normal 4/6 cases як проблему, якщо 2/6 — manual.
         """
 
         issues = []
@@ -954,6 +954,29 @@ CASES:
             default=0,
         )
 
+        manual_count = sum(
+            1
+            for item in news
+            if isinstance(item, dict)
+            and bool(item.get("_audit_manual_ids"))
+        )
+
+        if manual_count == 0:
+            manual_count = sum(
+                1
+                for item in news
+                if isinstance(item, dict)
+                and (
+                    bool(item.get("manual_fact_locked"))
+                    or bool(item.get("manual_fact_source_ids"))
+                )
+            )
+
+        expected_eligible = max(
+            0,
+            expected - manual_count,
+        )
+
         if expected != len(news):
             issues.append({
                 "type": (
@@ -969,7 +992,7 @@ CASES:
                 ),
             })
 
-        if eligible < expected:
+        if eligible < expected_eligible:
             issues.append({
                 "type": (
                     "fact_check_unmapped_items"
@@ -977,9 +1000,24 @@ CASES:
                 "event_id": "",
                 "confidence": 100,
                 "reason": (
-                    "Для fact-check вдалося "
-                    f"побудувати лише "
-                    f"{eligible}/{expected} cases."
+                    "Для AUTO fact-check вдалося "
+                    f"побудувати лише {eligible}/"
+                    f"{expected_eligible} очікуваних cases "
+                    f"(manual excluded={manual_count})."
+                ),
+            })
+
+        elif eligible > expected_eligible:
+            issues.append({
+                "type": (
+                    "fact_check_unexpected_items"
+                ),
+                "event_id": "",
+                "confidence": 100,
+                "reason": (
+                    "FINAL_FACT_CHECK отримав більше cases, ніж очікувалось "
+                    f"для AUTO: {eligible}/{expected_eligible} "
+                    f"(manual excluded={manual_count})."
                 ),
             })
 
@@ -998,6 +1036,7 @@ CASES:
             })
 
         return issues
+
 
     def _check_references(
         self,
@@ -1105,9 +1144,10 @@ CASES:
         """
         Не запускає Vision вдруге.
 
-        Перевіряємо тільки state:
-        rejected media не повинно залишитися
-        у фінальному Telegram/Instagram pipeline.
+        Перевіряємо structural media state після фактичної публікації.
+        Manual album — окремий валідний тип: top-level final_path/file_id
+        для нього можуть бути порожні, бо реальні фото/відео живуть у
+        media_items і main передає їх як Telegram media group.
         """
 
         issues = []
@@ -1141,32 +1181,90 @@ CASES:
                     "final_type"
                 )
                 or ""
-            ).strip()
+            ).strip().lower()
+
             final_file_id = bool(
-                audit.get("final_file_id")
+                audit.get(
+                    "final_file_id"
+                )
             )
 
-            manual_locked = bool(audit.get("manual_locked"))
+            final_media_items = self._int(
+                audit.get(
+                    "final_media_items"
+                ),
+                default=0,
+            )
+
+            manual_locked = bool(
+                audit.get(
+                    "manual_locked"
+                )
+            )
+
             manual_expected_path = str(
-                audit.get("manual_expected_path") or ""
+                audit.get(
+                    "manual_expected_path"
+                )
+                or ""
             ).strip()
+
             manual_expected_file_id = bool(
-                audit.get("manual_expected_file_id")
+                audit.get(
+                    "manual_expected_file_id"
+                )
             )
 
-            manual_media_present = bool(
+            original_type = str(
+                audit.get(
+                    "original_type"
+                )
+                or ""
+            ).strip().lower()
+
+            expected_album = (
+                original_type == "album"
+                or final_type == "album"
+            )
+
+            final_album_present = (
+                final_type == "album"
+                and final_media_items > 0
+            )
+
+            final_media_present = bool(
                 final_path
                 or final_file_id
+                or final_album_present
             )
 
             if manual_locked:
                 lock_broken = False
-                if manual_expected_path:
-                    lock_broken = final_path != manual_expected_path
-                elif manual_expected_file_id:
-                    lock_broken = not final_file_id
+
+                if expected_album:
+                    lock_broken = not final_album_present
+
                 else:
-                    lock_broken = not manual_media_present
+                    matched_expected_path = bool(
+                        manual_expected_path
+                        and final_path
+                        and final_path == manual_expected_path
+                    )
+                    matched_expected_file_id = bool(
+                        manual_expected_file_id
+                        and final_file_id
+                    )
+
+                    if (
+                        manual_expected_path
+                        or manual_expected_file_id
+                    ):
+                        lock_broken = not (
+                            matched_expected_path
+                            or matched_expected_file_id
+                        )
+                    else:
+                        lock_broken = not final_media_present
 
                 if lock_broken:
                     issues.append({
@@ -1175,8 +1273,11 @@ CASES:
                         "confidence": 100,
                         "reason": (
                             "Manual media було замінено/втрачено: "
+                            f"expected_type={original_type or 'unknown'}, "
                             f"expected_path={manual_expected_path or 'none'}, "
                             f"expected_file_id={manual_expected_file_id}, "
+                            f"final_type={final_type or 'none'}, "
+                            f"final_items={final_media_items}, "
                             f"final_path={final_path or 'none'}, "
                             f"final_file_id={final_file_id}."
                         ),
@@ -1185,8 +1286,7 @@ CASES:
             if (
                 rejected
                 and (
-                    final_path
-                    or final_file_id
+                    final_media_present
                     or final_type
                 )
             ):
@@ -1208,9 +1308,27 @@ CASES:
                     ),
                 })
 
+            elif bool(final_media_present) != bool(final_type):
+                issues.append({
+                    "type": (
+                        "media_state_issue"
+                    ),
+                    "event_id": str(
+                        item.get(
+                            "event_id"
+                        )
+                        or ""
+                    ),
+                    "confidence": 100,
+                    "reason": (
+                        "media payload і media_type "
+                        "неузгоджені."
+                    ),
+                })
+
             elif (
-                bool(final_path or final_file_id)
-                != bool(final_type)
+                final_type == "album"
+                and final_media_items <= 0
             ):
                 issues.append({
                     "type": (
@@ -1224,12 +1342,12 @@ CASES:
                     ),
                     "confidence": 100,
                     "reason": (
-                        "media path/file_id і media_type "
-                        "неузгоджені."
+                        "final_type=album, але final_media_items=0."
                     ),
                 })
 
         return issues
+
 
     @staticmethod
     def _check_priority(
