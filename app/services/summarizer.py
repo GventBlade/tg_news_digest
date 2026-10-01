@@ -5849,11 +5849,19 @@ MANUAL POSTS:
                     media_source is not None
                     and posts[media_source].get("is_priority")
                     and (
-                        posts[media_source].get("manual_media_path")
-                        or posts[media_source].get("manual_telegram_file_id")
-                        or posts[media_source].get("telegram_file_id")
+                        (
+                            posts[media_source].get("manual_media_type") in {"photo", "video"}
+                            and (
+                                posts[media_source].get("manual_media_path")
+                                or posts[media_source].get("manual_telegram_file_id")
+                                or posts[media_source].get("telegram_file_id")
+                            )
+                        )
+                        or (
+                            posts[media_source].get("manual_media_type") == "album"
+                            and bool(posts[media_source].get("manual_media_items"))
+                        )
                     )
-                    and posts[media_source].get("manual_media_type") in {"photo", "video"}
                 )
 
                 discovery_score = self._calculate_discovery_score(
@@ -8066,7 +8074,7 @@ discovery-блок.
         preferred_id: Any = None,
     ) -> Optional[int]:
         """
-        Manual media is immutable: якщо адмін надіслав фото/відео, жоден
+        Manual media is immutable: якщо адмін надіслав фото/відео/альбом, жоден
         автоматичний source не має права замінити цей файл. Інші source_ids
         можуть лише збагачувати факти/текст події.
         """
@@ -8080,11 +8088,12 @@ discovery-блок.
                 or ""
             ).strip()
             media_type = str(post.get("manual_media_type") or "").strip().lower()
-            if (
-                bool(post.get("is_priority"))
-                and (media_path or media_file_id)
-                and media_type in {"photo", "video"}
-            ):
+            album_items = post.get("manual_media_items") or []
+            has_locked_media = bool(
+                (media_type in {"photo", "video"} and (media_path or media_file_id))
+                or (media_type == "album" and isinstance(album_items, list) and album_items)
+            )
+            if bool(post.get("is_priority")) and has_locked_media:
                 locked.append(source_id)
 
         if not locked:

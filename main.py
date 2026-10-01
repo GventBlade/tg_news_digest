@@ -1,5 +1,6 @@
 import asyncio
 import html
+import json
 import logging
 import os
 import time
@@ -208,9 +209,16 @@ def cleanup_old_downloads(
                     )
                 )
 
+                # Manual media/bundle files may need to survive one or more
+                # failed publication cycles. Keep them for at least 24h; AUTO
+                # downloads still use the normal cleanup window.
+                effective_max_age_minutes = max_age_minutes
+                if filename.startswith("manual_"):
+                    effective_max_age_minutes = max(max_age_minutes, 24 * 60)
+
                 if (
                     age_seconds
-                    > max_age_minutes * 60
+                    > effective_max_age_minutes * 60
                 ):
                     os.unlink(
                         file_path
@@ -223,54 +231,298 @@ def cleanup_old_downloads(
             )
 
 
+async def _capture_manual_media_part(message) -> dict | None:
+    """Capture one photo/video part and preserve Telegram file_id as fallback."""
+    media_type = None
+    telegram_file_id = ""
+    telegram_file_unique_id = ""
+    telegram_file_size = 0
+    media_path = None
+
+    os.makedirs("downloads", exist_ok=True)
+
+    if message.photo:
+        media = message.photo[-1]
+        media_type = "photo"
+        telegram_file_id = str(getattr(media, "file_id", "") or "")
+        telegram_file_unique_id = str(getattr(media, "file_unique_id", "") or "")
+        telegram_file_size = int(getattr(media, "file_size", 0) or 0)
+        target_path = f"downloads/manual_{message.message_id}.jpg"
+        try:
+            file = await media.get_file()
+            await file.download_to_drive(target_path)
+            if os.path.exists(target_path):
+                media_path = target_path
+        except Exception as exc:
+            logger.warning(
+                "MANUAL MEDIA local download failed; залишаємо Telegram "
+                "file_id fallback: %s",
+                exc,
+            )
+
+    elif message.video:
+        media = message.video
+        media_type = "video"
+        telegram_file_id = str(getattr(media, "file_id", "") or "")
+        telegram_file_unique_id = str(getattr(media, "file_unique_id", "") or "")
+        telegram_file_size = int(getattr(media, "file_size", 0) or 0)
+        target_path = f"downloads/manual_{message.message_id}.mp4"
+        try:
+            file = await media.get_file()
+            await file.download_to_drive(target_path)
+            if os.path.exists(target_path):
+                media_path = target_path
+        except Exception as exc:
+            logger.warning(
+                "MANUAL MEDIA local download failed; залишаємо Telegram "
+                "file_id fallback: %s",
+                exc,
+            )
+
+    if media_type not in {"photo", "video"}:
+        return None
+
+    if not (media_path or telegram_file_id):
+        return None
+
+    return {
+        "type": media_type,
+        "path": media_path,
+        "file_id": telegram_file_id,
+        "file_unique_id": telegram_file_unique_id,
+        "file_size": telegram_file_size,
+        "message_id": int(message.message_id),
+    }
+
+
+def _manual_forward_source_info(message) -> tuple[str, str]:
+    channel_title = "Пріоритет (Адмін)"
+    channel_username = ""
+    if message.forward_origin:
+        origin = message.forward_origin
+        if hasattr(origin, "chat") and origin.chat:
+            channel_title = origin.chat.title or channel_title
+            channel_username = origin.chat.username or ""
+    return channel_title, channel_username
+
+
+def _write_manual_album_manifest(media_group_id: str, items: list[dict]) -> str:
+    safe_group = "".join(ch for ch in str(media_group_id) if ch.isalnum() or ch in "-_")
+    safe_group = (safe_group or "group")[:80]
+    path = f"downloads/manual_album_{safe_group}_{int(time.time() * 1000)}.json"
+    payload = {
+        "version": 1,
+        "media_group_id": str(media_group_id),
+        "items": items[:10],
+    }
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False, indent=2)
+    os.chmod(path, 0o644)
+    return path
+
+
+def _read_manual_album_manifest(path: str | None) -> list[dict]:
+    manifest_path = str(path or "").strip()
+    if not manifest_path or not os.path.exists(manifest_path):
+        return []
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except Exception as exc:
+        logger.error("MANUAL ALBUM manifest read failed %s: %s", manifest_path, exc)
+        return []
+
+    raw_items = payload.get("items", []) if isinstance(payload, dict) else []
+    result = []
+    seen = set()
+    for raw in raw_items:
+        if not isinstance(raw, dict):
+            continue
+        media_type = str(raw.get("type") or "").strip().lower()
+        media_path = str(raw.get("path") or "").strip() or None
+        file_id = str(raw.get("file_id") or "").strip() or None
+        unique_id = str(raw.get("file_unique_id") or "").strip()
+        if media_type not in {"photo", "video"} or not (media_path or file_id):
+            continue
+        key = unique_id or file_id or media_path
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append({
+            "type": media_type,
+            "path": media_path,
+            "file_id": file_id,
+            "file_unique_id": unique_id,
+            "file_size": int(raw.get("file_size") or 0),
+            "message_id": raw.get("message_id"),
+        })
+        if len(result) >= 10:
+            break
+    return result
+
+
+async def _finalize_manual_album(application, media_group_id: str):
+    """Debounce Telegram album updates and create exactly ONE manual queue row."""
+    try:
+        await asyncio.sleep(1.6)
+    except asyncio.CancelledError:
+        return
+
+    buffers = application.bot_data.setdefault("manual_album_buffers", {})
+    bundle = buffers.pop(str(media_group_id), None)
+    if not bundle:
+        return
+
+    raw_text = str(bundle.get("raw_text") or "").strip()
+    chat_id = bundle.get("chat_id")
+    items = list(bundle.get("items") or [])[:10]
+
+    if not raw_text:
+        logger.warning(
+            "MANUAL ALBUM rejected: media_group_id=%s has no caption/text.",
+            media_group_id,
+        )
+        if chat_id is not None:
+            await application.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "⚠️ Альбом отримано, але в ньому немає підпису. "
+                    "Додай короткий текст до альбому й надішли ще раз."
+                ),
+            )
+        return
+
+    if not items:
+        logger.error(
+            "MANUAL ALBUM capture failed completely: media_group_id=%s",
+            media_group_id,
+        )
+        if chat_id is not None:
+            await application.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "⚠️ Не вдалося зафіксувати фото/відео альбому. "
+                    "Новину не додано — надішли її ще раз."
+                ),
+            )
+        return
+
+    manifest_path = _write_manual_album_manifest(str(media_group_id), items)
+    history = NewsHistory()
+    queue_id = history.add_manual_post(
+        raw_text=raw_text,
+        channel_title=str(bundle.get("channel_title") or "Пріоритет (Адмін)"),
+        channel_username=str(bundle.get("channel_username") or ""),
+        media_path=manifest_path,
+        media_type="album",
+        has_media=True,
+        has_video=any(item.get("type") == "video" for item in items),
+        telegram_file_id="",
+        telegram_file_unique_id=f"album:{media_group_id}",
+        telegram_file_size=sum(int(item.get("file_size") or 0) for item in items),
+    )
+
+    photos = sum(1 for item in items if item.get("type") == "photo")
+    videos = sum(1 for item in items if item.get("type") == "video")
+    logger.info(
+        "✅ Ручний альбом додано як ОДНУ новину "
+        "(queue_id=%s, media_group_id=%s, photos=%s, videos=%s).",
+        queue_id,
+        media_group_id,
+        photos,
+        videos,
+    )
+    if chat_id is not None:
+        await application.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "✅ Альбом збережено як одну ручну новину. "
+                f"Зафіксовано медіа: {photos} фото, {videos} відео. "
+                "У найближчому слоті вони підуть разом; факти беруться "
+                "лише з твого підпису."
+            ),
+        )
+
+
 async def handle_admin_forwarded_message(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    user_id = (
-        update.effective_user.id
-        if update.effective_user
-        else None
-    )
-
-    logger.info(
-        "📩 Отримано повідомлення "
-        f"від Telegram user_id: {user_id}"
-    )
+    user_id = update.effective_user.id if update.effective_user else None
+    logger.info("📩 Отримано повідомлення від Telegram user_id: %s", user_id)
 
     if settings.ADMIN_TELEGRAM_ID is None:
-        logger.error(
-            "ADMIN_TELEGRAM_ID не налаштований у .env."
-        )
+        logger.error("ADMIN_TELEGRAM_ID не налаштований у .env.")
         return
 
     if user_id != settings.ADMIN_TELEGRAM_ID:
-        logger.warning(
-            "⛔ Відхилено повідомлення "
-            f"від user_id {user_id}."
-        )
+        logger.warning("⛔ Відхилено повідомлення від user_id %s.", user_id)
         return
 
     message = update.message
-
     if not message:
         return
 
-    raw_text = (
-        message.text
-        or message.caption
-        or ""
-    )
+    raw_text = message.text or message.caption or ""
+    if raw_text.strip().startswith("/start"):
+        await message.reply_text("👋 Бот активний і готовий приймати новини від адміна!")
+        return
 
-    if raw_text.strip().startswith(
-        "/start"
-    ):
-        await message.reply_text(
-            "👋 Бот активний і готовий приймати новини від адміна!"
+    channel_title, channel_username = _manual_forward_source_info(message)
+    media_group_id = getattr(message, "media_group_id", None)
+
+    # Telegram sends one album as several updates. Buffer every part and create
+    # one queue row only after the group has settled. Caption may exist only on
+    # the first element, therefore blank secondary parts are accepted here.
+    if media_group_id:
+        media_part = await _capture_manual_media_part(message)
+        buffers = context.application.bot_data.setdefault("manual_album_buffers", {})
+        key = str(media_group_id)
+        bundle = buffers.setdefault(key, {
+            "raw_text": "",
+            "channel_title": channel_title,
+            "channel_username": channel_username,
+            "chat_id": message.chat_id,
+            "items": [],
+            "task": None,
+        })
+
+        if raw_text.strip():
+            bundle["raw_text"] = raw_text.strip()
+        if channel_title and channel_title != "Пріоритет (Адмін)":
+            bundle["channel_title"] = channel_title
+        if channel_username:
+            bundle["channel_username"] = channel_username
+        if media_part:
+            known = {
+                str(item.get("file_unique_id") or item.get("file_id") or item.get("path"))
+                for item in bundle["items"]
+            }
+            part_key = str(
+                media_part.get("file_unique_id")
+                or media_part.get("file_id")
+                or media_part.get("path")
+            )
+            if part_key not in known and len(bundle["items"]) < 10:
+                bundle["items"].append(media_part)
+
+        previous_task = bundle.get("task")
+        if previous_task and not previous_task.done():
+            previous_task.cancel()
+        bundle["task"] = asyncio.create_task(
+            _finalize_manual_album(context.application, key)
+        )
+        logger.info(
+            "MANUAL ALBUM part buffered: media_group_id=%s message_id=%s "
+            "items=%s caption=%s",
+            key,
+            message.message_id,
+            len(bundle["items"]),
+            bool(bundle.get("raw_text")),
         )
         return
 
-    # Порожній медіапост Analyzer не зможе нормально оцінити.
+    # Non-album manual item: one message = one queue row.
     if not raw_text.strip():
         await message.reply_text(
             "⚠️ Додай короткий текст або підпис до новини. "
@@ -278,109 +530,21 @@ async def handle_admin_forwarded_message(
         )
         return
 
-    channel_title = (
-        "Пріоритет (Адмін)"
+    media_part = await _capture_manual_media_part(message)
+    media_path = media_part.get("path") if media_part else None
+    media_type = media_part.get("type") if media_part else None
+    telegram_file_id = str(media_part.get("file_id") or "") if media_part else ""
+    telegram_file_unique_id = (
+        str(media_part.get("file_unique_id") or "") if media_part else ""
     )
-    channel_username = ""
-
-    if message.forward_origin:
-        origin = message.forward_origin
-
-        if (
-            hasattr(origin, "chat")
-            and origin.chat
-        ):
-            channel_title = (
-                origin.chat.title
-                or channel_title
-            )
-            channel_username = (
-                origin.chat.username
-                or ""
-            )
-
-    media_path = None
-    media_type = None
-    telegram_file_id = ""
-    telegram_file_unique_id = ""
-    telegram_file_size = 0
-
-    os.makedirs(
-        "downloads",
-        exist_ok=True,
-    )
-
-    # Для manual media Telegram file_id є головною страховкою. Bot API може
-    # відмовити у download великого відео ("File is too big"), але той самий
-    # бот все одно може повторно відправити оригінал за file_id.
-    if message.photo:
-        photo = message.photo[-1]
-        media_type = "photo"
-        telegram_file_id = str(
-            getattr(photo, "file_id", "") or ""
-        )
-        telegram_file_unique_id = str(
-            getattr(photo, "file_unique_id", "") or ""
-        )
-        telegram_file_size = int(
-            getattr(photo, "file_size", 0) or 0
-        )
-        target_path = (
-            f"downloads/manual_"
-            f"{message.message_id}.jpg"
-        )
-        try:
-            file = await photo.get_file()
-            await file.download_to_drive(
-                target_path
-            )
-            if os.path.exists(target_path):
-                media_path = target_path
-        except Exception as e:
-            logger.warning(
-                "MANUAL MEDIA local download failed; "
-                "залишаємо Telegram file_id fallback: %s",
-                e,
-            )
-
-    elif message.video:
-        video = message.video
-        media_type = "video"
-        telegram_file_id = str(
-            getattr(video, "file_id", "") or ""
-        )
-        telegram_file_unique_id = str(
-            getattr(video, "file_unique_id", "") or ""
-        )
-        telegram_file_size = int(
-            getattr(video, "file_size", 0) or 0
-        )
-        target_path = (
-            f"downloads/manual_"
-            f"{message.message_id}.mp4"
-        )
-        try:
-            file = await video.get_file()
-            await file.download_to_drive(
-                target_path
-            )
-            if os.path.exists(target_path):
-                media_path = target_path
-        except Exception as e:
-            logger.warning(
-                "MANUAL MEDIA local download failed; "
-                "залишаємо Telegram file_id fallback: %s",
-                e,
-            )
+    telegram_file_size = int(media_part.get("file_size") or 0) if media_part else 0
 
     has_manual_media = bool(
         media_type in {"photo", "video"}
         and (media_path or telegram_file_id)
     )
 
-    # Якщо користувач реально надіслав media, але ми не маємо ні локального
-    # файла, ні Telegram file_id, не створюємо оманливий text-only manual.
-    if media_type in {"photo", "video"} and not has_manual_media:
+    if (message.photo or message.video) and not has_manual_media:
         await message.reply_text(
             "⚠️ Не вдалося зафіксувати медіа. "
             "Новину не додано до черги — надішли її ще раз."
@@ -392,7 +556,6 @@ async def handle_admin_forwarded_message(
         return
 
     history = NewsHistory()
-
     queue_id = history.add_manual_post(
         raw_text=raw_text,
         channel_title=channel_title,
@@ -400,9 +563,7 @@ async def handle_admin_forwarded_message(
         media_path=media_path,
         media_type=media_type,
         has_media=has_manual_media,
-        has_video=(
-            media_type == "video"
-        ),
+        has_video=(media_type == "video"),
         telegram_file_id=telegram_file_id,
         telegram_file_unique_id=telegram_file_unique_id,
         telegram_file_size=telegram_file_size,
@@ -419,13 +580,12 @@ async def handle_admin_forwarded_message(
         "короткий опис із медіа теж допускається."
         + media_note
     )
-
     logger.info(
         "✅ Ручну новину додано до черги "
-        f"(queue_id={queue_id}, "
-        f"telegram_message_id={message.message_id})."
+        "(queue_id=%s, telegram_message_id=%s).",
+        queue_id,
+        message.message_id,
     )
-
 
 def _manual_queue_ids_for_item(
     item: dict,
@@ -744,11 +904,12 @@ def _locked_manual_media_source_for_item(
             or ""
         ).strip()
         media_type = str(post.get("manual_media_type") or "").strip().lower()
-        if (
-            bool(post.get("is_priority"))
-            and (media_path or media_file_id)
-            and media_type in {"photo", "video"}
-        ):
+        album_items = post.get("manual_media_items") or []
+        has_locked_media = bool(
+            (media_type in {"photo", "video"} and (media_path or media_file_id))
+            or (media_type == "album" and isinstance(album_items, list) and album_items)
+        )
+        if bool(post.get("is_priority")) and has_locked_media:
             return source_idx
 
     return None
@@ -1037,90 +1198,91 @@ async def _prepare_publication_item(
     )
     manual_media_locked = manual_media_source_idx is not None
     if manual_media_locked:
-        source_idx = manual_media_source_idx
-        logger.info(
-            "MANUAL MEDIA LOCK (prepare): news_index=%s event_id=%s source_id=%s",
-            news_index,
-            item.get("event_id"),
-            source_idx,
-        )
-
-    target_post = (
-        posts[source_idx]
-        if (
-            isinstance(source_idx, int)
-            and 0 <= source_idx < len(posts)
-        )
-        else None
-    )
-
-    if not target_post:
-        logger.warning(
-            "PUBLICATION PREP SKIP: news_index=%s event_id=%s "
-            "некоректний source_id=%r",
-            news_index,
-            item.get("event_id"),
-            source_idx,
-        )
-        return None
-
-    media_path = None
-    media_type = None
-    media_file_id = None
-    media_verdict = {}
-    media_rejected = False
-    media_reject_reason = ""
-    media_reuse_suppressed = False
-    media_fingerprint = None
-    original_media_path = None
-    original_media_file_id = None
-    original_media_type = None
-    attempted_media_source_ids = []
-
-    if manual_media_locked:
         media_type = str(
             target_post.get("manual_media_type") or ""
         ).strip().lower()
-        candidate_path = str(
-            target_post.get("manual_media_path") or ""
-        ).strip()
-        if candidate_path and os.path.exists(candidate_path):
-            media_path = candidate_path
 
-        media_file_id = str(
-            target_post.get("manual_telegram_file_id")
-            or target_post.get("telegram_file_id")
-            or ""
-        ).strip() or None
+        if media_type == "album":
+            raw_album_items = target_post.get("manual_media_items") or []
+            for raw in raw_album_items:
+                if not isinstance(raw, dict):
+                    continue
+                item_type = str(raw.get("type") or "").strip().lower()
+                item_path = str(raw.get("path") or "").strip() or None
+                item_file_id = str(raw.get("file_id") or "").strip() or None
+                if item_type not in {"photo", "video"}:
+                    continue
+                if item_path and not os.path.exists(item_path):
+                    item_path = None
+                if not (item_path or item_file_id):
+                    continue
+                media_items.append({
+                    "type": item_type,
+                    "path": item_path,
+                    "file_id": item_file_id,
+                })
+                if len(media_items) >= 10:
+                    break
 
-        # Manual media не має права тихо деградувати до text-only. Якщо файл
-        # справді втрачено, item не входить до prepared batch, а queue лишається
-        # pending для наступного циклу/повторної відправки.
-        if (
-            media_type not in {"photo", "video"}
-            or not (media_path or media_file_id)
-        ):
-            logger.error(
-                "MANUAL MEDIA LOCK FAILED DURING PREP: news_index=%s event_id=%s "
-                "source_id=%s path=%s file_id=%s type=%s. Queue лишається pending.",
-                news_index,
-                item.get("event_id"),
-                source_idx,
-                media_path,
-                bool(media_file_id),
-                media_type,
-            )
-            return None
+            if not media_items:
+                logger.error(
+                    "MANUAL ALBUM LOCK FAILED DURING PREP: news_index=%s "
+                    "event_id=%s source_id=%s. Queue лишається pending.",
+                    news_index,
+                    item.get("event_id"),
+                    source_idx,
+                )
+                return None
 
-        original_media_path = media_path
-        original_media_file_id = media_file_id
-        original_media_type = media_type
-        media_verdict = {
-            "is_relevant": True,
-            "confidence": 100,
-            "reason": "manual_media_locked_no_validation",
-            "media_type": media_type,
-        }
+            original_media_path = str(target_post.get("manual_media_path") or "") or None
+            original_media_type = "album"
+            media_verdict = {
+                "is_relevant": True,
+                "confidence": 100,
+                "reason": "manual_album_locked_no_validation",
+                "media_type": "album",
+            }
+        else:
+            candidate_path = str(
+                target_post.get("manual_media_path") or ""
+            ).strip()
+            if candidate_path and os.path.exists(candidate_path):
+                media_path = candidate_path
+
+            media_file_id = str(
+                target_post.get("manual_telegram_file_id")
+                or target_post.get("telegram_file_id")
+                or ""
+            ).strip() or None
+
+            # Manual media не має права тихо деградувати до text-only. Якщо файл
+            # справді втрачено, item не входить до prepared batch, а queue лишається
+            # pending для наступного циклу/повторної відправки.
+            if (
+                media_type not in {"photo", "video"}
+                or not (media_path or media_file_id)
+            ):
+                logger.error(
+                    "MANUAL MEDIA LOCK FAILED DURING PREP: news_index=%s event_id=%s "
+                    "source_id=%s path=%s file_id=%s type=%s. Queue лишається pending.",
+                    news_index,
+                    item.get("event_id"),
+                    source_idx,
+                    media_path,
+                    bool(media_file_id),
+                    media_type,
+                )
+                return None
+
+            original_media_path = media_path
+            original_media_file_id = media_file_id
+            original_media_type = media_type
+            media_verdict = {
+                "is_relevant": True,
+                "confidence": 100,
+                "reason": "manual_media_locked_no_validation",
+                "media_type": media_type,
+            }
     else:
         auto_media = await _resolve_auto_media_for_item(
             item=item,
@@ -1195,6 +1357,7 @@ async def _prepare_publication_item(
         "media_path": media_path,
         "media_type": media_type,
         "media_file_id": media_file_id,
+        "media_items": media_items,
         "media_verdict": media_verdict,
         "media_rejected": media_rejected,
         "media_reject_reason": media_reject_reason,
@@ -1254,6 +1417,28 @@ async def process_and_publish_news_cycle():
                 manual["id"]
             )
 
+            manual_media_type = str(manual.get("media_type") or "").strip().lower()
+            manual_media_items = (
+                _read_manual_album_manifest(manual.get("media_path"))
+                if manual_media_type == "album"
+                else []
+            )
+            manual_has_media = bool(
+                manual_media_items
+                if manual_media_type == "album"
+                else manual.get("has_media")
+            )
+            manual_has_video = bool(
+                any(item.get("type") == "video" for item in manual_media_items)
+                if manual_media_type == "album"
+                else manual.get("has_video")
+            )
+            manual_has_photo = bool(
+                any(item.get("type") == "photo" for item in manual_media_items)
+                if manual_media_type == "album"
+                else manual_media_type == "photo"
+            )
+
             manual_posts_formatted.append({
                 "text": manual["raw_text"],
                 "channel_name": (
@@ -1275,22 +1460,14 @@ async def process_and_publish_news_cycle():
                 ),
                 "forwards": 0,
                 "replies": 0,
-                "has_media": bool(
-                    manual["has_media"]
-                ),
-                "has_video": bool(
-                    manual["has_video"]
-                ),
-                "has_photo": (
-                    manual["media_type"]
-                    == "photo"
-                ),
+                "has_media": manual_has_media,
+                "has_video": manual_has_video,
+                "has_photo": manual_has_photo,
                 "manual_media_path": manual[
                     "media_path"
                 ],
-                "manual_media_type": manual[
-                    "media_type"
-                ],
+                "manual_media_type": manual_media_type,
+                "manual_media_items": manual_media_items,
                 "manual_telegram_file_id": str(
                     manual.get("telegram_file_id") or ""
                 ),
@@ -1306,7 +1483,8 @@ async def process_and_publish_news_cycle():
                 # text from other sources, but publication must use the admin
                 # media either from local path OR Telegram file_id.
                 "media_locked": bool(
-                    manual.get("media_path")
+                    manual_media_items
+                    or manual.get("media_path")
                     or manual.get("telegram_file_id")
                 ),
                 "media_document_id": None,
@@ -1479,6 +1657,7 @@ async def process_and_publish_news_cycle():
             media_path = prepared["media_path"]
             media_type = prepared["media_type"]
             media_file_id = prepared["media_file_id"]
+            media_items = prepared.get("media_items") or []
             media_verdict = prepared["media_verdict"]
             media_rejected = prepared["media_rejected"]
             media_reject_reason = prepared["media_reject_reason"]
@@ -1496,7 +1675,7 @@ async def process_and_publish_news_cycle():
                 len(prepared_news),
                 original_index,
                 item.get("event_id"),
-                media_type or "text-only",
+                (f"album[{len(media_items)}]" if media_items else (media_type or "text-only")),
             )
 
             published = await publisher.publish_telegram_post(
@@ -1504,6 +1683,7 @@ async def process_and_publish_news_cycle():
                 media_path=media_path,
                 media_type=media_type,
                 media_file_id=media_file_id,
+                media_items=media_items,
                 # Усе вже перевірено під час PREPARE; manual взагалі bypass.
                 validate_media=False,
                 # Manual не має права тихо впасти до text-only.
@@ -1593,7 +1773,8 @@ async def process_and_publish_news_cycle():
                 "reuse_suppressed": media_reuse_suppressed,
                 "final_path": media_path,
                 "final_file_id": bool(media_file_id),
-                "final_type": media_type,
+                "final_type": ("album" if media_items else media_type),
+                "final_media_items": len(media_items),
                 "manual_locked": manual_media_locked,
                 "manual_expected_path": (
                     str(target_post.get("manual_media_path") or "")
@@ -1623,7 +1804,27 @@ async def process_and_publish_news_cycle():
 
             published_news.append(published_item)
 
-            if (
+            if media_items:
+                for album_position, album_item in enumerate(media_items, start=1):
+                    album_path = str(album_item.get("path") or "").strip()
+                    album_type = str(album_item.get("type") or "").strip().lower()
+                    if (
+                        album_path
+                        and os.path.exists(album_path)
+                        and album_type in {"photo", "video"}
+                    ):
+                        ig_media_items.append({
+                            "path": album_path,
+                            "type": album_type,
+                        })
+                        logger.info(
+                            "Instagram media #%s.%s: %s → %s",
+                            publish_position,
+                            album_position,
+                            album_type,
+                            album_path,
+                        )
+            elif (
                 media_path
                 and media_type in {"photo", "video"}
             ):

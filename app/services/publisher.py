@@ -13,7 +13,7 @@ import aiohttp
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.types import FSInputFile
+from aiogram.types import FSInputFile, InputMediaPhoto, InputMediaVideo
 from PIL import Image, ImageOps
 from google import genai
 from google.genai import types
@@ -66,6 +66,7 @@ class NewsPublisher:
         text: str,
         media_path: str | None = None,
         media_type: str | None = None,
+        media_items: list | None = None,
         validate_media: bool = True,
         media_file_id: str | None = None,
         require_media: bool = False,
@@ -76,10 +77,132 @@ class NewsPublisher:
 
         `media_file_id` is primarily for manual admin media that Telegram already
         stores. It lets us re-send a large original video even when Bot API
-        refuses to download it locally. If `require_media=True`, failure to send
-        that media returns False instead of silently degrading to text-only.
+        refuses to download it locally. `media_items` is a locked manual album
+        (mixed photo/video) that must be published as one Telegram media group.
+        If `require_media=True`, failure to send required media returns False
+        instead of silently degrading to text-only.
         """
         try:
+            # Manual album path. Telegram accepts mixed photo/video media groups
+            # (2-10 items). Caption is attached only to the first item so the
+            # whole album is one logical news post. Manual albums bypass Vision:
+            # the admin explicitly supplied every attachment.
+            if media_items:
+                normalized_items = []
+                for raw in list(media_items)[:10]:
+                    if not isinstance(raw, dict):
+                        continue
+                    item_type = str(raw.get("type") or "").strip().lower()
+                    item_path = str(raw.get("path") or "").strip() or None
+                    item_file_id = str(raw.get("file_id") or "").strip() or None
+                    if item_type not in {"photo", "video"}:
+                        continue
+                    if item_path and not Path(item_path).exists():
+                        item_path = None
+                    if not (item_file_id or item_path):
+                        continue
+                    normalized_items.append({
+                        "type": item_type,
+                        "path": item_path,
+                        "file_id": item_file_id,
+                    })
+
+                if normalized_items:
+                    last_album_error = None
+
+                    # First prefer Telegram file_id (fast, no re-upload), then
+                    # retry with local files where available. This protects a
+                    # manual album if one stored file_id becomes unusable.
+                    for prefer_local in (False, True):
+                        album_payload = []
+                        signature = []
+                        for idx, media_item in enumerate(normalized_items):
+                            local_path = media_item.get("path")
+                            file_id = media_item.get("file_id")
+                            if prefer_local and local_path:
+                                payload = FSInputFile(str(local_path))
+                                source_kind = "local"
+                            elif file_id:
+                                payload = str(file_id)
+                                source_kind = "file_id"
+                            elif local_path:
+                                payload = FSInputFile(str(local_path))
+                                source_kind = "local"
+                            else:
+                                continue
+
+                            caption_kwargs = (
+                                {"caption": text, "parse_mode": ParseMode.HTML}
+                                if idx == 0
+                                else {}
+                            )
+                            if media_item["type"] == "photo":
+                                album_payload.append(
+                                    InputMediaPhoto(media=payload, **caption_kwargs)
+                                )
+                            else:
+                                album_payload.append(
+                                    InputMediaVideo(media=payload, **caption_kwargs)
+                                )
+                            signature.append(source_kind)
+
+                        if not album_payload:
+                            continue
+
+                        try:
+                            if len(album_payload) == 1:
+                                only = normalized_items[0]
+                                payload = (
+                                    FSInputFile(str(only["path"]))
+                                    if prefer_local and only.get("path")
+                                    else (only.get("file_id") or FSInputFile(str(only["path"])))
+                                )
+                                if only["type"] == "photo":
+                                    await self.bot.send_photo(
+                                        chat_id=settings.TARGET_CHANNEL_ID,
+                                        photo=payload,
+                                        caption=text,
+                                    )
+                                else:
+                                    await self.bot.send_video(
+                                        chat_id=settings.TARGET_CHANNEL_ID,
+                                        video=payload,
+                                        caption=text,
+                                        supports_streaming=True,
+                                    )
+                            else:
+                                await self.bot.send_media_group(
+                                    chat_id=settings.TARGET_CHANNEL_ID,
+                                    media=album_payload,
+                                )
+                            logger.info(
+                                "Manual media album published in Telegram: items=%s sources=%s",
+                                len(album_payload),
+                                signature,
+                            )
+                            return True
+                        except Exception as album_error:
+                            last_album_error = album_error
+                            logger.warning(
+                                "Telegram manual album send failed (prefer_local=%s): %s",
+                                prefer_local,
+                                album_error,
+                            )
+
+                    if require_media:
+                        logger.error(
+                            "REQUIRED MANUAL ALBUM send failed; text-only fallback "
+                            "заборонено: %s",
+                            last_album_error,
+                            exc_info=last_album_error is not None,
+                        )
+                        return False
+                elif require_media:
+                    logger.error(
+                        "REQUIRED MANUAL ALBUM missing: no usable items."
+                    )
+                    return False
+
             # Local AUTO media can still be validated here when caller did not
             # already validate it. Telegram file_id media is used only for the
             # manual locked path and intentionally bypasses Vision.
@@ -1470,4 +1593,5 @@ confidence — ЦІЛЕ ЧИСЛО ВІД 0 ДО 100, де 100 = повна вп
 
     async def close(self):
         await self.bot.session.close()
+
 
