@@ -1171,24 +1171,25 @@ def _auto_media_candidate_source_ids(
     """
     Ordered AUTO-media candidates for one final event.
 
-    Summarizer now supplies `media_candidate_source_ids`, already filtered by
-    its deterministic event-consistency gate. For backward compatibility with
-    an older summarizer we append the selected source and the event source_ids.
-    We never search unrelated posts here: fallback stays inside the same event.
+    If Summarizer explicitly supplies `media_candidate_source_ids` (even an
+    empty list), ONLY these pre-screened sources may be tried. Re-appending
+    raw `source_ids` used to undo its safety gate and publish unrelated media.
+    Older Summarizer versions without this field retain their legacy fallback.
     """
     ordered = []
 
     raw_ranked = item.get("media_candidate_source_ids")
     if isinstance(raw_ranked, list):
+        # An empty list is intentional: Summarizer found no safe media.
         ordered.extend(raw_ranked)
-
-    preferred = item.get("source_id")
-    if isinstance(preferred, int):
-        ordered.append(preferred)
-
-    raw_sources = item.get("source_ids")
-    if isinstance(raw_sources, list):
-        ordered.extend(raw_sources)
+    else:
+        # Backward compatibility ONLY for genuinely older Summarizers.
+        preferred = item.get("source_id")
+        if isinstance(preferred, int):
+            ordered.append(preferred)
+        raw_sources = item.get("source_ids")
+        if isinstance(raw_sources, list):
+            ordered.extend(raw_sources)
 
     result = []
     seen = set()
@@ -1308,15 +1309,11 @@ async def _resolve_auto_media_for_item(
             result["original_media_path"] = media_path
             result["original_media_type"] = media_type
 
-        # Backup videos are always Vision-checked. This prevents a second random
-        # clip from slipping through merely because the first one was rejected.
-        force_video_validation = bool(
-            item.get("video_validation_needed", False)
-            or (
-                media_type == "video"
-                and source_idx != preferred_source
-            )
-        )
+        # Every AUTO video (preferred AND fallback) requires content validation.
+        # In particular, a seemingly well-matched Telegram caption does NOT prove
+        # that the attached frames illustrate that story. Manual albums bypass
+        # this function and are not affected.
+        force_video_validation = (media_type == "video")
 
         verdict = await publisher.validate_media_for_news(
             text=item["text"],
@@ -2065,7 +2062,12 @@ async def process_and_publish_news_cycle():
                 "original_path": original_media_path,
                 "original_file_id": bool(original_media_file_id),
                 "original_type": original_media_type,
-                "rejected": media_rejected,
+                # A rejected *candidate* is not a rejected *final* item when a
+                # different candidate successfully passed validation.
+                "rejected": bool(
+                    media_rejected and not (media_path or media_file_id or media_items)
+                ),
+                "had_rejected_candidates": media_rejected,
                 "reject_reason": media_reject_reason,
                 "validation_reason": str(media_verdict.get("reason") or ""),
                 "validation_confidence": media_verdict.get("confidence"),

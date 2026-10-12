@@ -50,10 +50,9 @@ class NewsPublisher:
             "gemini-3.1-flash-lite",
         ]
         self.media_validation_fail_closed = True
-        # Video validation: small clips go inline; larger clips use Gemini Files
-        # API. On validator/API failure we fail open for AUTO video because the
-        # Summarizer already applies a stricter event-consistency gate. Clear
-        # high-confidence mismatches are still rejected.
+        # AUTO video validation uses Gemini Files API for large clips and inline
+        # bytes for small clips. Errors are fail-closed for the current candidate;
+        # Main can still try the next video/photo from the same story.
         self.video_validation_inline_max_bytes = 12 * 1024 * 1024
         self.video_validation_processing_timeout = 45
         # Для відео, які ОБОВ'ЯЗКОВО пішли на Gemini-перевірку (насамперед
@@ -328,11 +327,9 @@ class NewsPublisher:
         """
         Єдина перевірка медіа перед публікацією на будь-якій платформі.
 
-        Фото проходять Gemini Vision-перевірку. AUTO-відео фізичних атак
-        теж обов'язково перевіряємо Gemini, навіть якщо caller забув передати
-        video_validation_needed=True. Для решти відео зберігаємо дешевий fast-path,
-        якщо Summarizer не позначив ролик як підозрілий. Результат цього методу
-        треба використовувати одночасно для Telegram та Instagram.
+        Фото і ВСІ AUTO-відео проходять Gemini content check. Збіг caption
+        із новиною сам по собі не підтверджує відеоряд. Manual locked media не
+        проходить цю функцію. Результат однаковий для Telegram та Instagram.
         """
         if not media_path or not Path(media_path).exists():
             return {
@@ -372,34 +369,11 @@ class NewsPublisher:
             return verdict
 
         if media_type == "video":
-            # Подвійна страховка. Summarizer передає video_validation_needed=True
-            # для фізичних атак, але Publisher сам повторно впізнає такі новини.
-            # Тому навіть якщо десь у caller загубиться цей прапорець, AUTO-відео
-            # удару/влучання не пройде VIDEO MEDIA FAST-PASS без Vision-check.
-            force_video_validation = bool(
-                video_validation_needed
-                or self._looks_like_physical_attack_news(text)
-            )
-
-            if not force_video_validation:
-                verdict = {
-                    "is_relevant": True,
-                    "confidence": 0,
-                    "has_prominent_text": False,
-                    "conflicting_text": False,
-                    "conflicting_context": False,
-                    "reason": "auto_video_fast_path_no_gemini",
-                    "media_type": "video",
-                }
-                logger.info(
-                    "VIDEO MEDIA FAST-PASS: path=%s reason=%s",
-                    media_path,
-                    verdict["reason"],
-                )
-                return verdict
-
+            # No unconditional FAST-PASS: even a source with a relevant caption
+            # may contain an unrelated video (e.g. residential footage above
+            # a water supply story). Validation is part of PREPARE, not PUBLISH.
             logger.info(
-                "VIDEO MEDIA REQUIRED CHECK: path=%s attack=%s requested=%s",
+                "VIDEO MEDIA CONTENT CHECK: path=%s attack=%s requested=%s",
                 media_path,
                 self._looks_like_physical_attack_news(text),
                 bool(video_validation_needed),
@@ -528,14 +502,21 @@ class NewsPublisher:
   або іншу ціль — is_relevant=false і conflicting_context=true;
 - приклад: текст про влучання у житловий будинок, а ролик явно показує
   падіння/вибух у воді чи відкритій місцевості без будинку — це reject;
-- загальні кадри вибуху/диму, де конкретну ціль неможливо розпізнати і немає
-  видимого протиріччя, можна дозволити, але з нижчою confidence;
-- водяні знаки каналу самі по собі НЕ є конфліктом;
+- загальні кадри вибуху/диму допускаються лише за наявності обґрунтованої
+  тематичної/подієвої прив'язки; не вигадуй назви місця з водяного знака;
+- водяні знаки каналу самі по собі НЕ є конфліктом чи доказом місця;
 - якщо в кадрі/аудіо/плашках видно назву іншого міста, об'єкта, компанії чи
   іншої новини — conflicting_context=true;
-- не вимагай, щоб відео показувало всі факти тексту: достатньо, щоб воно
-  чесно ілюструвало саме цю подію;
-- якщо не можеш встановити відповідність або сумніваєшся — НЕ відхиляй;\n  conflicting_context=true став лише при явному, видимому протиріччі.
+- НЕ вимагай показати всі факти тексту. Дозволь зрозумілу тематичну
+  ілюстрацію (наприклад, водогін/труби для водопостачання, портрет героя),
+  якщо вона не видається за документальні кадри конкретного інциденту;
+- випадкові будинки, машини, пейзажі, дим або загальні вулиці НЕ є
+  достатньою ілюстрацією конкретних новин про воду, рішення чи людину;
+- для match_level="direct" має бути впізнавана конкретна подія/об'єкт;
+  "illustrative" — справді дотична до теми зрозуміла ілюстрація;
+  "unclear" — не видно значущого зв'язку, навіть якщо немає суперечності;
+  "mismatch" — видно іншу подію/об'єкт. Якщо сумніваєшся, обери unclear;
+- не стверджуй, що це той самий інцидент тільки через загальну схожість.
 
 НОВИНА:
 {clean_text[:1800]}
@@ -546,6 +527,7 @@ confidence — ціле число 0-100.
   "is_relevant": true,
   "confidence": 90,
   "conflicting_context": false,
+  "match_level": "direct",
   "video_summary": "коротко, що реально видно/чути",
   "reason": "коротке пояснення"
 }}
@@ -619,28 +601,22 @@ confidence — ціле число 0-100.
 
                     model_relevant = bool(data.get("is_relevant", False))
                     conflicting = bool(data.get("conflicting_context", False))
+                    match_level = str(data.get("match_level") or "").strip().lower()
 
-                    # Для ролика, який уже пішов на обов'язкову перевірку,
-                    # краще відкинути явний mismatch, ніж показати інше влучання.
-                    # Водночас не караємо нічні/задимлені кадри лише за невисоку
-                    # впевненість, якщо модель не бачить конкретного протиріччя.
-                    clear_mismatch = bool(
-                        (conflicting and confidence >= 80)
-                        or ((not model_relevant) and confidence >= 90)
+                    # Positive evidence is needed, not only absence of an obvious
+                    # contradiction. Unknown schema => conservative result so a
+                    # broken LLM response cannot auto-approve a random video.
+                    is_relevant = bool(
+                        model_relevant
+                        and not conflicting
+                        and match_level in {"direct", "illustrative"}
+                        and confidence >= (60 if match_level == "direct" else 70)
                     )
-                    is_relevant = not clear_mismatch
-
-                    reason = str(data.get("reason") or "")[:500]
-                    if clear_mismatch:
-                        reason = (
-                            reason
-                            + " | rejected: clear video/event mismatch"
-                        ).strip()
-                    else:
-                        reason = (
-                            reason
-                            + " | allowed: no clear video/event mismatch"
-                        ).strip()
+                    reason = str(data.get("reason") or "")[:400]
+                    reason += (
+                        f" | video_match={match_level or 'unknown'}"
+                        + (" | accepted" if is_relevant else " | rejected")
+                    )
 
                     return {
                         "is_relevant": is_relevant,
@@ -648,8 +624,9 @@ confidence — ціле число 0-100.
                         "has_prominent_text": False,
                         "conflicting_text": False,
                         "conflicting_context": conflicting,
+                        "match_level": match_level,
                         "video_summary": str(data.get("video_summary") or "")[:300],
-                        "reason": reason,
+                        "reason": reason[:500],
                     }
 
                 except Exception as e:
@@ -749,10 +726,15 @@ confidence — ціле число 0-100.
 - картку/скриншот із заголовком про іншу подію;
 - інше місто/компанію/особу, якщо це не пояснюється текстом новини;
 - стару ілюстрацію, яка створює хибне враження про конкретний новий інцидент;
-- зображення, де помітний текст суперечить новині.
+- зображення, де помітний текст суперечить новині;
+- випадковий житловий будинок/машини/вулицю як начебто фото конкретного
+  водоканалу, політика, аварії, заводу чи іншого названого об'єкта.
 
-Якщо не впевнений, але бачиш сильний текстовий конфлікт — ВІДХИЛЯЙ.
-Якщо фото просто нейтральне й релевантне без конфлікту — можна дозволити.
+Не плутай «немає видимого протиріччя» з «є тематичний зв'язок».
+Оціни match_level: direct (показано саме героя/місце/предмет), illustrative
+(очевидна тематична ілюстрація без неправдивого натяку на кадри події),
+unclear (немає пояснюваного візуального зв'язку), mismatch (інша подія).
+Дозволяй direct або illustrative. Не вигадуй зв'язок через водяний знак.
 
 НОВИНА:
 {clean_text[:1800]}
@@ -766,6 +748,7 @@ confidence — ЦІЛЕ ЧИСЛО ВІД 0 ДО 100, де 100 = повна вп
   "confidence": 95,
   "has_prominent_text": false,
   "conflicting_text": false,
+  "match_level": "direct",
   "image_text_summary": "коротко, який текст видно на зображенні, якщо є",
   "reason": "коротке пояснення рішення"
 }}
@@ -798,10 +781,11 @@ confidence — ЦІЛЕ ЧИСЛО ВІД 0 ДО 100, де 100 = повна вп
 
                 is_relevant = bool(data.get("is_relevant", False))
                 conflicting_text = bool(data.get("conflicting_text", False))
+                match_level = str(data.get("match_level") or "").strip().lower()
 
-                # Жорстка локальна страховка: модель не може одночасно
-                # сказати "relevant" і "conflicting_text=true".
-                if conflicting_text:
+                # A photo with no visible contradiction can still be unrelated.
+                # Require a positively identified direct/thematic relationship.
+                if conflicting_text or match_level not in {"direct", "illustrative"}:
                     is_relevant = False
 
                 # Gemini іноді повертає confidence у шкалі 0-1, навіть
@@ -822,7 +806,8 @@ confidence — ЦІЛЕ ЧИСЛО ВІД 0 ДО 100, де 100 = повна вп
 
                 # Дуже невпевнене "так" все ще не приймаємо, але тепер
                 # confidence спочатку нормалізований до єдиної шкали 0-100.
-                if is_relevant and confidence < 55:
+                min_confidence = 55 if match_level == "direct" else 65
+                if is_relevant and confidence < min_confidence:
                     is_relevant = False
                     data["reason"] = (
                         str(data.get("reason") or "")
@@ -836,6 +821,7 @@ confidence — ЦІЛЕ ЧИСЛО ВІД 0 ДО 100, де 100 = повна вп
                         data.get("has_prominent_text", False)
                     ),
                     "conflicting_text": conflicting_text,
+                    "match_level": match_level,
                     "image_text_summary": str(
                         data.get("image_text_summary") or ""
                     )[:300],
@@ -1593,5 +1579,6 @@ confidence — ЦІЛЕ ЧИСЛО ВІД 0 ДО 100, де 100 = повна вп
 
     async def close(self):
         await self.bot.session.close()
+
 
 

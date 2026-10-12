@@ -694,12 +694,79 @@ class NewsSummarizer:
             max_retries_per_model,
         )
 
+        # Editor/FACT_CHECK may rewrite titles, but they must not erase the
+        # already confirmed history classification. Apply the visible update
+        # marker only once, AFTER factual editing, without altering any facts.
+        validated = self._label_confirmed_history_updates(
+            validated, ranked_events
+        )
+
         logger.info(
             "Фінальний дайджест: "
             f"{len(validated)} новин."
         )
 
         return validated[:effective_count]
+
+    @classmethod
+    def _label_confirmed_history_updates(
+        cls,
+        final_news: List[Dict[str, Any]],
+        ranked_events: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Mark only significant, *same-story* AUTO follow-ups in the title.
+
+        Do not infer an update from the topic, source similarity or editor
+        wording. The pre-publication history review must have confirmed it.
+        This is purely a presentation change; it does not affect ranking/dedup.
+        """
+        events = {
+            str(event.get("event_id") or ""): event
+            for event in ranked_events
+            if isinstance(event, dict)
+        }
+        for item in final_news:
+            if not isinstance(item, dict):
+                continue
+            ev = events.get(str(item.get("event_id") or ""))
+            if not ev or item.get("is_priority") or ev.get("is_priority"):
+                continue
+            confirmed = bool(
+                ev.get("is_history_repeat")
+                and ev.get("history_material_update") is True
+                and cls._safe_score(ev.get("history_update_strength"))
+                    >= cls.HISTORY_SIGNIFICANT_UPDATE_MIN
+                and str(ev.get("history_match_title") or "").strip()
+            )
+            if not confirmed:
+                continue
+            current = str(item.get("text") or "")
+            # Edit only the first bold Telegram headline. Never edit body or
+            # add facts. Idempotent if retries call this stage twice.
+            match = re.search(r"<b>(.*?)</b>", current, flags=re.I | re.S)
+            if not match:
+                logger.warning(
+                    "HISTORY UPDATE LABEL SKIP: event_id=%s no bold headline",
+                    item.get("event_id"),
+                )
+                continue
+            title = match.group(1).strip()
+            if re.search(r"^(?:🔄\s*)?(?:ОНОВЛЕНО|UPDATE)\s*:", title, flags=re.I):
+                continue
+            if not title:
+                continue
+            item["text"] = (
+                current[:match.start(1)] + "ОНОВЛЕНО: " + title
+                + current[match.end(1):]
+            )
+            item["is_confirmed_update"] = True
+            item["updated_from_title"] = str(ev.get("history_match_title") or "")
+            logger.info(
+                "HISTORY UPDATE LABELED: event_id=%s matched='%s'",
+                item.get("event_id"),
+                item["updated_from_title"][:120],
+            )
+        return final_news
 
     def _build_posts_context(
         self,
