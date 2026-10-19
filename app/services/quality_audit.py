@@ -11,6 +11,7 @@ from google import genai
 from google.genai import types
 
 from app.config import settings
+from app.services.text_quality import auto_news_quality_issues
 
 logger = logging.getLogger(__name__)
 
@@ -214,6 +215,8 @@ class QualityAuditor:
             )
         )
 
+        text_issues = self._check_text_quality(news)
+
         priority_issues = (
             self._check_priority(
                 expected_manual_ids or [],
@@ -231,6 +234,7 @@ class QualityAuditor:
         issues.extend(
             fact_issues
         )
+        issues.extend(text_issues)
         issues.extend(
             priority_issues
         )
@@ -275,6 +279,7 @@ class QualityAuditor:
             "fact_check_issues": len(
                 fact_issues
             ),
+            "text_issues": len(text_issues),
             "priority_issues": len(
                 priority_issues
             ),
@@ -910,6 +915,28 @@ CASES:
                 )
 
         return None
+
+    @staticmethod
+    def _check_text_quality(news: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Read-only content diagnostics for published AUTO items."""
+        issues = []
+        for item in news or []:
+            if not isinstance(item, dict):
+                continue
+            if (
+                item.get("is_priority") or item.get("manual_fact_locked")
+                or item.get("manual_fact_source_ids") or item.get("_audit_manual_ids")
+            ):
+                continue
+            problems = auto_news_quality_issues(str(item.get("text") or ""))
+            if problems:
+                issues.append({
+                    "type": "text_quality_issue",
+                    "event_id": str(item.get("event_id") or ""),
+                    "confidence": 100,
+                    "reason": "AUTO text quality: " + ", ".join(problems),
+                })
+        return issues
 
     def _check_fact_check(
         self,
