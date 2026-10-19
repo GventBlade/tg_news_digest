@@ -18,4 +18,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
+# Fail the build if a required service was omitted from the repository/context.
+RUN python -m compileall -q app main.py \
+    && python -c "from importlib.util import find_spec; required = ('app.services.summarizer', 'app.services.text_quality', 'app.services.quality_audit'); missing = [name for name in required if find_spec(name) is None]; assert not missing, f'Missing required modules: {missing}'"
+
 CMD ["python", "main.py"]

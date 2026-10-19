@@ -1,0 +1,17 @@
+.git
+.idea
+.vscode
+.venv
+venv
+ENV
+**/__pycache__
+**/*.py[cod]
+.env
+.env.*
+*.key
+*.pem
+*.session*
+*.db
+*.sqlite*
+data
+downloads

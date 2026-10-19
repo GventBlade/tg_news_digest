@@ -308,6 +308,7 @@ class QualityAuditor:
                 "fact_check_issues=0 "
                 "reference_issues=0 "
                 "media_issues=0 "
+                "text_issues=0 "
                 "priority_issues=0 "
                 "elapsed=%sms",
                 len(news),
@@ -322,6 +323,7 @@ class QualityAuditor:
                 "fact_check_issues=%s "
                 "reference_issues=%s "
                 "media_issues=%s "
+                "text_issues=%s "
                 "priority_issues=%s "
                 "elapsed=%sms",
                 len(news),
@@ -337,6 +339,7 @@ class QualityAuditor:
                 result[
                     "media_issues"
                 ],
+                result["text_issues"],
                 result[
                     "priority_issues"
                 ],
