@@ -13,6 +13,7 @@ import aiohttp
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramNetworkError
 from aiogram.types import FSInputFile, InputMediaPhoto, InputMediaVideo
 from PIL import Image, ImageOps
 from google import genai
@@ -24,6 +25,9 @@ logger = logging.getLogger(__name__)
 
 
 class NewsPublisher:
+    TELEGRAM_HEADER_MAX_ATTEMPTS = 5
+    TELEGRAM_HEADER_RETRY_DELAY_SECONDS = 60
+
     def __init__(self):
         self.bot = Bot(
             token=settings.BOT_TOKEN,
@@ -59,6 +63,44 @@ class NewsPublisher:
         # AUTO-відео фізичних атак), безпечніше втратити медіа і лишити текст,
         # ніж опублікувати ролик з іншого влучання/місця.
         self.video_validation_fail_closed = True
+
+    async def publish_telegram_header(self, text: str) -> bool:
+        """Retry the digest header when the connection fails before sending it."""
+        for attempt in range(1, self.TELEGRAM_HEADER_MAX_ATTEMPTS + 1):
+            try:
+                await self.bot.send_message(
+                    chat_id=settings.TARGET_CHANNEL_ID,
+                    text=text,
+                )
+            except Exception as exc:
+                cause = exc.__cause__ if isinstance(exc, TelegramNetworkError) else exc
+                # A lost response may mean Telegram already accepted the post.
+                # Retry only a connection failure, before the request was sent.
+                if not isinstance(cause, aiohttp.ClientConnectorError) or isinstance(
+                    cause, aiohttp.ClientSSLError
+                ):
+                    logger.exception("Помилка публікації заголовка в Telegram.")
+                    return False
+
+                if attempt == self.TELEGRAM_HEADER_MAX_ATTEMPTS:
+                    logger.error(
+                        "З'єднання з Telegram не встановлено після %s спроб відправити заголовок.",
+                        attempt,
+                    )
+                    return False
+
+                logger.warning(
+                    "Збій з'єднання з Telegram під час відправлення заголовка "
+                    "(спроба %s/%s, %s). Наступна спроба через %s с.",
+                    attempt,
+                    self.TELEGRAM_HEADER_MAX_ATTEMPTS,
+                    type(cause).__name__,
+                    self.TELEGRAM_HEADER_RETRY_DELAY_SECONDS,
+                )
+                await asyncio.sleep(self.TELEGRAM_HEADER_RETRY_DELAY_SECONDS)
+            else:
+                logger.info("Заголовок випуску опубліковано в Telegram (спроба %s).", attempt)
+                return True
 
     async def publish_telegram_post(
         self,

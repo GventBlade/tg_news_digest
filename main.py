@@ -1927,7 +1927,7 @@ async def process_and_publish_news_cycle():
         # 5. PUBLISH ALL: header + уже повністю підготовлені новини по черзі.
         # Ніяких Gemini/media-selection між Telegram-постами тут більше немає.
         header_text = get_slot_header_text(len(prepared_news))
-        header_published = await publisher.publish_telegram_post(
+        header_published = await publisher.publish_telegram_header(
             text=header_text
         )
 
